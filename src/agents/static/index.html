@@ -38,6 +38,18 @@
             <button id="retry-connect" class="quiet compact" type="button" hidden>Retry</button>
           </div>
         </header>
+
+        <section id="world" class="world" aria-labelledby="world-title">
+          <header class="world-header">
+            <div>
+              <p class="eyebrow">Live control plane</p>
+              <h3 id="world-title">The Internet Garden</h3>
+            </div>
+            <button id="world-motion" class="quiet compact" type="button">Pause motion</button>
+          </header>
+          <canvas id="world-canvas" aria-hidden="true"></canvas>
+          <p id="world-summary" class="sr-only" aria-live="polite"></p>
+        </section>
         <section id="view-state" class="view-state" tabindex="-1" hidden></section>
         <section id="retry-panel" class="retry-panel" aria-labelledby="retry-title" hidden>
           <h3 id="retry-title">Requests awaiting a definitive result</h3>
@@ -321,6 +333,7 @@
       </form>
     </dialog>
 
+    <script src="/static/world.js" defer></script>
     <script src="/static/app.js" defer></script>
   </body>
 </html>

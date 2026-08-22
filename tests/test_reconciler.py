@@ -446,6 +446,57 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
             "accepted",
         )
 
+    async def test_terminal_status_transition_emits_one_event(self):
+        item_id, run = self._make_work_terminal("idle")
+        await self.reconciler._poll(run["id"])
+        events = self.connection.execute(
+            "SELECT actor_slug,kind,entity_kind,entity_id,metadata_json FROM events "
+            "WHERE kind='terminal.status_changed' AND entity_id=? ORDER BY id",
+            (f"terminal:{run['id']}",),
+        ).fetchall()
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        self.assertEqual(event["actor_slug"], "explorer")
+        self.assertEqual(event["entity_kind"], "terminal")
+        self.assertEqual(
+            json.loads(event["metadata_json"]),
+            {
+                "previous_status": "",
+                "status": "idle",
+                "state": "live",
+                "purpose_kind": "work",
+                "purpose_id": item_id,
+            },
+        )
+        await self.reconciler._poll(run["id"])
+        self.assertEqual(
+            self.connection.execute("SELECT COUNT(*) FROM events WHERE kind='terminal.status_changed'").fetchone()[0],
+            1,
+        )
+        self.fake.status = "processing"
+        await self.reconciler._poll(run["id"])
+        rows = self.connection.execute(
+            "SELECT metadata_json FROM events WHERE kind='terminal.status_changed' ORDER BY id"
+        ).fetchall()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(json.loads(rows[1]["metadata_json"])["previous_status"], "idle")
+        self.assertEqual(json.loads(rows[1]["metadata_json"])["status"], "processing")
+
+    async def test_terminal_status_event_shares_transaction_with_update(self):
+        _, run = self._make_work_terminal("idle")
+        with (
+            self.connection,
+            patch("agents.reconciler.canonical_json", side_effect=RuntimeError("metadata failed")),
+            self.assertRaises(RuntimeError),
+        ):
+            await self.reconciler._poll(run["id"])
+        saved = self.connection.execute("SELECT status FROM terminal_runs WHERE id=?", (run["id"],)).fetchone()
+        self.assertIsNone(saved["status"])
+        self.assertEqual(
+            self.connection.execute("SELECT COUNT(*) FROM events WHERE kind='terminal.status_changed'").fetchone()[0],
+            0,
+        )
+
     async def test_assignment_delivery_waits_for_work_terminal_and_routes_participant_to_persistent(self):
         work = Store(self.connection).create_work(
             actor="human",

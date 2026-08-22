@@ -13,7 +13,7 @@ from typing import Any, Protocol, cast
 from .auth import derive_agent_token, read_private_secret, token_digest
 from .cao_client import CaoClient, CaoNotFound, CaoUnavailable
 from .config import AgentsConfig
-from .db import utc_now
+from .db import canonical_json, utc_now
 from .git_worktree import GitError, head_sha, remove_recorded_worktree
 from .profiles import (
     PROVIDER_CAPABILITIES,
@@ -29,6 +29,13 @@ from .profiles import (
 )
 
 _RETRY = (1, 5, 30, 120, 300)
+
+_COMPLETION_STATUSES = {"completed", "complete", "done", "exited", "stopped"}
+
+
+def _normalize_status(status: str | None) -> str:
+    normalized = (status or "").strip().lower()
+    return "completed" if normalized in _COMPLETION_STATUSES else normalized
 
 
 def _parse(value: str) -> datetime:
@@ -1009,10 +1016,7 @@ class Reconciler:
         since = now if digest != run["output_digest"] else (run["digest_since"] or now)
         status = str(terminal.get("status", "")).lower()
         tail = output[-128 * 1024 :]
-        self.connection.execute(
-            "UPDATE terminal_runs SET status=?,output_digest=?,output_tail=?,digest_since=?,updated_at=? WHERE id=?",
-            (status, digest, tail, since, now, run_id),
-        )
+        self._record_terminal_status(run, status, digest, tail, since, now)
         if status != "waiting_user_answer":
             self.connection.execute(
                 "UPDATE blockers SET state='resolved',resolution='Provider resumed after human answer',updated_at=? "
@@ -1025,7 +1029,7 @@ class Reconciler:
             self._provider_prompt(run, tail)
         elif status == "error":
             self._recover_terminal(run, "provider terminal entered error state")
-        elif status in {"completed", "complete", "done", "exited", "stopped"}:
+        elif status in _COMPLETION_STATUSES:
             if await self._completion_has_outcome(run):
                 await self._complete_terminal(run)
             elif datetime.now(UTC) - _parse(str(since)) >= timedelta(seconds=self.config.runtime.worker_grace_seconds):
@@ -1034,6 +1038,47 @@ class Reconciler:
             seconds=self.config.runtime.stall_seconds
         ):
             self._incident("stalled_terminal", "terminal", str(run_id), "Terminal output has not changed")
+
+    def _record_terminal_status(
+        self,
+        run: sqlite3.Row,
+        status: str,
+        digest: str,
+        tail: str,
+        since: str,
+        now: str,
+    ) -> None:
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            self.connection.execute(
+                "UPDATE terminal_runs SET status=?,output_digest=?,output_tail=?,digest_since=?,updated_at=? WHERE id=?",
+                (status, digest, tail, since, now, run["id"]),
+            )
+            if _normalize_status(run["status"]) != _normalize_status(status):
+                self.connection.execute(
+                    "INSERT INTO events(actor_slug,kind,entity_kind,entity_id,metadata_json,created_at) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (
+                        run["actor_slug"],
+                        "terminal.status_changed",
+                        "terminal",
+                        f"terminal:{run['id']}",
+                        canonical_json(
+                            {
+                                "previous_status": _normalize_status(run["status"]),
+                                "status": _normalize_status(status),
+                                "state": run["state"],
+                                "purpose_kind": run["purpose_kind"],
+                                "purpose_id": run["purpose_id"],
+                            }
+                        ),
+                        now,
+                    ),
+                )
+            self.connection.commit()
+        except BaseException:
+            self.connection.rollback()
+            raise
 
     async def _completion_has_outcome(self, run: sqlite3.Row) -> bool:
         purpose = str(run["purpose_kind"])

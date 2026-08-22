@@ -7,6 +7,7 @@ const state = {
   eventSource: null,
   reloadTimer: null,
 };
+let agentWorld = null;
 const $ = (id) => document.getElementById(id);
 const csrf = () =>
   document.cookie
@@ -242,6 +243,7 @@ async function hydrate() {
     const snapshot = await api("/api/v1/snapshot");
     state.snapshot = snapshot;
     state.eventId = Math.max(state.eventId, snapshot.event_high_water);
+    if (agentWorld) agentWorld.reconcile(snapshot);
     renderRoster();
     renderConversations();
     renderBoard();
@@ -251,6 +253,7 @@ async function hydrate() {
       renderMessages();
     }
     $("connection").textContent = "Live";
+    if (agentWorld) agentWorld.setConnection("live");
     $("status").textContent = "";
     $("status").className = "";
     connectEvents();
@@ -259,30 +262,62 @@ async function hydrate() {
     $("connection").textContent = "Disconnected";
   }
 }
+function scheduleAuthoritativeHydration({ immediate = false } = {}) {
+  clearTimeout(state.reloadTimer);
+  state.reloadTimer = setTimeout(
+    async () => {
+      await hydrate();
+      if (state.work) await loadWork(state.work.work.id);
+      if (state.conversation) await selectConversation(state.conversation, false);
+    },
+    immediate ? 0 : 150,
+  );
+}
 function connectEvents() {
   if (state.eventSource) return;
   const source = new EventSource(`/api/v1/events?after=${state.eventId}`);
   state.eventSource = source;
   source.addEventListener("agents", (event) => {
     const id = Number(event.lastEventId);
-    if (id <= state.eventId) return;
+    if (!Number.isSafeInteger(id) || id <= state.eventId) return;
+
+    const gap = id > state.eventId + 1;
     state.eventId = id;
-    clearTimeout(state.reloadTimer);
-    state.reloadTimer = setTimeout(async () => {
-      await hydrate();
-      if (state.work) await loadWork(state.work.work.id);
-      if (state.conversation) await selectConversation(state.conversation, false);
-    }, 150);
+
+    try {
+      const row = JSON.parse(event.data);
+      try {
+        row.metadata = JSON.parse(row.metadata_json);
+      } catch {
+        row.metadata = null;
+      }
+      if (agentWorld) agentWorld.onEvent(row);
+    } catch {
+      // Animation is best-effort. Hydration below remains mandatory.
+    }
+
+    scheduleAuthoritativeHydration({ immediate: gap });
   });
   source.onopen = () => {
     $("connection").textContent = "Live";
+    if (agentWorld) agentWorld.setConnection("live");
   };
   source.onerror = () => {
     $("connection").textContent = "Reconnecting…";
+    if (agentWorld) agentWorld.setConnection("reconnecting");
     source.close();
     state.eventSource = null;
     setTimeout(connectEvents, 1500);
   };
+}
+function initWorld() {
+  const canvas = $("world-canvas");
+  if (!canvas || agentWorld || typeof window.createAgentWorld !== "function") return;
+  agentWorld = window.createAgentWorld(canvas, {
+    onAgent: (actor) => selectConversation(`dm:human:${actor.slug}`),
+    onWork: (workId) => loadWork(workId),
+    onBlocker: (row) => (row.kind === "waiting_user_answer" ? openAnswer(row) : openBlocker(row)),
+  });
 }
 async function selectConversation(value, announce = true) {
   const row =
@@ -637,4 +672,5 @@ $("logout").addEventListener("click", async () => {
   await api("/auth/logout", { method: "POST", body: {}, intent: true });
   location.href = "/login";
 });
+initWorld();
 hydrate();

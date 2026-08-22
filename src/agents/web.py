@@ -296,7 +296,8 @@ def create_app(config: AgentsConfig | None = None, connection: sqlite3.Connectio
                 "roster": [
                     dict(row)
                     for row in connection.execute(
-                        "SELECT a.*,tr.id terminal_run_id,tr.status terminal_status,tr.state terminal_state "
+                        "SELECT a.*,tr.id terminal_run_id,tr.status terminal_status,tr.state terminal_state,"
+                        "tr.purpose_kind terminal_purpose_kind,tr.purpose_id terminal_purpose_id "
                         "FROM actors a LEFT JOIN terminal_runs tr ON tr.actor_slug=a.slug "
                         "AND tr.state IN ('reserved','creating','live','retained') ORDER BY a.slug"
                     )

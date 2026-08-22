@@ -261,6 +261,19 @@ class WebAuthTests(unittest.TestCase):
             )
             self.assertEqual(generic_ack.status_code, 200)
 
+    def test_snapshot_roster_exposes_terminal_purpose(self):
+        self.client.post("/auth/login", data={"token": "w" * 64}, headers={"Origin": "http://testserver"})
+        self._terminal_run("work", "W-18", "explorer-work-18")
+        data = self.client.get("/api/v1/snapshot").json()["data"]
+        explorer = next(row for row in data["roster"] if row["slug"] == "explorer")
+        self.assertEqual(explorer["terminal_purpose_kind"], "work")
+        self.assertEqual(explorer["terminal_purpose_id"], "W-18")
+        self.assertEqual(explorer["terminal_run_id"], 1)
+        elder = next(row for row in data["roster"] if row["slug"] == "elder")
+        self.assertIsNone(elder["terminal_run_id"])
+        self.assertIsNone(elder["terminal_purpose_kind"])
+        self.assertIsNone(elder["terminal_purpose_id"])
+
     def test_dashboard_assets_and_work_evidence_contract(self):
         self.client.post("/auth/login", data={"token": "w" * 64}, headers={"Origin": "http://testserver"})
         csrf = self.client.cookies.get("agents_csrf")

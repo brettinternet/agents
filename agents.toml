@@ -18,11 +18,11 @@ provider = "opencode"
 api_port = 9889
 # Set one fixed model:
 # model = "openai/gpt-5"
-# reasoning_effort = "high"
+# effort = "high"
 #
-# Or choose one model/reasoning pair when each terminal run is reserved:
+# Or choose one model/effort pair when each terminal run is reserved:
 # models = [
-#   { id = "openai/gpt-5", reasoning_effort = "high" },
+#   { id = "openai/gpt-5", effort = "high" },
 #   { id = "anthropic/claude-sonnet-4-6" },
 # ]
 
@@ -58,7 +58,7 @@ persistent = true
 capacity = 1
 # Optional persona-specific pool; overrides [cao] for this actor.
 # models = [
-#   { id = "openai/gpt-5", reasoning_effort = "high" },
+#   { id = "openai/gpt-5", effort = "high" },
 # ]
 
 [[actors]]

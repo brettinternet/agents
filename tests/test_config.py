@@ -44,7 +44,7 @@ class ConfigTests(unittest.TestCase):
             "api_port=9889",
             """api_port=9889
 models=[
-  {id='openai/gpt-5', reasoning_effort='high'},
+  {id='openai/gpt-5', effort='high'},
   {id='anthropic/claude-sonnet-4-6'},
 ]""",
         ).replace("provider='mock'", "provider='opencode'")
@@ -53,7 +53,7 @@ models=[
             path.write_text(configured)
             choices = load(path, {}).cao.models
             self.assertEqual(
-                [(choice.id, choice.reasoning_effort) for choice in choices],
+                [(choice.id, choice.effort) for choice in choices],
                 [("openai/gpt-5", "high"), ("anthropic/claude-sonnet-4-6", "")],
             )
 
@@ -68,7 +68,7 @@ models=[
                 """slug='elder'
 kind='agent'
 models=[
-  {id='openai/gpt-5', reasoning_effort='high'},
+  {id='openai/gpt-5', effort='high'},
   {id='anthropic/claude-sonnet-4-6'},
 ]""",
             )
@@ -79,7 +79,7 @@ models=[
             path.write_text(configured)
             config = load(path, {})
             self.assertEqual(
-                [(choice.id, choice.reasoning_effort) for choice in config.models_for("elder")],
+                [(choice.id, choice.effort) for choice in config.models_for("elder")],
                 [("openai/gpt-5", "high"), ("anthropic/claude-sonnet-4-6", "")],
             )
             self.assertEqual(config.models_for("unknown")[0].id, "openai/gpt-5-mini")
@@ -120,10 +120,10 @@ models=[
                 ):
                     load(path, env)
 
-    def test_environment_model_and_reasoning_override_toml_choices(self) -> None:
+    def test_environment_model_and_effort_override_toml_choices(self) -> None:
         configured = CONFIG.replace(
             "api_port=9889",
-            "api_port=9889\nmodels=[{id='openai/gpt-5', reasoning_effort='low'}]",
+            "api_port=9889\nmodels=[{id='openai/gpt-5', effort='low'}]",
         ).replace("provider='mock'", "provider='opencode'")
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "agents.toml"
@@ -132,12 +132,10 @@ models=[
                 path,
                 {
                     "AGENTS_MODEL": "openai/gpt-5-mini",
-                    "AGENTS_REASONING_EFFORT": "medium",
+                    "AGENTS_EFFORT": "medium",
                 },
             ).cao.models
-            self.assertEqual(
-                [(choice.id, choice.reasoning_effort) for choice in choices], [("openai/gpt-5-mini", "medium")]
-            )
+            self.assertEqual([(choice.id, choice.effort) for choice in choices], [("openai/gpt-5-mini", "medium")])
 
     def test_empty_environment_model_does_not_override_toml(self) -> None:
         configured = CONFIG.replace("api_port=9889", "api_port=9889\nmodel='mock/model'")
@@ -160,14 +158,37 @@ models=[
                     path.write_text(CONFIG.replace("api_port=9889", f"api_port=9889\n{section}"))
                     load(path, {})
 
-    def test_rejects_reasoning_without_opencode(self) -> None:
+    def test_rejects_effort_without_opencode(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "agents.toml"
-            path.write_text(
-                CONFIG.replace("api_port=9889", "api_port=9889\nmodel='mock/model'\nreasoning_effort='high'")
-            )
+            path.write_text(CONFIG.replace("api_port=9889", "api_port=9889\nmodel='mock/model'\neffort='high'"))
             with self.assertRaisesRegex(ConfigError, "only by the opencode provider"):
                 load(path, {})
+
+    def test_rejects_renamed_reasoning_effort_keys(self) -> None:
+        configured = CONFIG.replace("provider='mock'", "provider='opencode'").replace(
+            "api_port=9889", "api_port=9889\nmodel='openai/gpt-5'\nreasoning_effort='high'"
+        )
+        nested_configured = CONFIG.replace(
+            "api_port=9889",
+            "api_port=9889\nmodels=[{id='openai/gpt-5', reasoning_effort='high'}]",
+        ).replace("provider='mock'", "provider='opencode'")
+        actor_configured = CONFIG.replace(
+            "slug='human'",
+            "slug='elder'\nkind='agent'\nmodel='openai/gpt-5'\nreasoning_effort='high'",
+        ).replace("provider='mock'", "provider='opencode'")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "agents.toml"
+            for content, env in (
+                (configured, {}),
+                (nested_configured, {}),
+                (nested_configured, {"AGENTS_MODEL": "openai/gpt-5-mini"}),
+                (actor_configured, {}),
+                (CONFIG, {"AGENTS_MODEL": "openai/gpt-5", "AGENTS_REASONING_EFFORT": "high"}),
+            ):
+                with self.subTest(content=content, env=env), self.assertRaisesRegex(ConfigError, "renamed"):
+                    path.write_text(content)
+                    load(path, env)
 
     def test_rejects_codex_provider(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

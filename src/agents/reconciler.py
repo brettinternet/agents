@@ -103,7 +103,7 @@ def _reserve_terminal_unchecked(
             "",
             provider,
             model.id,
-            model.reasoning_effort,
+            model.effort,
             generation,
             actor,
             purpose_kind,

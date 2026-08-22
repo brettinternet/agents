@@ -14,13 +14,13 @@ _ALLOWED_ENV = {
     "AGENTS_CONFIG",
     "AGENTS_PROVIDER",
     "AGENTS_MODEL",
-    "AGENTS_REASONING_EFFORT",
+    "AGENTS_EFFORT",
     "AGENTS_CAO_PORT",
     "AGENTS_WEB_PORT",
     "AGENTS_WEB_TOKEN",
 }
 _MODEL_ID = re.compile(r"^[A-Za-z0-9._:/-]{1,128}$")
-_REASONING_EFFORT = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
+_EFFORT = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
 
 
 class ConfigError(ValueError):
@@ -48,7 +48,7 @@ class RuntimeConfig:
 @dataclass(frozen=True)
 class ModelChoice:
     id: str
-    reasoning_effort: str = ""
+    effort: str = ""
 
 
 @dataclass(frozen=True)
@@ -123,14 +123,12 @@ def _verify(value: object) -> tuple[tuple[str, ...], ...]:
     return tuple(commands)
 
 
-def _model_choice(model: object, reasoning_effort: object = "") -> ModelChoice:
+def _model_choice(model: object, effort: object = "") -> ModelChoice:
     if not isinstance(model, str) or not _MODEL_ID.fullmatch(model):
         raise ConfigError("cao model IDs must match ^[A-Za-z0-9._:/-]{1,128}$")
-    if not isinstance(reasoning_effort, str) or (
-        reasoning_effort and not _REASONING_EFFORT.fullmatch(reasoning_effort)
-    ):
-        raise ConfigError("cao reasoning_effort must match ^[A-Za-z0-9._-]{1,32}$")
-    return ModelChoice(model, reasoning_effort)
+    if not isinstance(effort, str) or (effort and not _EFFORT.fullmatch(effort)):
+        raise ConfigError("cao effort must match ^[A-Za-z0-9._-]{1,32}$")
+    return ModelChoice(model, effort)
 
 
 def _models(
@@ -139,39 +137,45 @@ def _models(
     provider: str,
     name: str = "cao",
 ) -> tuple[ModelChoice, ...]:
+    if "AGENTS_REASONING_EFFORT" in values:
+        raise ConfigError("AGENTS_REASONING_EFFORT was renamed to AGENTS_EFFORT")
+    if "reasoning_effort" in section:
+        raise ConfigError(f"{name}.reasoning_effort was renamed to {name}.effort")
+    models = section.get("models")
+    if isinstance(models, list) and any(isinstance(entry, dict) and "reasoning_effort" in entry for entry in models):
+        raise ConfigError(f"{name}.models reasoning_effort was renamed to effort")
     env_model = values.get("AGENTS_MODEL")
-    env_reasoning = values.get("AGENTS_REASONING_EFFORT", "")
+    env_effort = values.get("AGENTS_EFFORT", "")
     if env_model:
-        choices = (_model_choice(env_model, env_reasoning),)
-    elif env_reasoning:
-        raise ConfigError("AGENTS_REASONING_EFFORT requires AGENTS_MODEL")
+        choices = (_model_choice(env_model, env_effort),)
+    elif env_effort:
+        raise ConfigError("AGENTS_EFFORT requires AGENTS_MODEL")
     else:
         model = section.get("model")
-        models = section.get("models")
-        reasoning = section.get("reasoning_effort", "")
+        effort = section.get("effort", "")
         if model is not None and models is not None:
             raise ConfigError(f"{name}.model and {name}.models are mutually exclusive")
         if models is not None:
-            if reasoning:
-                raise ConfigError(f"{name}.reasoning_effort cannot be combined with {name}.models")
+            if effort:
+                raise ConfigError(f"{name}.effort cannot be combined with {name}.models")
             if not isinstance(models, list) or not models:
                 raise ConfigError(f"{name}.models must be a nonempty array of model tables")
             parsed: list[ModelChoice] = []
             for entry in models:
-                if not isinstance(entry, dict) or set(entry) - {"id", "reasoning_effort"} or "id" not in entry:
-                    raise ConfigError(f"each {name}.models entry requires id and optionally reasoning_effort")
-                parsed.append(_model_choice(entry["id"], entry.get("reasoning_effort", "")))
+                if not isinstance(entry, dict) or set(entry) - {"id", "effort"} or "id" not in entry:
+                    raise ConfigError(f"each {name}.models entry requires id and optionally effort")
+                parsed.append(_model_choice(entry["id"], entry.get("effort", "")))
             choices = tuple(parsed)
         elif model is not None:
-            choices = (_model_choice(model, reasoning),)
-        elif reasoning:
-            raise ConfigError(f"{name}.reasoning_effort requires {name}.model")
+            choices = (_model_choice(model, effort),)
+        elif effort:
+            raise ConfigError(f"{name}.effort requires {name}.model")
         else:
             choices = (ModelChoice(""),)
     if len(choices) != len(set(choices)):
-        raise ConfigError(f"{name}.models contains duplicate model/reasoning choices")
-    if provider != "opencode" and any(choice.reasoning_effort for choice in choices):
-        raise ConfigError("reasoning_effort is supported only by the opencode provider")
+        raise ConfigError(f"{name}.models contains duplicate model/effort choices")
+    if provider != "opencode" and any(choice.effort for choice in choices):
+        raise ConfigError("effort is supported only by the opencode provider")
     return choices
 
 
@@ -182,7 +186,7 @@ def _actor_models(
 ) -> tuple[tuple[str, tuple[ModelChoice, ...]], ...]:
     configured: list[tuple[str, tuple[ModelChoice, ...]]] = []
     for actor in actors:
-        if not {"model", "models", "reasoning_effort"}.intersection(actor):
+        if not {"model", "models", "effort", "reasoning_effort"}.intersection(actor):
             continue
         slug = str(actor["slug"])
         if actor.get("kind") != "agent":

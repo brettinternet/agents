@@ -50,16 +50,16 @@ Set one model for every new terminal run:
 ```toml
 [cao]
 model = "openai/gpt-5"
-reasoning_effort = "high"
+effort = "high"
 ```
 
-Or choose a model/reasoning pair uniformly when each run is reserved:
+Or choose a model/effort pair uniformly when each run is reserved:
 
 ```toml
 [cao]
 models = [
-  { id = "openai/gpt-5", reasoning_effort = "high" },
-  { id = "openai/gpt-5", reasoning_effort = "medium" },
+  { id = "openai/gpt-5", effort = "high" },
+  { id = "openai/gpt-5", effort = "medium" },
   { id = "anthropic/claude-sonnet-4-6" },
 ]
 ```
@@ -71,19 +71,19 @@ An agent actor can override the global choice or pool:
 slug = "elder"
 kind = "agent"
 models = [
-  { id = "openai/gpt-5", reasoning_effort = "high" },
+  { id = "openai/gpt-5", effort = "high" },
 ]
 
 [[actors]]
 slug = "explorer"
 kind = "agent"
 models = [
-  { id = "openai/gpt-5-mini", reasoning_effort = "medium" },
+  { id = "openai/gpt-5-mini", effort = "medium" },
   { id = "anthropic/claude-sonnet-4-6" },
 ]
 ```
 
 Actor choices take precedence over `[cao]`; actors without choices use the global configuration. The selected
-pair is persisted for the run, so retries never re-roll it. `reasoning_effort` is available only with the
-OpenCode provider. `AGENTS_MODEL` and optional `AGENTS_REASONING_EFFORT` override every actor and either TOML
+pair is persisted for the run, so retries never re-roll it. `effort` is available only with the OpenCode
+provider. `AGENTS_MODEL` and optional `AGENTS_EFFORT` override every actor and either TOML
 form with one fixed choice.

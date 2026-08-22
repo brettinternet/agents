@@ -9,6 +9,7 @@ vars:
   AGENTS_STATE_DIR: "{{.ROOT_DIR}}/.agents"
   PYTHON: "{{.ROOT_DIR}}/.venv/bin/python"
   ENV_RUN: mise exec varlock -- varlock run -p .env.schema -p .env.local --
+  SECRETS_CLI: mise exec python age sops varlock -- python src/agents/secret_store.py
 
 env:
   UV_TOOL_DIR: "{{.UV_TOOL_DIR}}"
@@ -52,6 +53,27 @@ tasks:
   env:lock:
     desc: Lock the Varlock local encryption session
     cmd: mise exec varlock -- varlock lock
+  secrets:init:
+    desc: Initialize or validate the agent-managed encrypted secret store
+    cmd: "{{.SECRETS_CLI}} init"
+  secrets:check:
+    desc: Validate the agent-managed encrypted secret store
+    cmd: "{{.SECRETS_CLI}} check"
+  secrets:list:
+    desc: List agent-managed secret names
+    cmd: "{{.SECRETS_CLI}} list"
+  secrets:set:
+    desc: Set an agent-managed secret from stdin
+    cmd: "{{.SECRETS_CLI}} set {{.CLI_ARGS}}"
+  secrets:unset:
+    desc: Remove an agent-managed secret
+    cmd: "{{.SECRETS_CLI}} unset {{.CLI_ARGS}}"
+  secrets:reveal:
+    desc: Reveal one agent-managed secret without a newline
+    cmd: "{{.SECRETS_CLI}} reveal {{.CLI_ARGS}}"
+  secrets:run:
+    desc: Run a command with agent-managed secrets through Varlock
+    cmd: "{{.SECRETS_CLI}} run -- {{.CLI_ARGS}}"
   migrate:
     desc: Apply Agents SQLite migrations
     cmd: "{{.ENV_RUN}} {{.PYTHON}} -m agents.cli migrate"

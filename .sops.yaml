@@ -1,0 +1,6 @@
+stores:
+  json:
+    indent: 2
+creation_rules:
+  - path_regex: ^agent-secrets\.sops\.json$
+    age: age159yjl3zwfxpe929t3dmv7zavpcd2yjy9y06qjr2788zz8lnfhvcq9q67tx

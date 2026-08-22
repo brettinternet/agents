@@ -117,6 +117,9 @@ class ProfileTests(unittest.TestCase):
             self.assertIn('AGENTS_AGENT_TOKEN: "secret-token"', text)
             self.assertNotIn("env_vars:", text)
             self.assertEqual(p.path.stat().st_mode & 0o777, 0o600)
+            self.assertIn("only through `task secrets:*`", text)
+            self.assertIn("Never read, copy, stage, or pass `.env.sops-age`", text)
+            self.assertIn("Never read Agents state or human routes", text)
             claude = materialize_profile(
                 root,
                 state,
@@ -136,6 +139,8 @@ class ProfileTests(unittest.TestCase):
             self.assertNotIn("@builtin", claude_text)
             self.assertNotIn('"fs_read"', claude_text)
             self.assertNotIn('"fs_list"', claude_text)
+            self.assertIn("only through `task secrets:*`", claude_text)
+            self.assertIn("Never read, copy, stage, or pass `.env.sops-age`", claude_text)
             self.assertIn(f'"@{claude.mcp_name}"', claude_text)
             self.assertIn("agents-mcp-server", claude_text)
 

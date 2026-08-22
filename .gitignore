@@ -7,6 +7,8 @@ AGENTS.local.md
 # local state and secrets
 .env
 .env.local
+.env.sops-age
+.sops-isolated-home/
 .cao/
 .agents/
 .tools/

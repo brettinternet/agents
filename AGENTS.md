@@ -6,11 +6,15 @@ This repository is a public playground for agents to explore the web, publish au
 
 ## Safety and external actions
 
-Treat every tracked file and commit as public. Never read or persist secrets, credentials, private messages, personal data, authentication artifacts, or proprietary material. Credentials may be supplied to preconfigured tools through environment variables, but agents must not inspect their values. Commit only non-secret example placeholders.
+Treat every tracked file and commit as public. Never read or persist secrets, credentials, private messages, personal data, authentication artifacts, or proprietary material except through the narrow managed-secret boundary below. Credentials may also be supplied to preconfigured tools through environment variables, but agents must not inspect those values. Commit only non-secret example placeholders or SOPS ciphertext.
 
 Browse public resources freely. Post, upload, message, create accounts, spend money, accept terms, or make other external side effects only when the assignment clearly authorizes that action and identifies the intended account or venue. Never impersonate the operator. Follow applicable service rules, and record the public URL or identifier for any durable external artifact.
 
 Prefer reversible experiments. Do not run destructive actions against services or data outside this repository. Generated content must be distinguishable from factual observations, and consequential claims should retain source links.
+
+Agents in execute-capable work or review sessions may access and update values in `agent-secrets.sops.json` only through `task secrets:*`, only for assignment-authorized activity, and only after the key is declared `# @sensitive` in `.env.schema`. Managed plaintext may exist transiently in the private local control-plane or tool transcript when discovery or `secrets:reveal` requires it, but agents must not deliberately echo it or place it in tracked files, commits, messages, command arguments, public or durable logs, or durable memory. Prefer `task secrets:run`; commit ciphertext only.
+
+Never read, copy, stage, or pass `.env.sops-age` or `.sops-isolated-home/` to an agent command. Never access `.env.local`, unrelated credentials or authentication artifacts, user or system age identities, SSH identities, or raw SOPS decryption. Persistent MCP-only sessions must request a work item instead of bypassing this boundary.
 
 ## Durable knowledge
 
@@ -30,6 +34,6 @@ Agents working in this repo are same-user host processes, not an OS sandbox. Rep
 
 Agents must use the Agent MCP surface for backlog, communication, progress, blockers, consultations, reviews, and submissions. A wake is a notification, not authority: call `inbox`, process message IDs in order, inspect `get_assignment`, and acknowledge each message only after its durable action has a definitive response.
 
-Agents must not read secrets, modify `.agents/`, or control CAO directly. However, they may make other changes to the repository tools and package available with `mise.toml` and change versions if necessary.
+Agents must not modify `.agents/` or control CAO directly. However, they may make other changes to the repository tools and package available with `mise.toml` and change versions if necessary.
 
 The Agents system manages one immutable local Git project and one human operator. Remote access uses SSH forwarding to loopback services, and the web token remains required even on loopback.

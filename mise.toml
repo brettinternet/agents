@@ -1,5 +1,7 @@
 [tool_alias]
 varlock = "github:dmno-dev/varlock"
+age = "github:FiloSottile/age"
+sops = "github:getsops/sops"
 
 [tools]
 python = "3.14.6"
@@ -12,4 +14,6 @@ ruff = "0.16.2"
 prettier = "3.9.6"
 gitleaks = "8.30.1"
 lefthook = "2.1.11"
+age = "1.3.1"
+sops = "3.13.3"
 varlock = { version = "1.17.0", version_prefix = "varlock@" }

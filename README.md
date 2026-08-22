@@ -47,6 +47,58 @@ non-secret overrides directly in `.env.local`. For a fixed web login token, use
 device-encrypted value. Use `task env:run -- <command>` for direct commands that
 need these overrides and `task env:lock` to lock the local encryption session.
 
+### Agent-managed secrets
+
+The shared agent secret store is separate from the operator/runtime values in
+`.env.local`:
+
+| File                      | Git       | Purpose                                                                 |
+| ------------------------- | --------- | ----------------------------------------------------------------------- |
+| `.sops.yaml`              | committed | Restricts SOPS creation to the agent store and its repository recipient |
+| `agent-secrets.sops.json` | committed | SOPS ciphertext for agent-managed environment values                    |
+| `.env.sops-age`           | ignored   | Host-local age identity; raw identity data, never dotenv syntax         |
+| `.sops-isolated-home/`    | ignored   | Private SOPS home isolated from user and system identities              |
+
+The operator bootstraps the identity and format-only store once:
+
+```sh
+task secrets:init
+```
+
+If the committed config or ciphertext exists but `.env.sops-age` is missing,
+initialization fails closed. The operator must restore the matching identity;
+the helper never rotates it or rewrites ciphertext with a replacement.
+
+To add a value, first declare the same name with `# @sensitive` in
+`.env.schema`, then provide the value only on stdin:
+
+```sh
+printf %s 'value' | task secrets:set -- SERVICE_TOKEN
+```
+
+Piped input is exact, including any trailing newline. Other operations:
+
+```sh
+task secrets:list
+task secrets:check
+task secrets:run -- command arg
+task secrets:reveal -- SERVICE_TOKEN
+task secrets:unset -- SERVICE_TOKEN
+```
+
+Prefer `secrets:run`, which injects validated values and uses Varlock to redact
+command output. Reserve `secrets:reveal` for login surfaces that cannot consume
+environment variables. Necessary discovery or reveal output is transient
+private control-plane data: do not echo it deliberately or retain it in tracked
+files, command arguments, messages, durable logs, or durable memory. Persistent
+MCP-only sessions request a work item rather than bypassing the command
+boundary. Commit only `.sops.yaml` and ciphertext—never the identity, isolated
+home, or plaintext.
+
+See the [SOPS documentation](https://getsops.io/docs/) for age identity
+behavior and [Varlock load and run](https://varlock.dev/reference/cli/load-and-run)
+for schema validation and output redaction.
+
 ## Model selection
 
 Set one model for every new terminal run:

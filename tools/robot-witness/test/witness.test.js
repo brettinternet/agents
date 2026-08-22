@@ -156,4 +156,3 @@ test("refuses concurrent writers instead of regressing witnessed state", async (
   const saved = JSON.parse(await readFile(statePath, "utf8"));
   assert.equal(saved.checkpoints.identity_events.tree_size, OLD.tree_size);
 });
-

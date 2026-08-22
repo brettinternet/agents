@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import shlex
 import shutil
 import sqlite3
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
 
 import uvicorn
@@ -45,8 +47,71 @@ def _prepare(config: AgentsConfig) -> None:
         connection.close()
 
 
+_PROVIDER_CLI = {
+    "opencode": ("opencode", "run `brew install anomalyco/tap/opencode`"),
+    "claude": ("claude", "install Claude Code and ensure `claude` is on PATH"),
+    "mock": ("mock_cli", "ensure `mock_cli` is on PATH"),
+}
+
+
+def preflight(config: AgentsConfig) -> list[str]:
+    errors: list[str] = []
+    executable, action = _PROVIDER_CLI[config.cao.provider]
+    if shutil.which(executable) is None:
+        errors.append(f"CAO provider executable `{executable}` is missing; operator action: {action}")
+    for setting, placeholder in (("user.name", "Your Name"), ("user.email", "you@example.com")):
+        try:
+            value = git(config.project.path, "config", "--get", setting)
+        except GitError:
+            value = ""
+        if not value:
+            command = shlex.join(("git", "-C", str(config.project.path), "config", setting, placeholder))
+            errors.append(f"Git commit identity `{setting}` is missing; operator action: run `{command}`")
+    return errors
+
+
+def _path_shape(path: str) -> tuple[str, ...]:
+    return tuple(
+        "{}"
+        if len(segment) > 2
+        and segment.startswith("{")
+        and segment.endswith("}")
+        and "{" not in segment[1:-1]
+        and "}" not in segment[1:-1]
+        else segment
+        for segment in path.split("/")
+    )
+
+
+def _missing_openapi_methods(document: Mapping[str, object]) -> list[str]:
+    value = document.get("paths", {})
+    paths = value if isinstance(value, Mapping) else {}
+    required = {
+        "/sessions": {"post"},
+        "/sessions/{session_name}": {"get", "delete"},
+        "/sessions/{session_name}/terminals": {"get"},
+        "/terminals/{terminal_id}": {"get"},
+        "/terminals/{terminal_id}/working-directory": {"get"},
+        "/terminals/{terminal_id}/input": {"post"},
+        "/terminals/{terminal_id}/output": {"get"},
+        "/terminals/{terminal_id}/inbox/messages": {"post"},
+    }
+    missing: list[str] = []
+    for required_path, methods in required.items():
+        available: set[str] = set()
+        shape = _path_shape(required_path)
+        for actual_path, item in paths.items():
+            if isinstance(actual_path, str) and _path_shape(actual_path) == shape and isinstance(item, Mapping):
+                available.update(key for key in item if isinstance(key, str))
+        absent = methods - available
+        if absent:
+            missing.append(f"{required_path} {','.join(sorted(absent))}")
+    return missing
+
+
 def doctor(config: AgentsConfig, online: bool = True) -> list[str]:
     errors: list[str] = []
+    errors.extend(preflight(config))
     try:
         canonical, _ = validate_project(config.project.path, config.project.default_branch)
         if canonical != config.project.path:
@@ -124,22 +189,7 @@ def doctor(config: AgentsConfig, online: bool = True) -> list[str]:
         else:
             try:
                 document = client.openapi()
-                paths = document.get("paths", {})
-                required = {
-                    "/sessions": {"post"},
-                    "/sessions/{session_name}": {"get", "delete"},
-                    "/sessions/{session_name}/terminals": {"get"},
-                    "/terminals/{terminal_id}": {"get"},
-                    "/terminals/{terminal_id}/working-directory": {"get"},
-                    "/terminals/{terminal_id}/input": {"post"},
-                    "/terminals/{terminal_id}/output": {"get"},
-                    "/terminals/{terminal_id}/inbox/messages": {"post"},
-                }
-                missing = [
-                    f"{path} {','.join(sorted(methods - set(paths.get(path, {}))))}"
-                    for path, methods in required.items()
-                    if path not in paths or not methods.issubset(set(paths[path]))
-                ]
+                missing = _missing_openapi_methods(document)
                 if missing:
                     errors.append("CAO OpenAPI is missing required methods: " + ", ".join(missing))
                 encoded = str(document)
@@ -351,8 +401,14 @@ def main(argv: list[str] | None = None) -> None:
     config = _config()
     if args.command == "init":
         _prepare(config)
-        service.start(config)
-        errors = doctor(config)
+        errors = preflight(config)
+        if not errors:
+            try:
+                service.start(config)
+            except service.ServiceError as exc:
+                errors = [str(exc)]
+            else:
+                errors = doctor(config)
     elif args.command == "migrate":
         connection = connect(config.state_dir / "agents.db")
         try:

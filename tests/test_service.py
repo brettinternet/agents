@@ -14,7 +14,75 @@ from agents.db import connect, migrate, utc_now
 from agents.service import ServiceError, _owned, _record, acquire_daemon_lock, shutdown, start
 
 
+def _config(root: Path) -> AgentsConfig:
+    return AgentsConfig(
+        source=root / "agents.toml",
+        root=root,
+        project=ProjectConfig("test", root, "main", (("task", "check"),)),
+        runtime=RuntimeConfig(5, 1800, 12, 4, 3, 86400),
+        cao=CaoConfig("2.4.1", "mock", "mock_cli", 9889, (ModelChoice(""),)),
+        web=WebConfig("127.0.0.1", 9890),
+        actors=(),
+    )
+
+
 class ServiceTests(unittest.TestCase):
+    def test_start_reuses_healthy_owned_services_without_launching(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = _config(Path(temporary))
+            with (
+                patch("agents.service._owned", return_value=(123, {})),
+                patch("agents.service._health_ready", return_value=True) as health,
+                patch("agents.service.subprocess.Popen") as launch,
+            ):
+                start(config)
+
+            self.assertEqual(health.call_count, 2)
+            launch.assert_not_called()
+
+    def test_start_requires_explicit_restart_for_unhealthy_owned_services(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = _config(Path(temporary))
+            with (
+                patch("agents.service._owned", return_value=(123, {})),
+                patch("agents.service._health_ready", return_value=False),
+                self.assertRaisesRegex(
+                    ServiceError, "owned services are running but unhealthy.*server:stop.*server:start"
+                ),
+            ):
+                start(config)
+
+    def test_start_rejects_stale_ownership_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = _config(root)
+            config.state_dir.mkdir(mode=0o700)
+            (config.state_dir / "agentsd.pid").write_text("{}")
+            with (
+                patch("agents.service._owned", return_value=None),
+                self.assertRaisesRegex(ServiceError, "stale service ownership record for agentsd.*server:stop"),
+            ):
+                start(config)
+
+    def test_start_rejects_incomplete_owned_service_set(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = _config(Path(temporary))
+            with (
+                patch("agents.service._owned", side_effect=((123, {}), None)),
+                self.assertRaisesRegex(ServiceError, r"incomplete owned service set \(agentsd running\).*server:stop"),
+            ):
+                start(config)
+
+    def test_start_rejects_foreign_listener(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = _config(Path(temporary))
+            with (
+                patch("agents.service._owned", return_value=None),
+                patch("agents.service._port_free", return_value=False),
+                self.assertRaisesRegex(ServiceError, "configured listener is already owned by another process"),
+            ):
+                start(config)
+
     def test_daemon_lock_is_exclusive(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             state = Path(temporary)

@@ -44,19 +44,31 @@ function checkpointResponse(checkpoint, publicKey = PUBLIC_KEY) {
 }
 
 function jsonResponse(body) {
-  return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
 }
 
 test("verifies registry signatures over exact checkpoint payloads", () => {
   assert.equal(verifyCheckpointSignature(OLD, PUBLIC_KEY), true);
-  assert.equal(verifyCheckpointSignature({ ...OLD, tree_size: OLD.tree_size + 1 }, PUBLIC_KEY), false);
+  assert.equal(
+    verifyCheckpointSignature({ ...OLD, tree_size: OLD.tree_size + 1 }, PUBLIC_KEY),
+    false,
+  );
 });
 
 test("verifies a live RFC 6962 append-only proof and rejects tampering", () => {
-  assert.equal(verifyConsistency(OLD.tree_size, CURRENT.tree_size, OLD.root, CURRENT.root, PROOF), true);
+  assert.equal(
+    verifyConsistency(OLD.tree_size, CURRENT.tree_size, OLD.root, CURRENT.root, PROOF),
+    true,
+  );
   const tampered = [...PROOF];
   tampered[3] = `0${tampered[3].slice(1)}`;
-  assert.equal(verifyConsistency(OLD.tree_size, CURRENT.tree_size, OLD.root, CURRENT.root, tampered), false);
+  assert.equal(
+    verifyConsistency(OLD.tree_size, CURRENT.tree_size, OLD.root, CURRENT.root, tampered),
+    false,
+  );
 });
 
 test("pins on first use, then advances only through a valid consistency proof", async () => {
@@ -74,17 +86,21 @@ test("pins on first use, then advances only through a valid consistency proof", 
 
   const first = await witness({ statePath, fetchImpl });
   assert.equal(first.trust, "trust-on-first-use");
-  assert.deepEqual(first.results, [{ log: "identity_events", status: "pinned", tree_size: OLD.tree_size }]);
+  assert.deepEqual(first.results, [
+    { log: "identity_events", status: "pinned", tree_size: OLD.tree_size },
+  ]);
 
   latest = CURRENT;
   const second = await witness({ statePath, fetchImpl });
-  assert.deepEqual(second.results, [{
-    log: "identity_events",
-    status: "advanced",
-    from: OLD.tree_size,
-    to: CURRENT.tree_size,
-    added: CURRENT.tree_size - OLD.tree_size,
-  }]);
+  assert.deepEqual(second.results, [
+    {
+      log: "identity_events",
+      status: "advanced",
+      from: OLD.tree_size,
+      to: CURRENT.tree_size,
+      added: CURRENT.tree_size - OLD.tree_size,
+    },
+  ]);
   assert.equal(requests.length, 3);
   const saved = JSON.parse(await readFile(statePath, "utf8"));
   assert.equal(saved.checkpoints.identity_events.root, CURRENT.root);
@@ -118,7 +134,10 @@ test("rejects an advertised key change without replacing witnessed state", async
   const changedKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
   await assert.rejects(
-    witness({ statePath, fetchImpl: async () => jsonResponse(checkpointResponse(OLD, changedKey)) }),
+    witness({
+      statePath,
+      fetchImpl: async () => jsonResponse(checkpointResponse(OLD, changedKey)),
+    }),
     /registry key changed/,
   );
   assert.equal(await readFile(statePath, "utf8"), before);

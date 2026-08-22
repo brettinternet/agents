@@ -1,130 +1,99 @@
 <!doctype html>
 <html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Agents</title>
-  <link rel="stylesheet" href="/static/styles.css">
-</head>
-<body>
-  <div id="status" role="status" aria-live="polite">Loading Agents…</div>
-  <div class="shell">
-    <nav aria-label="Agents navigation">
-      <div class="brand">
-        <p class="eyebrow">Internet exploration</p>
-        <h1>Agents</h1>
-      </div>
-      <div class="nav-actions">
-        <button id="new-intake" class="primary" type="button">New request</button>
-        <button id="new-dm" type="button">New direct message</button>
-      </div>
-      <label for="search">Search messages</label>
-      <input id="search" type="search" autocomplete="off" placeholder="Search durable history">
-      <h2>Channels and threads</h2>
-      <ul id="conversations" class="nav-list" aria-label="Conversations"></ul>
-      <h2>Roster</h2>
-      <ul id="roster" class="nav-list roster" aria-label="Agents roster"></ul>
-      <button id="logout" class="quiet" type="button">Sign out</button>
-    </nav>
-
-    <main>
-      <header class="main-header">
-        <div>
-          <p class="eyebrow">One repository · durable evidence</p>
-          <h2 id="view-title">Agents board</h2>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Agents</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div id="status" role="status" aria-live="polite">Loading Agents…</div>
+    <div class="shell">
+      <nav aria-label="Agents navigation">
+        <div class="brand">
+          <p class="eyebrow">Internet exploration</p>
+          <h1>Agents</h1>
         </div>
-        <div class="connection-wrap">
-          <span id="connection" class="connection connecting">Connecting…</span>
-          <button id="retry-connect" class="quiet compact" type="button" hidden>Retry</button>
+        <div class="nav-actions">
+          <button id="new-intake" class="primary" type="button">New request</button>
+          <button id="new-dm" type="button">New direct message</button>
         </div>
-      </header>
-      <section id="view-state" class="view-state" tabindex="-1" hidden></section>
-      <section id="retry-panel" class="retry-panel" aria-labelledby="retry-title" hidden>
-        <h3 id="retry-title">Requests awaiting a definitive result</h3>
-        <p>These retries resend the exact saved method, path, body, and idempotency key.</p>
-        <ul id="pending-intents"></ul>
-      </section>
-      <section id="queues" class="queues" aria-label="Operational queues"></section>
-      <section id="board" class="board" aria-label="Work board" aria-busy="true">
-        <p class="empty-state">Loading the board…</p>
-      </section>
-    </main>
+        <label for="search">Search messages</label>
+        <input id="search" type="search" autocomplete="off" placeholder="Search durable history" />
+        <h2>Channels and threads</h2>
+        <ul id="conversations" class="nav-list" aria-label="Conversations"></ul>
+        <h2>Roster</h2>
+        <ul id="roster" class="nav-list roster" aria-label="Agents roster"></ul>
+        <button id="logout" class="quiet" type="button">Sign out</button>
+      </nav>
 
-    <aside aria-label="Conversation and work detail">
-      <section id="detail" class="detail" aria-live="polite">
-        <h2>Details</h2>
-        <p class="empty-state">Select work, a queue, or terminal output to inspect durable evidence.</p>
-      </section>
-      <section class="thread">
-        <header class="thread-header">
+      <main>
+        <header class="main-header">
           <div>
-            <p class="eyebrow">Durable conversation</p>
-            <h2 id="thread-title">#findings</h2>
+            <p class="eyebrow">One repository · durable evidence</p>
+            <h2 id="view-title">Agents board</h2>
           </div>
-          <button id="older" class="quiet compact" type="button" disabled>Load older</button>
+          <div class="connection-wrap">
+            <span id="connection" class="connection connecting">Connecting…</span>
+            <button id="retry-connect" class="quiet compact" type="button" hidden>Retry</button>
+          </div>
         </header>
-        <div id="messages" class="messages" tabindex="0" aria-live="polite" aria-busy="true">
-          <p class="empty-state">Loading messages…</p>
-        </div>
-        <form id="compose" class="compose">
-          <p class="form-error" role="alert" hidden></p>
-          <label for="message-body">Message</label>
-          <textarea id="message-body" required maxlength="16384"></textarea>
-          <div class="form-row">
-            <label for="message-urgency">Urgency</label>
-            <select id="message-urgency">
-              <option value="normal">Normal</option>
-              <option value="urgent">Urgent</option>
-            </select>
-            <button class="primary" type="submit">Send</button>
+        <section id="view-state" class="view-state" tabindex="-1" hidden></section>
+        <section id="retry-panel" class="retry-panel" aria-labelledby="retry-title" hidden>
+          <h3 id="retry-title">Requests awaiting a definitive result</h3>
+          <p>These retries resend the exact saved method, path, body, and idempotency key.</p>
+          <ul id="pending-intents"></ul>
+        </section>
+        <section id="queues" class="queues" aria-label="Operational queues"></section>
+        <section id="board" class="board" aria-label="Work board" aria-busy="true">
+          <p class="empty-state">Loading the board…</p>
+        </section>
+      </main>
+
+      <aside aria-label="Conversation and work detail">
+        <section id="detail" class="detail" aria-live="polite">
+          <h2>Details</h2>
+          <p class="empty-state">
+            Select work, a queue, or terminal output to inspect durable evidence.
+          </p>
+        </section>
+        <section class="thread">
+          <header class="thread-header">
+            <div>
+              <p class="eyebrow">Durable conversation</p>
+              <h2 id="thread-title">#findings</h2>
+            </div>
+            <button id="older" class="quiet compact" type="button" disabled>Load older</button>
+          </header>
+          <div id="messages" class="messages" tabindex="0" aria-live="polite" aria-busy="true">
+            <p class="empty-state">Loading messages…</p>
           </div>
-        </form>
-      </section>
-    </aside>
-  </div>
+          <form id="compose" class="compose">
+            <p class="form-error" role="alert" hidden></p>
+            <label for="message-body">Message</label>
+            <textarea id="message-body" required maxlength="16384"></textarea>
+            <div class="form-row">
+              <label for="message-urgency">Urgency</label>
+              <select id="message-urgency">
+                <option value="normal">Normal</option>
+                <option value="urgent">Urgent</option>
+              </select>
+              <button class="primary" type="submit">Send</button>
+            </div>
+          </form>
+        </section>
+      </aside>
+    </div>
 
-  <dialog id="intake-dialog">
-    <form id="intake-form">
-      <header class="dialog-header">
-        <p class="eyebrow">Product intake</p>
-        <h2>Submit product request</h2>
-      </header>
-      <p class="form-error" role="alert" hidden></p>
-      <label>Kind
-        <select name="kind">
-          <option value="story">Story</option>
-          <option value="bug">Bug</option>
-          <option value="task">Task</option>
-          <option value="spike">Spike</option>
-        </select>
-      </label>
-      <label>Title
-        <input name="title" required maxlength="200">
-      </label>
-      <label>Problem
-        <textarea name="problem" required maxlength="16384"></textarea>
-      </label>
-      <label>Outcome
-        <textarea name="outcome" required maxlength="16384"></textarea>
-      </label>
-      <div class="actions">
-        <button type="button" data-close>Cancel</button>
-        <button class="primary" type="submit">Submit</button>
-      </div>
-    </form>
-  </dialog>
-
-  <dialog id="refine-dialog" class="wide-dialog">
-    <form id="refine-form">
-      <header class="dialog-header">
-        <p class="eyebrow">Product Owner scope</p>
-        <h2 id="refine-title">Refine work</h2>
-      </header>
-      <p class="form-error" role="alert" hidden></p>
-      <input type="hidden" name="item">
-      <input type="hidden" name="expected_version">
-      <div class="form-grid">
-        <label>Kind
+    <dialog id="intake-dialog">
+      <form id="intake-form">
+        <header class="dialog-header">
+          <p class="eyebrow">Product intake</p>
+          <h2>Submit product request</h2>
+        </header>
+        <p class="form-error" role="alert" hidden></p>
+        <label
+          >Kind
           <select name="kind">
             <option value="story">Story</option>
             <option value="bug">Bug</option>
@@ -132,164 +101,226 @@
             <option value="spike">Spike</option>
           </select>
         </label>
-        <label>Priority
-          <select name="priority">
-            <option value="urgent">Urgent</option>
-            <option value="high">High</option>
-            <option value="normal">Normal</option>
-            <option value="low">Low</option>
+        <label
+          >Title
+          <input name="title" required maxlength="200" />
+        </label>
+        <label
+          >Problem
+          <textarea name="problem" required maxlength="16384"></textarea>
+        </label>
+        <label
+          >Outcome
+          <textarea name="outcome" required maxlength="16384"></textarea>
+        </label>
+        <div class="actions">
+          <button type="button" data-close>Cancel</button>
+          <button class="primary" type="submit">Submit</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="refine-dialog" class="wide-dialog">
+      <form id="refine-form">
+        <header class="dialog-header">
+          <p class="eyebrow">Product Owner scope</p>
+          <h2 id="refine-title">Refine work</h2>
+        </header>
+        <p class="form-error" role="alert" hidden></p>
+        <input type="hidden" name="item" />
+        <input type="hidden" name="expected_version" />
+        <div class="form-grid">
+          <label
+            >Kind
+            <select name="kind">
+              <option value="story">Story</option>
+              <option value="bug">Bug</option>
+              <option value="task">Task</option>
+              <option value="spike">Spike</option>
+            </select>
+          </label>
+          <label
+            >Priority
+            <select name="priority">
+              <option value="urgent">Urgent</option>
+              <option value="high">High</option>
+              <option value="normal">Normal</option>
+              <option value="low">Low</option>
+            </select>
+          </label>
+          <label
+            >Exploration specialty
+            <select name="specialty" required>
+              <option value="">Choose a specialty</option>
+              <option value="research">Research</option>
+              <option value="publishing">Publishing</option>
+            </select>
+          </label>
+        </div>
+        <label
+          >Title
+          <input name="title" required maxlength="200" />
+        </label>
+        <label
+          >Problem
+          <textarea name="problem" required maxlength="16384"></textarea>
+        </label>
+        <label
+          >Outcome
+          <textarea name="outcome" required maxlength="16384"></textarea>
+        </label>
+        <label
+          >Acceptance criteria <span class="hint">One criterion per line</span>
+          <textarea name="acceptance_criteria" required maxlength="102449"></textarea>
+        </label>
+        <label
+          >Dependencies <span class="hint">Work IDs separated by commas or new lines</span>
+          <textarea name="dependencies" maxlength="4096"></textarea>
+        </label>
+        <fieldset>
+          <legend>Review gates</legend>
+          <label class="check"
+            ><input type="checkbox" checked disabled /> Research (required)</label
+          >
+          <label class="check"
+            ><input type="checkbox" name="review_gate" value="publishing" /> Publishing</label
+          >
+          <label class="check"
+            ><input type="checkbox" name="review_gate" value="coordination" /> Coordination</label
+          >
+        </fieldset>
+        <section class="consultation-summary" aria-labelledby="refine-consultations-title">
+          <h3 id="refine-consultations-title">Consultation evidence</h3>
+          <div id="refine-consultations"></div>
+        </section>
+        <div class="actions">
+          <button type="button" data-close>Cancel</button>
+          <button class="primary" type="submit">Save scope</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="action-dialog">
+      <form id="action-form">
+        <header class="dialog-header">
+          <p class="eyebrow">Human work control</p>
+          <h2 id="action-title">Work action</h2>
+        </header>
+        <p class="form-error" role="alert" hidden></p>
+        <label
+          >Action
+          <select name="action"></select>
+        </label>
+        <input type="hidden" name="item" />
+        <label id="action-reason-label"
+          >Reason or feedback
+          <textarea name="reason" maxlength="16384"></textarea>
+        </label>
+        <div class="actions">
+          <button type="button" data-close>Cancel</button>
+          <button class="primary" type="submit">Apply</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="decision-dialog">
+      <form id="decision-form">
+        <header class="dialog-header">
+          <p class="eyebrow">Human decision</p>
+          <h2 id="decision-title">Resolve decision</h2>
+        </header>
+        <p id="decision-question"></p>
+        <p id="decision-recommendation" class="callout"></p>
+        <p class="form-error" role="alert" hidden></p>
+        <input type="hidden" name="decision_id" />
+        <input type="hidden" name="item_id" />
+        <input type="hidden" name="expected_version" />
+        <label
+          >Resolution
+          <select name="resolution" required></select>
+        </label>
+        <div class="actions">
+          <button type="button" data-close>Cancel</button>
+          <button class="primary" type="submit">Resolve</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="blocker-dialog">
+      <form id="blocker-form">
+        <header class="dialog-header">
+          <p class="eyebrow">Scrum Master queue</p>
+          <h2 id="blocker-title">Resolve blocker</h2>
+        </header>
+        <p id="blocker-reason" class="callout"></p>
+        <p class="form-error" role="alert" hidden></p>
+        <input type="hidden" name="blocker_id" />
+        <input type="hidden" name="item_id" />
+        <input type="hidden" name="expected_version" />
+        <label
+          >Action
+          <select name="action">
+            <option value="resume">Resume</option>
+            <option value="restart">Restart with a new generation</option>
+            <option value="escalate">Escalate to human</option>
           </select>
         </label>
-        <label>Exploration specialty
-          <select name="specialty" required>
-            <option value="">Choose a specialty</option>
-            <option value="research">Research</option>
-            <option value="publishing">Publishing</option>
-          </select>
+        <label
+          >Resolution
+          <textarea name="resolution" required maxlength="16384"></textarea>
         </label>
-      </div>
-      <label>Title
-        <input name="title" required maxlength="200">
-      </label>
-      <label>Problem
-        <textarea name="problem" required maxlength="16384"></textarea>
-      </label>
-      <label>Outcome
-        <textarea name="outcome" required maxlength="16384"></textarea>
-      </label>
-      <label>Acceptance criteria <span class="hint">One criterion per line</span>
-        <textarea name="acceptance_criteria" required maxlength="102449"></textarea>
-      </label>
-      <label>Dependencies <span class="hint">Work IDs separated by commas or new lines</span>
-        <textarea name="dependencies" maxlength="4096"></textarea>
-      </label>
-      <fieldset>
-        <legend>Review gates</legend>
-        <label class="check"><input type="checkbox" checked disabled> Research (required)</label>
-        <label class="check"><input type="checkbox" name="review_gate" value="publishing"> Publishing</label>
-        <label class="check"><input type="checkbox" name="review_gate" value="coordination"> Coordination</label>
-      </fieldset>
-      <section class="consultation-summary" aria-labelledby="refine-consultations-title">
-        <h3 id="refine-consultations-title">Consultation evidence</h3>
-        <div id="refine-consultations"></div>
-      </section>
-      <div class="actions">
-        <button type="button" data-close>Cancel</button>
-        <button class="primary" type="submit">Save scope</button>
-      </div>
-    </form>
-  </dialog>
+        <div class="actions">
+          <button type="button" data-close>Cancel</button>
+          <button class="primary" type="submit">Apply resolution</button>
+        </div>
+      </form>
+    </dialog>
 
-  <dialog id="action-dialog">
-    <form id="action-form">
-      <header class="dialog-header">
-        <p class="eyebrow">Human work control</p>
-        <h2 id="action-title">Work action</h2>
-      </header>
-      <p class="form-error" role="alert" hidden></p>
-      <label>Action
-        <select name="action"></select>
-      </label>
-      <input type="hidden" name="item">
-      <label id="action-reason-label">Reason or feedback
-        <textarea name="reason" maxlength="16384"></textarea>
-      </label>
-      <div class="actions">
-        <button type="button" data-close>Cancel</button>
-        <button class="primary" type="submit">Apply</button>
-      </div>
-    </form>
-  </dialog>
+    <dialog id="answer-dialog">
+      <form id="answer-form">
+        <header class="dialog-header">
+          <p class="eyebrow">One-shot terminal input</p>
+          <h2 id="answer-title">Answer terminal</h2>
+        </header>
+        <p class="warning">
+          Answers are stored in Agents state and CAO 2.4.1 carries them in a local request URL.
+          Never enter secrets.
+        </p>
+        <p class="form-error" role="alert" hidden></p>
+        <input type="hidden" name="terminal_run_id" />
+        <label
+          >Answer
+          <textarea name="body" required maxlength="2048"></textarea>
+        </label>
+        <div class="actions">
+          <button type="button" data-close>Cancel</button>
+          <button class="primary" type="submit">Send once</button>
+        </div>
+      </form>
+    </dialog>
 
-  <dialog id="decision-dialog">
-    <form id="decision-form">
-      <header class="dialog-header">
-        <p class="eyebrow">Human decision</p>
-        <h2 id="decision-title">Resolve decision</h2>
-      </header>
-      <p id="decision-question"></p>
-      <p id="decision-recommendation" class="callout"></p>
-      <p class="form-error" role="alert" hidden></p>
-      <input type="hidden" name="decision_id">
-      <input type="hidden" name="item_id">
-      <input type="hidden" name="expected_version">
-      <label>Resolution
-        <select name="resolution" required></select>
-      </label>
-      <div class="actions">
-        <button type="button" data-close>Cancel</button>
-        <button class="primary" type="submit">Resolve</button>
-      </div>
-    </form>
-  </dialog>
+    <dialog id="dm-dialog">
+      <form id="dm-form">
+        <header class="dialog-header">
+          <p class="eyebrow">Direct message</p>
+          <h2>Start a direct message</h2>
+        </header>
+        <p class="form-error" role="alert" hidden></p>
+        <label
+          >Live role
+          <select name="actor" required></select>
+        </label>
+        <label
+          >Message
+          <textarea name="body" required maxlength="16384"></textarea>
+        </label>
+        <div class="actions">
+          <button type="button" data-close>Cancel</button>
+          <button class="primary" type="submit">Send message</button>
+        </div>
+      </form>
+    </dialog>
 
-  <dialog id="blocker-dialog">
-    <form id="blocker-form">
-      <header class="dialog-header">
-        <p class="eyebrow">Scrum Master queue</p>
-        <h2 id="blocker-title">Resolve blocker</h2>
-      </header>
-      <p id="blocker-reason" class="callout"></p>
-      <p class="form-error" role="alert" hidden></p>
-      <input type="hidden" name="blocker_id">
-      <input type="hidden" name="item_id">
-      <input type="hidden" name="expected_version">
-      <label>Action
-        <select name="action">
-          <option value="resume">Resume</option>
-          <option value="restart">Restart with a new generation</option>
-          <option value="escalate">Escalate to human</option>
-        </select>
-      </label>
-      <label>Resolution
-        <textarea name="resolution" required maxlength="16384"></textarea>
-      </label>
-      <div class="actions">
-        <button type="button" data-close>Cancel</button>
-        <button class="primary" type="submit">Apply resolution</button>
-      </div>
-    </form>
-  </dialog>
-
-  <dialog id="answer-dialog">
-    <form id="answer-form">
-      <header class="dialog-header">
-        <p class="eyebrow">One-shot terminal input</p>
-        <h2 id="answer-title">Answer terminal</h2>
-      </header>
-      <p class="warning">Answers are stored in Agents state and CAO 2.4.1 carries them in a local request URL. Never enter secrets.</p>
-      <p class="form-error" role="alert" hidden></p>
-      <input type="hidden" name="terminal_run_id">
-      <label>Answer
-        <textarea name="body" required maxlength="2048"></textarea>
-      </label>
-      <div class="actions">
-        <button type="button" data-close>Cancel</button>
-        <button class="primary" type="submit">Send once</button>
-      </div>
-    </form>
-  </dialog>
-
-  <dialog id="dm-dialog">
-    <form id="dm-form">
-      <header class="dialog-header">
-        <p class="eyebrow">Direct message</p>
-        <h2>Start a direct message</h2>
-      </header>
-      <p class="form-error" role="alert" hidden></p>
-      <label>Live role
-        <select name="actor" required></select>
-      </label>
-      <label>Message
-        <textarea name="body" required maxlength="16384"></textarea>
-      </label>
-      <div class="actions">
-        <button type="button" data-close>Cancel</button>
-        <button class="primary" type="submit">Send message</button>
-      </div>
-    </form>
-  </dialog>
-
-  <script src="/static/app.js" defer></script>
-</body>
+    <script src="/static/app.js" defer></script>
+  </body>
 </html>

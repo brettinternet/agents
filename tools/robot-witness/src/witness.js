@@ -17,7 +17,12 @@ async function getJson(fetchImpl, url) {
 async function loadState(path) {
   try {
     const state = JSON.parse(await readFile(path, "utf8"));
-    if (state.version !== 1 || typeof state.public_key !== "string" || typeof state.checkpoints !== "object" || state.checkpoints === null) {
+    if (
+      state.version !== 1 ||
+      typeof state.public_key !== "string" ||
+      typeof state.checkpoints !== "object" ||
+      state.checkpoints === null
+    ) {
       throw new Error("unsupported or malformed witness state");
     }
     return state;
@@ -40,7 +45,9 @@ async function acquireLock(path, statePath) {
     handle = await open(path, "wx", 0o600);
   } catch (error) {
     if (error?.code === "EEXIST") {
-      throw new Error(`another witness is already using ${statePath}; if it was killed, inspect and remove ${path}`);
+      throw new Error(
+        `another witness is already using ${statePath}; if it was killed, inspect and remove ${path}`,
+      );
     }
     throw error;
   }
@@ -78,11 +85,13 @@ function checkpointMap(checkpoints) {
 }
 
 function sameCheckpoint(left, right) {
-  return left.log === right.log
-    && left.tree_size === right.tree_size
-    && left.root === right.root
-    && left.sig === right.sig
-    && left.created_at === right.created_at;
+  return (
+    left.log === right.log &&
+    left.tree_size === right.tree_size &&
+    left.root === right.root &&
+    left.sig === right.sig &&
+    left.created_at === right.created_at
+  );
 }
 
 function assertSigned(checkpoint, publicKey, label = checkpoint.log) {
@@ -91,13 +100,10 @@ function assertSigned(checkpoint, publicKey, label = checkpoint.log) {
   }
 }
 
-async function runWitness({
-  origin,
-  statePath,
-  fetchImpl,
-}) {
+async function runWitness({ origin, statePath, fetchImpl }) {
   const base = new URL(origin);
-  if (base.pathname !== "/" || base.search || base.hash) throw new Error("origin must not contain a path, query, or fragment");
+  if (base.pathname !== "/" || base.search || base.hash)
+    throw new Error("origin must not contain a path, query, or fragment");
 
   const saved = await loadState(statePath);
   const latestUrl = new URL("/api/checkpoint", base);
@@ -114,12 +120,14 @@ async function runWitness({
   const results = [];
   if (saved) {
     for (const log of Object.keys(saved.checkpoints)) {
-      if (!Object.hasOwn(current, log)) throw new Error(`previously witnessed log disappeared: ${log}`);
+      if (!Object.hasOwn(current, log))
+        throw new Error(`previously witnessed log disappeared: ${log}`);
     }
   }
 
   for (const [log, checkpoint] of Object.entries(current)) {
-    const previous = saved && Object.hasOwn(saved.checkpoints, log) ? saved.checkpoints[log] : undefined;
+    const previous =
+      saved && Object.hasOwn(saved.checkpoints, log) ? saved.checkpoints[log] : undefined;
     if (!previous) {
       results.push({ log, status: saved ? "new" : "pinned", tree_size: checkpoint.tree_size });
       continue;
@@ -128,7 +136,8 @@ async function runWitness({
       throw new Error(`${log} shrank from ${previous.tree_size} to ${checkpoint.tree_size}`);
     }
     if (checkpoint.tree_size === previous.tree_size) {
-      if (checkpoint.root !== previous.root) throw new Error(`${log} root changed at tree size ${checkpoint.tree_size}`);
+      if (checkpoint.root !== previous.root)
+        throw new Error(`${log} root changed at tree size ${checkpoint.tree_size}`);
       results.push({ log, status: "unchanged", tree_size: checkpoint.tree_size });
       continue;
     }
@@ -139,17 +148,25 @@ async function runWitness({
     proofUrl.searchParams.set("to", String(checkpoint.tree_size));
     const consistency = await getJson(fetchImpl, proofUrl);
     if (
-      consistency.log !== log
-      || (consistency.from?.log !== undefined && consistency.from.log !== log)
-      || (consistency.to?.log !== undefined && consistency.to.log !== log)
-      || !sameCheckpoint({ ...consistency.from, log }, previous)
-      || !sameCheckpoint({ ...consistency.to, log }, checkpoint)
+      consistency.log !== log ||
+      (consistency.from?.log !== undefined && consistency.from.log !== log) ||
+      (consistency.to?.log !== undefined && consistency.to.log !== log) ||
+      !sameCheckpoint({ ...consistency.from, log }, previous) ||
+      !sameCheckpoint({ ...consistency.to, log }, checkpoint)
     ) {
       throw new Error(`${log} consistency response does not match the witnessed endpoints`);
     }
     assertSigned({ ...consistency.from, log }, publicKey, `${log} previous`);
     assertSigned({ ...consistency.to, log }, publicKey, `${log} current`);
-    if (!verifyConsistency(previous.tree_size, checkpoint.tree_size, previous.root, checkpoint.root, consistency.proof)) {
+    if (
+      !verifyConsistency(
+        previous.tree_size,
+        checkpoint.tree_size,
+        previous.root,
+        checkpoint.root,
+        consistency.proof,
+      )
+    ) {
       throw new Error(`${log} append-only consistency proof is invalid`);
     }
     results.push({

@@ -1,0 +1,19 @@
+---
+# yaml-language-server: $schema=https://raw.githubusercontent.com/evilmartians/lefthook/master/schema.json
+
+pre-commit:
+  parallel: true
+  jobs:
+    - name: Check staged Prettier formatting
+      glob: "*.{css,html,js,json,jsonc,md,mdx,yaml,yml}"
+      run: mise exec prettier -- prettier --check --ignore-unknown -- {staged_files}
+    - name: Check staged Python formatting
+      glob: "*.py"
+      run: mise exec ruff -- ruff format --check -- {staged_files}
+    - name: Lint staged Python
+      glob: "*.py"
+      run: mise exec ruff -- ruff check -- {staged_files}
+    - name: Check for secret leaks
+      run: mise exec gitleaks -- gitleaks git --pre-commit --redact --staged --verbose --no-banner
+    - name: Check for configured secret values
+      run: mise exec varlock -- varlock scan -p .env.schema -p .env.local --staged

@@ -1,0 +1,104 @@
+---
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+version: "3"
+
+vars:
+  UV_TOOL_DIR: "{{.ROOT_DIR}}/.tools/uv"
+  UV_TOOL_BIN_DIR: "{{.ROOT_DIR}}/.tools/bin"
+  CAO_HOME_DIR: "{{.ROOT_DIR}}/.cao"
+  AGENTS_STATE_DIR: "{{.ROOT_DIR}}/.agents"
+  PYTHON: "{{.ROOT_DIR}}/.venv/bin/python"
+  ENV_RUN: mise exec varlock -- varlock run -p .env.schema -p .env.local --
+
+env:
+  UV_TOOL_DIR: "{{.UV_TOOL_DIR}}"
+  UV_TOOL_BIN_DIR: "{{.UV_TOOL_BIN_DIR}}"
+  CAO_HOME_DIR: "{{.CAO_HOME_DIR}}"
+  AGENTS_CONFIG: "{{.ROOT_DIR}}/agents.toml"
+
+tasks:
+  default:
+    desc: Show available Agents tasks
+    silent: true
+    cmd: task --list
+  init:
+    desc: Install dependencies, configure hooks, and initialize Agents
+    cmds:
+      - mkdir -p .tools/bin .tools/uv
+      - uv tool install --force --managed-python --python 3.14 cli-agent-orchestrator==2.4.1
+      - uv sync --all-groups
+      - task: env:init
+      - lefthook install
+      - "{{.ENV_RUN}} {{.PYTHON}} -m agents.cli init"
+  env:init:
+    desc: Create and validate the local environment
+    cmds:
+      - task: env:create
+      - task: env:check
+  env:create:
+    internal: true
+    cmd: touch .env.local
+    status:
+      - test -f .env.local
+  env:check:
+    desc: Validate and resolve the Varlock environment
+    cmd: mise exec varlock -- varlock load -p .env.schema -p .env.local --show-all
+  env:encrypt:
+    desc: Encrypt one value for use in .env.local
+    cmd: mise exec varlock -- varlock encrypt
+  env:run:
+    desc: Run a command with scoped Varlock environment values
+    cmd: "{{.ENV_RUN}} {{.CLI_ARGS}}"
+  env:lock:
+    desc: Lock the Varlock local encryption session
+    cmd: mise exec varlock -- varlock lock
+  migrate:
+    desc: Apply Agents SQLite migrations
+    cmd: "{{.ENV_RUN}} {{.PYTHON}} -m agents.cli migrate"
+  doctor:
+    desc: Check local Agents prerequisites and service ownership
+    cmd: "{{.ENV_RUN}} {{.PYTHON}} -m agents.cli doctor"
+  server:start:
+    desc: Start CAO and Agents services
+    cmd: "{{.ENV_RUN}} {{.PYTHON}} -m agents.cli service start"
+  server:stop:
+    desc: Stop Agents and CAO services, retaining sessions
+    cmd: "{{.ENV_RUN}} {{.PYTHON}} -m agents.cli service stop"
+  server:status:
+    desc: Show owned service status
+    cmd: "{{.ENV_RUN}} {{.PYTHON}} -m agents.cli service status"
+  dashboard:
+    desc: Print the web-token file path
+    cmd: "{{.ENV_RUN}} {{.PYTHON}} -m agents.cli dashboard"
+  sessions:
+    desc: List Agents-owned sessions
+    cmd: "{{.ENV_RUN}} {{.PYTHON}} -m agents.cli sessions"
+  check:
+    desc: Run formatting, lint, and type checks
+    cmds:
+      - prettier --check --ignore-unknown .
+      - ruff format --check src/agents tests
+      - ruff check src/agents tests
+      - pyright src/agents tests
+  check:staged:
+    desc: Run checks against staged files
+    aliases: [check-staged]
+    cmd: lefthook run pre-commit
+  fix:
+    desc: Format and autofix project files
+    cmds:
+      - prettier --write --ignore-unknown .
+      - ruff format src/agents tests
+      - ruff check --fix src/agents tests
+  test:
+    desc: Run the unittest suite
+    cmd: '{{.PYTHON}} -m unittest discover -s tests -p "test_*.py"'
+  smoke:
+    desc: Run the isolated CAO/tmux mock-provider delivery smoke
+    cmd: "{{.PYTHON}} -m tests.smoke_e2e"
+  dev:mock:
+    desc: Seed and serve a mock development instance
+    cmd: "AGENTS_PROVIDER=mock {{.ENV_RUN}} {{.PYTHON}} -m agents.cli dev-mock"
+  shutdown:
+    desc: Revoke/delete mapped sessions and stop both services
+    cmd: "{{.ENV_RUN}} {{.PYTHON}} -m agents.cli shutdown"

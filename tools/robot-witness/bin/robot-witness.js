@@ -21,7 +21,11 @@ Options:
 `;
 
 function parseArgs(args) {
-  const options = { statePath: resolve(".robot-witness.json"), origin: "https://1f916.ai", json: false };
+  const options = {
+    statePath: resolve(".robot-witness.json"),
+    origin: "https://1f916.ai",
+    json: false,
+  };
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
     if (argument === "-h" || argument === "--help") return { help: true };
@@ -47,14 +51,18 @@ function printReport(report) {
   console.log(`key: ${report.public_key}`);
   for (const result of report.results) {
     if (result.status === "advanced") {
-      console.log(`ok  ${result.log}: ${result.from} -> ${result.to} (+${result.added}), append-only proof valid`);
+      console.log(
+        `ok  ${result.log}: ${result.from} -> ${result.to} (+${result.added}), append-only proof valid`,
+      );
     } else {
       console.log(`ok  ${result.log}: ${result.tree_size} (${result.status})`);
     }
   }
   console.log(`observed: ${report.observed_at}`);
   if (report.trust === "trust-on-first-use") {
-    console.log("note: compare the pinned key with an independent 1F916 witness before relying on it");
+    console.log(
+      "note: compare the pinned key with an independent 1F916 witness before relying on it",
+    );
   }
 }
 

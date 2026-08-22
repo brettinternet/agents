@@ -8,7 +8,6 @@ import subprocess
 from pathlib import Path
 
 import uvicorn
-from dotenv import load_dotenv
 
 from . import service
 from .auth import derive_agent_token, read_agent_auth_key
@@ -27,13 +26,10 @@ class DoctorError(RuntimeError):
 
 
 def _config() -> AgentsConfig:
-    load_dotenv()
     return load()
 
 
 def _prepare(config: AgentsConfig) -> None:
-    if not (config.root / ".env").exists():
-        (config.root / ".env").write_text("# Local Agents environment overrides\n", encoding="utf-8")
     state = config.state_dir
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     state.chmod(0o700)

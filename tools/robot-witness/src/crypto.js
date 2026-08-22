@@ -17,7 +17,11 @@ function fromHex(value) {
 }
 
 function nodeHash(left, right) {
-  return createHash("sha256").update(Buffer.from([1])).update(left).update(right).digest();
+  return createHash("sha256")
+    .update(Buffer.from([1]))
+    .update(left)
+    .update(right)
+    .digest();
 }
 
 export function checkpointPayload(checkpoint) {
@@ -37,10 +41,7 @@ export function verifyCheckpointSignature(checkpoint, publicKey) {
   if (rawKey.length !== 32 || signature.length !== 64) return false;
 
   const key = {
-    key: Buffer.concat([
-      Buffer.from("302a300506032b6570032100", "hex"),
-      rawKey,
-    ]),
+    key: Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), rawKey]),
     format: "der",
     type: "spki",
   };
@@ -48,7 +49,13 @@ export function verifyCheckpointSignature(checkpoint, publicKey) {
 }
 
 export function verifyConsistency(oldSize, newSize, oldRoot, newRoot, proof) {
-  if (!Number.isSafeInteger(oldSize) || !Number.isSafeInteger(newSize) || oldSize < 0 || newSize < oldSize) return false;
+  if (
+    !Number.isSafeInteger(oldSize) ||
+    !Number.isSafeInteger(newSize) ||
+    oldSize < 0 ||
+    newSize < oldSize
+  )
+    return false;
   if (!Array.isArray(proof)) return false;
   try {
     fromHex(oldRoot);
@@ -94,9 +101,9 @@ export function verifyConsistency(oldSize, newSize, oldRoot, newRoot, proof) {
       newIndex = Math.floor(newIndex / 2);
     }
 
-    return oldHash.toString("hex") === oldRoot
-      && newHash.toString("hex") === newRoot
-      && newIndex === 0;
+    return (
+      oldHash.toString("hex") === oldRoot && newHash.toString("hex") === newRoot && newIndex === 0
+    );
   } catch {
     return false;
   }

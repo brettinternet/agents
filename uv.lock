@@ -10,7 +10,6 @@ dependencies = [
     { name = "fastapi" },
     { name = "fastmcp" },
     { name = "httpx" },
-    { name = "python-dotenv" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -25,7 +24,6 @@ requires-dist = [
     { name = "fastapi", specifier = "==0.141.1" },
     { name = "fastmcp", specifier = "==3.4.6" },
     { name = "httpx", specifier = "==0.28.1" },
-    { name = "python-dotenv", specifier = "==1.2.2" },
     { name = "uvicorn", extras = ["standard"], specifier = "==0.52.1" },
 ]
 

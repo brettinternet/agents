@@ -57,6 +57,69 @@ models=[
                 [("openai/gpt-5", "high"), ("anthropic/claude-sonnet-4-6", "")],
             )
 
+    def test_actor_model_choices_override_global_choices(self) -> None:
+        configured = (
+            CONFIG.replace(
+                "api_port=9889",
+                "api_port=9889\nmodel='openai/gpt-5-mini'",
+            )
+            .replace(
+                "slug='human'",
+                """slug='elder'
+kind='agent'
+models=[
+  {id='openai/gpt-5', reasoning_effort='high'},
+  {id='anthropic/claude-sonnet-4-6'},
+]""",
+            )
+            .replace("provider='mock'", "provider='opencode'")
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "agents.toml"
+            path.write_text(configured)
+            config = load(path, {})
+            self.assertEqual(
+                [(choice.id, choice.reasoning_effort) for choice in config.models_for("elder")],
+                [("openai/gpt-5", "high"), ("anthropic/claude-sonnet-4-6", "")],
+            )
+            self.assertEqual(config.models_for("unknown")[0].id, "openai/gpt-5-mini")
+
+    def test_environment_model_overrides_actor_choices(self) -> None:
+        configured = CONFIG.replace(
+            "slug='human'",
+            "slug='elder'\nkind='agent'\nmodels=[{id='actor/model'}]",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "agents.toml"
+            path.write_text(configured)
+            config = load(path, {"AGENTS_MODEL": "override/model"})
+            self.assertEqual(config.models_for("elder"), config.cao.models)
+            self.assertEqual(config.models_for("elder")[0].id, "override/model")
+
+    def test_rejects_actor_choices_for_non_agents(self) -> None:
+        configured = CONFIG.replace("slug='human'", "slug='human'\nmodels=[{id='mock/model'}]")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "agents.toml"
+            path.write_text(configured)
+            for env in ({}, {"AGENTS_MODEL": "override/model"}):
+                with self.subTest(env=env), self.assertRaisesRegex(ConfigError, "require kind='agent'"):
+                    load(path, env)
+
+    def test_rejects_invalid_actor_model_pool(self) -> None:
+        configured = CONFIG.replace(
+            "slug='human'",
+            "slug='elder'\nkind='agent'\nmodels=[]",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "agents.toml"
+            path.write_text(configured)
+            for env in ({}, {"AGENTS_MODEL": "override/model"}):
+                with (
+                    self.subTest(env=env),
+                    self.assertRaisesRegex(ConfigError, "actor elder.models must be a nonempty"),
+                ):
+                    load(path, env)
+
     def test_environment_model_and_reasoning_override_toml_choices(self) -> None:
         configured = CONFIG.replace(
             "api_port=9889",

@@ -367,8 +367,9 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-    async def test_model_choice_is_selected_once_persisted_and_sent_to_cao(self):
-        selected = ModelChoice("mock/second")
+    async def test_actor_model_choice_is_selected_once_persisted_and_sent_to_cao(self):
+        selected = ModelChoice("mock/actor-second")
+        actor_models = (ModelChoice("mock/actor-first"), selected)
         self.config = replace(
             self.config,
             cao=CaoConfig(
@@ -376,18 +377,19 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
                 "mock",
                 "mock_cli",
                 9889,
-                (ModelChoice("mock/first"), selected),
+                (ModelChoice("mock/global"),),
             ),
+            actor_models=(("elder", actor_models),),
         )
         self.reconciler = Reconciler(self.config, self.connection, self.fake)
         with patch("agents.reconciler.secrets.choice", return_value=selected) as choose:
             run = self.reserve()
-            self.assertEqual((run["model"], run["reasoning_effort"]), ("mock/second", ""))
+            self.assertEqual((run["model"], run["reasoning_effort"]), ("mock/actor-second", ""))
             with patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "xdg")}):
                 await self.reconciler._launch(run["id"])
                 await self.reconciler._launch(run["id"])
-        choose.assert_called_once_with(self.config.cao.models)
-        self.assertEqual(self.fake.created[0]["model"], "mock/second")
+        choose.assert_called_once_with(actor_models)
+        self.assertEqual(self.fake.created[0]["model"], "mock/actor-second")
 
     async def test_output_digest_prompt_and_wake_are_durable(self):
         run = self.reserve()

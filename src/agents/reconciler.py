@@ -93,7 +93,7 @@ def _reserve_terminal_unchecked(
     )
     now = utc_now()
     provider = config.cao.provider_id
-    model = secrets.choice(config.cao.models)
+    model = secrets.choice(config.models_for(actor))
     cursor = connection.execute(
         "INSERT INTO terminal_runs(session_name,profile_name,mcp_name,profile_sha256,provider,model,reasoning_effort,generation,actor_slug,purpose_kind,purpose_id,working_directory,token_digest,profile_state,state,output_tail,launch_count,created_at,updated_at)VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'reserved','',0,?,?)",
         (

@@ -64,6 +64,26 @@ models = [
 ]
 ```
 
-The selected pair is persisted for the run, so retries never re-roll it. `reasoning_effort` is available only
-with the OpenCode provider. `AGENTS_MODEL` and optional `AGENTS_REASONING_EFFORT` force a single choice and
-override either TOML form.
+An agent actor can override the global choice or pool:
+
+```toml
+[[actors]]
+slug = "elder"
+kind = "agent"
+models = [
+  { id = "openai/gpt-5", reasoning_effort = "high" },
+]
+
+[[actors]]
+slug = "explorer"
+kind = "agent"
+models = [
+  { id = "openai/gpt-5-mini", reasoning_effort = "medium" },
+  { id = "anthropic/claude-sonnet-4-6" },
+]
+```
+
+Actor choices take precedence over `[cao]`; actors without choices use the global configuration. The selected
+pair is persisted for the run, so retries never re-roll it. `reasoning_effort` is available only with the
+OpenCode provider. `AGENTS_MODEL` and optional `AGENTS_REASONING_EFFORT` override every actor and either TOML
+form with one fixed choice.

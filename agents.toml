@@ -56,6 +56,10 @@ profile_template = "elder"
 specialty = ""
 persistent = true
 capacity = 1
+# Optional persona-specific pool; overrides [cao] for this actor.
+# models = [
+#   { id = "openai/gpt-5", reasoning_effort = "high" },
+# ]
 
 [[actors]]
 slug = "explorer"

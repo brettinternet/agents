@@ -75,6 +75,13 @@ class AgentsConfig:
     cao: CaoConfig
     web: WebConfig
     actors: tuple[dict[str, Any], ...]
+    actor_models: tuple[tuple[str, tuple[ModelChoice, ...]], ...] = ()
+
+    def models_for(self, actor_slug: str) -> tuple[ModelChoice, ...]:
+        for slug, models in self.actor_models:
+            if slug == actor_slug:
+                return models
+        return self.cao.models
 
     @property
     def state_dir(self) -> Path:
@@ -126,7 +133,12 @@ def _model_choice(model: object, reasoning_effort: object = "") -> ModelChoice:
     return ModelChoice(model, reasoning_effort)
 
 
-def _models(cao: dict[str, Any], values: Mapping[str, str], provider: str) -> tuple[ModelChoice, ...]:
+def _models(
+    section: dict[str, Any],
+    values: Mapping[str, str],
+    provider: str,
+    name: str = "cao",
+) -> tuple[ModelChoice, ...]:
     env_model = values.get("AGENTS_MODEL")
     env_reasoning = values.get("AGENTS_REASONING_EFFORT", "")
     if env_model:
@@ -134,33 +146,51 @@ def _models(cao: dict[str, Any], values: Mapping[str, str], provider: str) -> tu
     elif env_reasoning:
         raise ConfigError("AGENTS_REASONING_EFFORT requires AGENTS_MODEL")
     else:
-        model = cao.get("model")
-        models = cao.get("models")
-        reasoning = cao.get("reasoning_effort", "")
+        model = section.get("model")
+        models = section.get("models")
+        reasoning = section.get("reasoning_effort", "")
         if model is not None and models is not None:
-            raise ConfigError("cao.model and cao.models are mutually exclusive")
+            raise ConfigError(f"{name}.model and {name}.models are mutually exclusive")
         if models is not None:
             if reasoning:
-                raise ConfigError("cao.reasoning_effort cannot be combined with cao.models")
+                raise ConfigError(f"{name}.reasoning_effort cannot be combined with {name}.models")
             if not isinstance(models, list) or not models:
-                raise ConfigError("cao.models must be a nonempty array of model tables")
+                raise ConfigError(f"{name}.models must be a nonempty array of model tables")
             parsed: list[ModelChoice] = []
             for entry in models:
                 if not isinstance(entry, dict) or set(entry) - {"id", "reasoning_effort"} or "id" not in entry:
-                    raise ConfigError("each cao.models entry requires id and optionally reasoning_effort")
+                    raise ConfigError(f"each {name}.models entry requires id and optionally reasoning_effort")
                 parsed.append(_model_choice(entry["id"], entry.get("reasoning_effort", "")))
             choices = tuple(parsed)
         elif model is not None:
             choices = (_model_choice(model, reasoning),)
         elif reasoning:
-            raise ConfigError("cao.reasoning_effort requires cao.model")
+            raise ConfigError(f"{name}.reasoning_effort requires {name}.model")
         else:
             choices = (ModelChoice(""),)
     if len(choices) != len(set(choices)):
-        raise ConfigError("cao.models contains duplicate model/reasoning choices")
+        raise ConfigError(f"{name}.models contains duplicate model/reasoning choices")
     if provider != "opencode" and any(choice.reasoning_effort for choice in choices):
         raise ConfigError("reasoning_effort is supported only by the opencode provider")
     return choices
+
+
+def _actor_models(
+    actors: tuple[dict[str, Any], ...],
+    values: Mapping[str, str],
+    provider: str,
+) -> tuple[tuple[str, tuple[ModelChoice, ...]], ...]:
+    configured: list[tuple[str, tuple[ModelChoice, ...]]] = []
+    for actor in actors:
+        if not {"model", "models", "reasoning_effort"}.intersection(actor):
+            continue
+        slug = str(actor["slug"])
+        if actor.get("kind") != "agent":
+            raise ConfigError(f"actor {slug} model choices require kind='agent'")
+        models = _models(actor, {}, provider, f"actor {slug}")
+        if not values.get("AGENTS_MODEL"):
+            configured.append((slug, models))
+    return tuple(configured)
 
 
 def load(path: Path | None = None, env: dict[str, str] | None = None) -> AgentsConfig:
@@ -233,4 +263,5 @@ def load(path: Path | None = None, env: dict[str, str] | None = None) -> AgentsC
         ),
         web=WebConfig(host, web_port),
         actors=actor_rows,
+        actor_models=_actor_models(actor_rows, values, provider),
     )

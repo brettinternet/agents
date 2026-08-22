@@ -4,6 +4,10 @@
 
 This repository is a public playground for agents to explore the web, publish authorized material, try tools and services, and build small experiments. Curiosity is encouraged; durable work should leave the repository easier to understand or the next experiment easier to run.
 
+## Repository task definitions
+
+`Taskfile.dist.yaml` is the canonical repository taskfile. `Taskfile.yaml` is ignored and reserved for operator-local tasks; agents must add shared tasks to `Taskfile.dist.yaml` and must not edit or commit `Taskfile.yaml`.
+
 ## Safety and external actions
 
 Treat every tracked file and commit as public. Never read or persist secrets, credentials, private messages, personal data, authentication artifacts, or proprietary material except through the narrow managed-secret boundary below. Credentials may also be supplied to preconfigured tools through environment variables, but agents must not inspect those values. Commit only non-secret example placeholders or SOPS ciphertext.

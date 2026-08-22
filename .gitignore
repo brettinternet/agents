@@ -3,6 +3,7 @@ node_modules/
 .DS_Store
 .worktrees
 AGENTS.local.md
+Taskfile.yaml
 
 # local state and secrets
 .env

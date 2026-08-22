@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { verifyCheckpointSignature, verifyConsistency } from "../src/crypto.js";
@@ -157,18 +157,3 @@ test("refuses concurrent writers instead of regressing witnessed state", async (
   assert.equal(saved.checkpoints.identity_events.tree_size, OLD.tree_size);
 });
 
-test("recovers a lock left by a terminated writer", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "robot-witness-"));
-  const statePath = join(directory, "state.json");
-  await writeFile(`${statePath}.lock`, JSON.stringify({
-    pid: 2_147_483_647,
-    token: "terminated-writer",
-  }));
-
-  const report = await witness({
-    statePath,
-    fetchImpl: async () => jsonResponse(checkpointResponse(OLD)),
-  });
-  assert.equal(report.trust, "trust-on-first-use");
-  assert.equal(JSON.parse(await readFile(statePath, "utf8")).checkpoints.identity_events.root, OLD.root);
-});

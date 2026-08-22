@@ -1,5 +1,4 @@
-import { mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
+import { mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { checkpointPayload, verifyCheckpointSignature, verifyConsistency } from "./crypto.js";
 
@@ -35,56 +34,24 @@ async function saveState(path, state) {
   await rename(temporary, path);
 }
 
-function processIsAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error?.code !== "ESRCH";
-  }
-}
-
-async function staleLock(path) {
-  try {
-    const owner = JSON.parse(await readFile(path, "utf8"));
-    if (Number.isSafeInteger(owner.pid) && owner.pid > 0) return !processIsAlive(owner.pid);
-  } catch {
-    // A competing process may still be writing a newly-created lock.
-  }
-  return Date.now() - (await stat(path)).mtimeMs > 5_000;
-}
-
-async function acquireLock(path, statePath, mayRecover = true) {
+async function acquireLock(path, statePath) {
   let handle;
   try {
     handle = await open(path, "wx", 0o600);
   } catch (error) {
-    if (error?.code !== "EEXIST") throw error;
-    if (!mayRecover || !(await staleLock(path))) {
-      throw new Error(`another witness is already using ${statePath}`);
+    if (error?.code === "EEXIST") {
+      throw new Error(`another witness is already using ${statePath}; if it was killed, inspect and remove ${path}`);
     }
-    await unlink(path);
-    return acquireLock(path, statePath, false);
+    throw error;
   }
 
-  const token = randomUUID();
   try {
-    await handle.writeFile(JSON.stringify({ pid: process.pid, token }));
-    return { handle, token };
+    await handle.writeFile(`${process.pid}\n`);
+    return handle;
   } catch (error) {
     await handle.close().catch(() => {});
     await unlink(path).catch(() => {});
     throw error;
-  }
-}
-
-async function releaseLock(path, lock) {
-  await lock.handle.close().catch(() => {});
-  try {
-    const owner = JSON.parse(await readFile(path, "utf8"));
-    if (owner.token === lock.token) await unlink(path);
-  } catch (error) {
-    if (error?.code !== "ENOENT") throw error;
   }
 }
 
@@ -224,6 +191,7 @@ export async function witness({
   try {
     return await runWitness({ origin, statePath, fetchImpl });
   } finally {
-    await releaseLock(lockPath, lock);
+    await lock.close().catch(() => {});
+    await unlink(lockPath);
   }
 }

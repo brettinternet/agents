@@ -256,6 +256,9 @@
       const actor = agent.actor;
       const rects = regionRects();
       if (!actor || !actor.terminal_run_id) return homePosition(agent);
+      if (agent.mode === "question" && (agent.x !== 0 || agent.y !== 0)) {
+        return { x: agent.x, y: agent.y };
+      }
       const purpose = actor.terminal_purpose_kind;
       if (purpose === "work") {
         const work = entities.work.get(String(actor.terminal_purpose_id));
@@ -324,6 +327,10 @@
       pushEffect({ kind: "dissolve", x0: x, y0: y, born: now(), ttl: 800, color });
     }
 
+    function bloom(x, y) {
+      pushEffect({ kind: "bloom", x0: x, y0: y, born: now(), ttl: 1000, color: "#168554" });
+    }
+
     function now() {
       return performance.now();
     }
@@ -367,24 +374,23 @@
           break;
         }
         case "consultation.requested": {
-          const point = workPoint(workIdFrom(event.entity_id));
-          const target = point || { x: regionRects().workshop.cx, y: regionRects().workshop.cy };
+          const rects = regionRects();
+          const target = { x: rects.workshop.cx, y: rects.workshop.cy };
           packet(agentPosition(event.actor_slug), target, "#6d28d9");
           break;
         }
         case "consultation.completed": {
-          const pos = entities.agents.has(event.actor_slug)
+          const rects = regionRects();
+          const from = { x: rects.workshop.cx, y: rects.workshop.cy };
+          const to = entities.agents.has(event.actor_slug)
             ? agentPosition(event.actor_slug)
-            : { x: regionRects().workshop.cx, y: regionRects().workshop.cy };
-          ring(pos.x, pos.y, "#6d28d9");
+            : { x: rects.workshop.cx, y: rects.workshop.cy };
+          packet(from, to, "#6d28d9");
           break;
         }
         case "work.submitted": {
-          const point = workPoint(workIdFrom(event.entity_id));
-          const target = point || {
-            x: regionRects().verification.cx,
-            y: regionRects().verification.cy,
-          };
+          const rects = regionRects();
+          const target = { x: rects.verification.cx, y: rects.verification.cy };
           packet(agentPosition(event.actor_slug), target, "#0e7490");
           break;
         }
@@ -399,7 +405,7 @@
           break;
         }
         case "blocker.resolved": {
-          const point = workPoint(metadata.id);
+          const point = workPoint(workIdFrom(event.entity_id));
           if (point) dissolve(point.x, point.y, "#9b7d25");
           break;
         }
@@ -456,6 +462,7 @@
 
       const board = Array.isArray(snapshot.board) ? snapshot.board : [];
       const seenWork = new Set();
+      const rectsNow = regionRects();
       for (const work of board) {
         if (work.status === "cancelled") continue;
         seenWork.add(work.id);
@@ -464,7 +471,22 @@
           item = { id: work.id, appearance: workAppearance(work.id) };
           entities.work.set(work.id, item);
         }
+        const previous = item.status;
         item.status = work.status;
+        if (
+          previous &&
+          previous !== work.status &&
+          (work.status === "accepted" || work.status === "delivered")
+        ) {
+          const pos = workPosition(item, rectsNow);
+          bloom(pos.x, pos.y);
+        }
+      }
+      for (const [id, item] of entities.work) {
+        if (!seenWork.has(id)) {
+          const pos = workPosition(item, rectsNow);
+          dissolve(pos.x, pos.y, item.appearance.color);
+        }
       }
       for (const id of [...entities.work.keys()]) {
         if (!seenWork.has(id)) entities.work.delete(id);
@@ -480,12 +502,9 @@
         }
       }
       renderSummary();
-      if (!motion) {
-        snapAgents();
-        draw(performance.now());
-      } else {
-        ensureLoop();
-      }
+      if (!motion) snapAgents();
+      draw(performance.now());
+      ensureLoop();
     }
 
     function onEvent(event) {
@@ -612,6 +631,8 @@
 
     function ensureLoop() {
       if (destroyed || rafId) return;
+      if (!motion || document.hidden || connection !== "live") return;
+      if (!needsMotion()) return;
       rafId = requestAnimationFrame(frame);
     }
 
@@ -673,6 +694,18 @@
     function drawWork(rects, t) {
       for (const work of entities.work.values()) {
         const pos = workPosition(work, rects);
+        if (work.status === "verifying" || work.status === "awaiting_approval") {
+          const orbit =
+            work.appearance.radius + 5 + Math.sin(t * 0.003 + work.appearance.phase) * 1.5;
+          ctx.save();
+          ctx.strokeStyle = "#0e7490";
+          ctx.globalAlpha = 0.8;
+          ctx.lineWidth = 1.2;
+          ctx.beginPath();
+          ctx.arc(pos.x, pos.y, orbit, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.restore();
+        }
         drawWorkShape(work, pos, t);
         hitboxes.push({
           x: pos.x,
@@ -938,6 +971,17 @@
             ctx.arc(effect.x0, effect.y0, 18 * (1 - progress), 0, Math.PI * 2);
             ctx.stroke();
             break;
+          case "bloom": {
+            const radius = 2 + progress * 14;
+            ctx.beginPath();
+            ctx.arc(effect.x0, effect.y0, radius, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.arc(effect.x0, effect.y0, radius + 3, 0, Math.PI * 2);
+            ctx.stroke();
+            break;
+          }
           default:
             break;
         }
@@ -985,6 +1029,7 @@
       if (lastSnapshot) {
         recomputeTargets();
         if (!motion) snapAgents();
+        else ensureLoop();
       }
     }
 

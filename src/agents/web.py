@@ -789,6 +789,7 @@ def create_app(config: AgentsConfig | None = None, connection: sqlite3.Connectio
     @app.post("/agent/v1/blockers/{blocker_id}/resolve")
     async def agent_resolve_blocker(request: Request, blocker_id: int, context: AgentAuth):
         body = await _json_body(request)
+        entity = f"work:{body['item_id']}" if body.get("item_id") else f"blocker:{blocker_id}"
         return ok(
             _domain(
                 lambda: agent_delivery(
@@ -796,7 +797,7 @@ def create_app(config: AgentsConfig | None = None, connection: sqlite3.Connectio
                     context,
                     body,
                     "blocker.resolved",
-                    f"blocker:{blocker_id}",
+                    entity,
                     lambda delivery: resolve_linked_blocker(delivery, context, blocker_id, body),
                 )
             )

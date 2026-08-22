@@ -22,6 +22,8 @@ class ServiceError(RuntimeError):
 
 _LOCK_HANDLE: IO[str] | None = None
 
+_EXPLICIT_RESTART = "run `mise exec task -- task server:stop` and then `mise exec task -- task server:start` explicitly"
+
 
 def _terminal_matches(row: Any, terminal: dict[str, Any]) -> bool:
     identity = terminal.get("session_name", terminal.get("tmux_session", terminal.get("name")))
@@ -121,8 +123,24 @@ def start(config: AgentsConfig) -> None:
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     if state.stat().st_mode & 0o077:
         raise ServiceError(".agents must have mode 0700")
-    if _owned(state / "agentsd.pid") or _owned(state / "cao.pid"):
-        raise ServiceError("an owned service is already running")
+    names = ("agentsd", "cao")
+    paths = {name: state / f"{name}.pid" for name in names}
+    try:
+        owned = {name: _owned(path) for name, path in paths.items()}
+    except ServiceError as exc:
+        raise ServiceError(f"{exc}; {_EXPLICIT_RESTART}") from exc
+    stale = [name for name, path in paths.items() if (path.exists() or path.is_symlink()) and owned[name] is None]
+    if stale:
+        raise ServiceError(f"stale service ownership record for {', '.join(stale)}; {_EXPLICIT_RESTART}")
+    running = [name for name, process in owned.items() if process is not None]
+    if len(running) == len(names):
+        if _health_ready(f"http://127.0.0.1:{config.cao.api_port}/health") and _health_ready(
+            f"http://{config.web.host}:{config.web.port}/health"
+        ):
+            return
+        raise ServiceError(f"owned services are running but unhealthy; {_EXPLICIT_RESTART}")
+    if running:
+        raise ServiceError(f"incomplete owned service set ({', '.join(running)} running); {_EXPLICIT_RESTART}")
     if not _port_free("127.0.0.1", config.cao.api_port) or not _port_free(config.web.host, config.web.port):
         raise ServiceError("configured listener is already owned by another process")
     cao = config.root / ".tools" / "bin" / "cao-server"

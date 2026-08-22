@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { checkpointPayload, verifyCheckpointSignature, verifyConsistency } from "./crypto.js";
 
@@ -70,11 +70,11 @@ function assertSigned(checkpoint, publicKey, label = checkpoint.log) {
   }
 }
 
-export async function witness({
-  origin = DEFAULT_ORIGIN,
-  statePath = ".robot-witness.json",
-  fetchImpl = fetch,
-} = {}) {
+async function runWitness({
+  origin,
+  statePath,
+  fetchImpl,
+}) {
   const base = new URL(origin);
   if (base.pathname !== "/" || base.search || base.hash) throw new Error("origin must not contain a path, query, or fragment");
 
@@ -150,4 +150,28 @@ export async function witness({
     results,
     payloads: Object.values(current).map(checkpointPayload),
   };
+}
+
+export async function witness({
+  origin = DEFAULT_ORIGIN,
+  statePath = ".robot-witness.json",
+  fetchImpl = fetch,
+} = {}) {
+  await mkdir(dirname(statePath), { recursive: true });
+  const lockPath = `${statePath}.lock`;
+  let lock;
+  try {
+    lock = await open(lockPath, "wx", 0o600);
+  } catch (error) {
+    if (error?.code === "EEXIST") throw new Error(`another witness is already using ${statePath}`);
+    throw error;
+  }
+
+  try {
+    await lock.writeFile(`${process.pid}\n`);
+    return await runWitness({ origin, statePath, fetchImpl });
+  } finally {
+    await lock.close().catch(() => {});
+    await unlink(lockPath);
+  }
 }

@@ -104,3 +104,36 @@ test("rejects an advertised key change without replacing witnessed state", async
   );
   assert.equal(await readFile(statePath, "utf8"), before);
 });
+
+test("refuses concurrent writers instead of regressing witnessed state", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "robot-witness-"));
+  const statePath = join(directory, "state.json");
+  await witness({ statePath, fetchImpl: async () => jsonResponse(checkpointResponse(OLD)) });
+
+  let releaseFetch;
+  let fetchStarted;
+  const started = new Promise((resolve) => {
+    fetchStarted = resolve;
+  });
+  const release = new Promise((resolve) => {
+    releaseFetch = resolve;
+  });
+  const running = witness({
+    statePath,
+    fetchImpl: async () => {
+      fetchStarted();
+      await release;
+      return jsonResponse(checkpointResponse(OLD));
+    },
+  });
+  await started;
+
+  await assert.rejects(
+    witness({ statePath, fetchImpl: async () => jsonResponse(checkpointResponse(OLD)) }),
+    /another witness is already using/,
+  );
+  releaseFetch();
+  await running;
+  const saved = JSON.parse(await readFile(statePath, "utf8"));
+  assert.equal(saved.checkpoints.identity_events.tree_size, OLD.tree_size);
+});

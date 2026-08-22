@@ -22,11 +22,11 @@ def seed_conversations(connection: sqlite3.Connection) -> None:
         )
     actors = {str(row[0]) for row in connection.execute("SELECT slug FROM actors")}
     channel_members = {
-        "#all-hands": {"human", "elder", "explorer", "yapper"},
-        "#findings": {"human", "elder", "explorer"},
-        "#publishing": {"human", "elder", "yapper"},
-        "#coordination": {"human", "elder"},
-        "#incidents": {"human", "elder"},
+        "#all-hands": {"human", "system", "elder", "explorer", "yapper"},
+        "#findings": {"human", "system", "elder", "explorer"},
+        "#publishing": {"human", "system", "elder", "yapper"},
+        "#coordination": {"human", "system", "elder"},
+        "#incidents": {"human", "system", "elder"},
     }
     channel_notifications = {
         "#all-hands": {"elder", "explorer", "yapper"},

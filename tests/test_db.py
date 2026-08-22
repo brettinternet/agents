@@ -87,6 +87,8 @@ class DatabaseTests(unittest.TestCase):
             "deliveries",
             "events",
             "mutation_requests",
+            "schedule_states",
+            "schedule_runs",
         }
         self.assertTrue(required <= tables)
         self.assertEqual(self.connection.execute("PRAGMA foreign_keys").fetchone()[0], 1)
@@ -94,7 +96,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.connection.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
         self.assertEqual(
             [row[0] for row in self.connection.execute("SELECT version FROM schema_migrations ORDER BY version")],
-            [1, 2],
+            [1, 2, 3],
         )
         terminal_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(terminal_runs)")}
         self.assertIn("reasoning_effort", terminal_columns)
@@ -114,14 +116,37 @@ class DatabaseTests(unittest.TestCase):
         with self.assertRaises(ProjectIdentityError):
             initialize_project(self.connection, changed)
 
+    def test_schedule_migration_upgrades_existing_database(self) -> None:
+        migrations = self.root / "upgrade-migrations"
+        migrations.mkdir()
+        source = Path(__file__).parents[1] / "src/agents/migrations"
+        shutil.copy(source / "001_initial.sql", migrations / "001_initial.sql")
+        shutil.copy(source / "002_terminal_reasoning.sql", migrations / "002_terminal_reasoning.sql")
+        other = connect(self.root / "upgrade.db")
+        migrate(other, migrations)
+        self.assertEqual(
+            [row[0] for row in other.execute("SELECT version FROM schema_migrations ORDER BY version")],
+            [1, 2],
+        )
+        shutil.copy(source / "003_schedules.sql", migrations / "003_schedules.sql")
+        migrate(other, migrations)
+        tables = {row[0] for row in other.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        self.assertTrue({"schedule_states", "schedule_runs"} <= tables)
+        self.assertEqual(
+            [row[0] for row in other.execute("SELECT version FROM schema_migrations ORDER BY version")],
+            [1, 2, 3],
+        )
+        other.close()
+
     def test_checksum_and_unknown_versions_fail(self) -> None:
         migrations = self.root / "migrations"
         migrations.mkdir()
-        source = Path(__file__).parents[1] / "src/agents/migrations/001_initial.sql"
-        copied = migrations / source.name
-        shutil.copy(source, copied)
+        source = Path(__file__).parents[1] / "src/agents/migrations"
+        for name in ("001_initial.sql", "002_terminal_reasoning.sql", "003_schedules.sql"):
+            shutil.copy(source / name, migrations / name)
         other = connect(self.root / "other.db")
         migrate(other, migrations)
+        copied = migrations / "003_schedules.sql"
         copied.write_text(copied.read_text() + "\n-- drift\n")
         with self.assertRaises(MigrationError):
             migrate(other, migrations)

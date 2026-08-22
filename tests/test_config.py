@@ -210,3 +210,63 @@ models=[
             path.write_text(CONFIG.replace("host='127.0.0.1'", "host='0.0.0.0'"))
             with self.assertRaises(ConfigError):
                 load(path, {})
+
+    def test_loads_cron_and_interval_schedules(self) -> None:
+        configured = CONFIG.replace(
+            "slug='human'",
+            """slug='explorer'
+kind='agent'
+persistent=true
+[[schedules]]
+slug='daily-scout'
+cron='0 9 * * *'
+timezone='America/Los_Angeles'
+to='@explorer'
+message='Explore and commit a public-safe memory.'
+[[schedules]]
+slug='hourly-scout'
+every='1h'
+to='#findings'
+message='Report meaningful changes only.'
+[[schedules]]
+slug='weekly-memory'
+cron='0 9 * * 1'
+[schedules.work]
+kind='spike'
+title='Weekly exploration'
+problem='Find useful public developments.'
+outcome='Commit a dated public-safe memory with sources and recommendations.'""",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "agents.toml"
+            path.write_text(configured)
+            schedules = load(path, {}).schedules
+            self.assertEqual((schedules[0].cron, schedules[0].timezone), ("0 9 * * *", "America/Los_Angeles"))
+            self.assertEqual(schedules[1].every_seconds, 3600)
+            work = schedules[2].work
+            self.assertIsNotNone(work)
+            assert work is not None
+            self.assertEqual(work.kind, "spike")
+            self.assertIn("public-safe memory", work.outcome)
+
+    def test_rejects_invalid_schedule_configuration(self) -> None:
+        base = CONFIG.replace("slug='human'", "slug='explorer'\nkind='agent'\npersistent=true")
+        invalid = (
+            "slug='bad'\nto='@explorer'\nmessage='x'",
+            "slug='bad'\ncron='bad'\nto='@explorer'\nmessage='x'",
+            "slug='bad'\nevery='1h'\nto='@missing'\nmessage='x'",
+            "slug='bad'\nevery='1h'\ntimezone='Mars/Olympus'\nto='@explorer'\nmessage='x'",
+            "slug='bad'\nevery='1h'\nto='@explorer'\nmessage='x'\noverlap='queue'",
+            "slug='bad'\nevery='1h'\nto='@explorer'\nmessage='x'\nwork={kind='spike',title='x',problem='x',outcome='x'}",
+            "slug='bad'\nevery='1h'\nwork={kind='invalid',title='x',problem='x',outcome='x'}",
+            "slug='bad'\nevery='366d'\nto='@explorer'\nmessage='x'",
+            "slug='bad'\ncron=0\nevery='1h'\nto='@explorer'\nmessage='x'",
+            "slug='bad'\ncron=''\nto='@explorer'\nmessage='x'",
+            "slug='bad'\nevery='1h'\nwork={kind=[],title='x',problem='x',outcome='x'}",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "agents.toml"
+            for schedule in invalid:
+                with self.subTest(schedule=schedule), self.assertRaises(ConfigError):
+                    path.write_text(base + "\n[[schedules]]\n" + schedule + "\n")
+                    load(path, {})

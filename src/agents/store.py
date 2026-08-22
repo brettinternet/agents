@@ -53,8 +53,8 @@ class Store:
     def create_work(
         self, *, actor: str, parent_id: str | None, kind: str, title: str, problem: str, outcome: str
     ) -> dict[str, Any]:
-        if actor not in {"human", "elder"}:
-            raise DomainError("unauthorized", "only the human or elder may create work")
+        if actor not in {"human", "elder", "system"}:
+            raise DomainError("unauthorized", "only the human, elder, or scheduler may create work")
         validate_title(title)
         validate_text(problem, "problem")
         validate_text(outcome, "outcome")

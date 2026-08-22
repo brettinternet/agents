@@ -112,19 +112,19 @@ class MessageTests(unittest.TestCase):
     def test_seeded_members_and_notification_policy(self):
         expected = {
             "#all-hands": (
-                {"human", "elder", "explorer", "yapper"},
+                {"human", "system", "elder", "explorer", "yapper"},
                 {"elder", "explorer", "yapper"},
             ),
             "#findings": (
-                {"human", "elder", "explorer"},
+                {"human", "system", "elder", "explorer"},
                 {"elder", "explorer"},
             ),
             "#publishing": (
-                {"human", "elder", "yapper"},
+                {"human", "system", "elder", "yapper"},
                 {"elder", "yapper"},
             ),
-            "#coordination": ({"human", "elder"}, {"elder"}),
-            "#incidents": ({"human", "elder"}, {"elder"}),
+            "#coordination": ({"human", "system", "elder"}, {"elder"}),
+            "#incidents": ({"human", "system", "elder"}, {"elder"}),
         }
         for address, (members, notified) in expected.items():
             conversation = self.connection.execute(

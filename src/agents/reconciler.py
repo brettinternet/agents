@@ -275,6 +275,7 @@ class Reconciler:
 
     async def run_once(self) -> None:
         from .delivery import Delivery
+        from .schedules import Scheduler
 
         try:
             self._fence_stale_provider_runs()
@@ -284,6 +285,10 @@ class Reconciler:
                 self._recovered_checks = True
         except Exception as exc:
             self._incident("bootstrap_failed", "persistent", "global", str(exc))
+        try:
+            Scheduler(self.config, self.connection).dispatch_due()
+        except Exception as exc:
+            self._incident("schedule_dispatch_failed", "schedule", "global", str(exc))
         healthy = self.client.health()
         await self._advance_delivery(healthy)
         self._cleanup_expired()

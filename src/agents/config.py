@@ -7,6 +7,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from croniter import croniter
 
 _PROVIDER_MAP = {"opencode": "opencode_cli", "claude": "claude_code", "mock": "mock_cli"}
 _FORBIDDEN_ARG_CHARS = frozenset("$`; &|<>") - {" "}
@@ -21,6 +24,9 @@ _ALLOWED_ENV = {
 }
 _MODEL_ID = re.compile(r"^[A-Za-z0-9._:/-]{1,128}$")
 _EFFORT = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
+_SCHEDULE_SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+_SCHEDULE_DURATION = re.compile(r"^([1-9][0-9]*)([mhd])$")
+_SCHEDULE_CHANNELS = frozenset({"#all-hands", "#findings", "#publishing", "#coordination", "#incidents"})
 
 
 class ConfigError(ValueError):
@@ -61,6 +67,26 @@ class CaoConfig:
 
 
 @dataclass(frozen=True)
+class ScheduledWorkConfig:
+    kind: str
+    title: str
+    problem: str
+    outcome: str
+
+
+@dataclass(frozen=True)
+class ScheduleConfig:
+    slug: str
+    timezone: str
+    cron: str = ""
+    every_seconds: int = 0
+    overlap: str = "skip"
+    to: str = ""
+    message: str = ""
+    work: ScheduledWorkConfig | None = None
+
+
+@dataclass(frozen=True)
 class WebConfig:
     host: str
     port: int
@@ -75,6 +101,7 @@ class AgentsConfig:
     cao: CaoConfig
     web: WebConfig
     actors: tuple[dict[str, Any], ...]
+    schedules: tuple[ScheduleConfig, ...] = ()
     actor_models: tuple[tuple[str, tuple[ModelChoice, ...]], ...] = ()
 
     def models_for(self, actor_slug: str) -> tuple[ModelChoice, ...]:
@@ -197,6 +224,99 @@ def _actor_models(
     return tuple(configured)
 
 
+def _schedules(value: object, actors: tuple[dict[str, Any], ...]) -> tuple[ScheduleConfig, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ConfigError("schedules must be an array of tables")
+    persistent = {str(actor["slug"]) for actor in actors if actor.get("kind") == "agent" and actor.get("persistent")}
+    parsed: list[ScheduleConfig] = []
+    for entry in value:
+        if not isinstance(entry, dict):
+            raise ConfigError("each schedule must be a table")
+        unknown = set(entry) - {"slug", "to", "message", "work", "timezone", "cron", "every", "overlap"}
+        if unknown:
+            raise ConfigError(f"schedule contains unknown field: {sorted(unknown)[0]}")
+        slug = entry.get("slug")
+        if not isinstance(slug, str) or not _SCHEDULE_SLUG.fullmatch(slug):
+            raise ConfigError("schedule.slug must use 1-64 lowercase letters, digits, or hyphens")
+        work_raw = entry.get("work")
+        work: ScheduledWorkConfig | None = None
+        to = entry.get("to", "")
+        message = entry.get("message", "")
+        if work_raw is not None:
+            if to or message or not isinstance(work_raw, dict):
+                raise ConfigError(f"schedule {slug}.work cannot be combined with to or message")
+            if set(work_raw) != {"kind", "title", "problem", "outcome"}:
+                raise ConfigError(f"schedule {slug}.work requires kind, title, problem, and outcome")
+            if not isinstance(work_raw["kind"], str) or work_raw["kind"] not in {"story", "bug", "task", "spike"}:
+                raise ConfigError(f"schedule {slug}.work.kind is invalid")
+            for name in ("title", "problem", "outcome"):
+                text = work_raw[name]
+                maximum = 200 if name == "title" else 16 * 1024
+                if not isinstance(text, str) or not 1 <= len(text.encode("utf-8")) <= maximum or "\x00" in text:
+                    raise ConfigError(f"schedule {slug}.work.{name} must be 1..{maximum} UTF-8 bytes without NUL")
+            work = ScheduledWorkConfig(
+                kind=work_raw["kind"],
+                title=work_raw["title"],
+                problem=work_raw["problem"],
+                outcome=work_raw["outcome"],
+            )
+        else:
+            if not isinstance(to, str) or (
+                (to.startswith("@") and to[1:] not in persistent)
+                or (to.startswith("#") and to not in _SCHEDULE_CHANNELS)
+                or not to.startswith(("@", "#"))
+            ):
+                raise ConfigError(f"schedule {slug}.to must name a persistent agent or known channel")
+            if not isinstance(message, str) or not 1 <= len(message.encode("utf-8")) <= 16 * 1024 or "\x00" in message:
+                raise ConfigError(f"schedule {slug}.message must be 1..16384 UTF-8 bytes without NUL")
+        timezone = entry.get("timezone", "UTC")
+        if not isinstance(timezone, str):
+            raise ConfigError(f"schedule {slug}.timezone must be an IANA timezone")
+        try:
+            ZoneInfo(timezone)
+        except (ValueError, ZoneInfoNotFoundError) as exc:
+            raise ConfigError(f"schedule {slug}.timezone must be an IANA timezone") from exc
+        has_cron = "cron" in entry
+        has_every = "every" in entry
+        if has_cron == has_every:
+            raise ConfigError(f"schedule {slug} requires exactly one of cron or every")
+        expression = entry.get("cron", "")
+        every = entry.get("every", "")
+        every_seconds = 0
+        if has_cron:
+            if not isinstance(expression, str) or len(expression.split()) != 5 or not croniter.is_valid(expression):
+                raise ConfigError(f"schedule {slug}.cron must be a valid five-field cron expression")
+        else:
+            match = _SCHEDULE_DURATION.fullmatch(every) if isinstance(every, str) else None
+            if match is None:
+                raise ConfigError(f"schedule {slug}.every must be a positive duration such as 30m, 1h, or 1d")
+            multiplier = {"m": 60, "h": 3600, "d": 86400}[match.group(2)]
+            every_seconds = int(match.group(1)) * multiplier
+            if every_seconds > 365 * 86400:
+                raise ConfigError(f"schedule {slug}.every cannot exceed 365d")
+        overlap = entry.get("overlap", "skip")
+        if overlap != "skip":
+            raise ConfigError(f"schedule {slug}.overlap currently supports only 'skip'")
+        parsed.append(
+            ScheduleConfig(
+                slug=slug,
+                to=to,
+                message=message,
+                work=work,
+                timezone=timezone,
+                cron=expression,
+                every_seconds=every_seconds,
+                overlap=overlap,
+            )
+        )
+    slugs = [schedule.slug for schedule in parsed]
+    if len(slugs) != len(set(slugs)):
+        raise ConfigError("schedules must have unique slugs")
+    return tuple(parsed)
+
+
 def load(path: Path | None = None, env: dict[str, str] | None = None) -> AgentsConfig:
     values = os.environ if env is None else env
     source = Path(path or values.get("AGENTS_CONFIG", "agents.toml")).expanduser().resolve()
@@ -267,5 +387,6 @@ def load(path: Path | None = None, env: dict[str, str] | None = None) -> AgentsC
         ),
         web=WebConfig(host, web_port),
         actors=actor_rows,
+        schedules=_schedules(raw.get("schedules"), actor_rows),
         actor_models=_actor_models(actor_rows, values, provider),
     )

@@ -22,7 +22,7 @@ class ServiceError(RuntimeError):
 
 _LOCK_HANDLE: IO[str] | None = None
 
-_EXPLICIT_RESTART = "run `mise exec task -- task server:stop` and then `mise exec task -- task server:start` explicitly"
+_EXPLICIT_RESTART = "run `task server:stop` and then `task server:start` explicitly"
 
 
 def _terminal_matches(row: Any, terminal: dict[str, Any]) -> bool:

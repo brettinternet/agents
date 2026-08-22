@@ -79,7 +79,9 @@ class ServiceTests(unittest.TestCase):
             with (
                 patch("agents.service._owned", return_value=None),
                 patch("agents.service._port_free", return_value=False),
-                self.assertRaisesRegex(ServiceError, "configured listener is already owned by another process"),
+                self.assertRaisesRegex(
+                    ServiceError, "configured listener is already owned by another process.*rerun.*task init"
+                ),
             ):
                 start(config)
 

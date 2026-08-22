@@ -74,7 +74,7 @@ class CliTests(unittest.TestCase):
             errors,
         )
 
-    def test_init_runs_doctor_after_reusing_services(self) -> None:
+    def test_init_rerun_prepares_reuses_services_and_runs_doctor_again(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             config = _config(Path(temporary))
             with (
@@ -85,11 +85,11 @@ class CliTests(unittest.TestCase):
                 patch("agents.cli.doctor", return_value=[]) as run_doctor,
             ):
                 main(["init"])
+                main(["init"])
 
-        prepare.assert_called_once_with(config)
-        check_preflight.assert_called_once_with(config)
-        start_services.assert_called_once_with(config)
-        run_doctor.assert_called_once_with(config)
+        for operation in (prepare, check_preflight, start_services, run_doctor):
+            self.assertEqual(operation.call_count, 2)
+            operation.assert_called_with(config)
 
 
 if __name__ == "__main__":

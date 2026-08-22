@@ -142,7 +142,10 @@ def start(config: AgentsConfig) -> None:
     if running:
         raise ServiceError(f"incomplete owned service set ({', '.join(running)} running); {_EXPLICIT_RESTART}")
     if not _port_free("127.0.0.1", config.cao.api_port) or not _port_free(config.web.host, config.web.port):
-        raise ServiceError("configured listener is already owned by another process")
+        raise ServiceError(
+            "configured listener is already owned by another process; stop the conflicting process or change the "
+            "configured ports, then rerun `task init`"
+        )
     cao = config.root / ".tools" / "bin" / "cao-server"
     agentsd = config.root / ".venv" / "bin" / "agentsd"
     if not cao.is_file() or not os.access(cao, os.X_OK) or not agentsd.is_file() or not os.access(agentsd, os.X_OK):

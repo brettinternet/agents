@@ -10,12 +10,14 @@ Requires [mise](https://mise.jdx.dev/) and Git.
 task init
 ```
 
-Open `http://127.0.0.1:9890`. Run `task dashboard` to print the login token's path.
-
-## Commands
+`task init` installs dependencies, initializes state, and starts the Agents web
+server and CAO service. Open `http://127.0.0.1:9890`. Run `task dashboard` to
+print the login token's path.
 
 ```sh
 task server:status  # Show service status
+task server:start   # Start (or reuse the already-running) services
+task server:stop    # Stop services, retaining sessions
 task doctor         # Check prerequisites and ownership
 task check          # Run formatting, lint, and type checks
 task check:staged   # Run the pre-commit checks against staged files

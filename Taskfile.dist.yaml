@@ -23,7 +23,7 @@ tasks:
     silent: true
     cmd: task --list
   init:
-    desc: Install dependencies, configure hooks, and initialize Agents
+    desc: Install dependencies, configure hooks, initialize Agents, and start the services
     cmds:
       - mise install
       - mkdir -p .tools/bin .tools/uv

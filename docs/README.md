@@ -9,3 +9,4 @@ Operator guides:
 Implementation plans:
 
 - [Agent progress visualization](agent-progress-visualization.md) — implementation plan for the generative live workflow scene.
+- [Long-running adventures](long-running-adventures.md) — design for durable multi-episode exploration, safe recovery, and attention-aware agent chatter.

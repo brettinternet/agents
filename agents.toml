@@ -1,0 +1,67 @@
+[project]
+name = "agents"
+path = "."
+default_branch = "main"
+verify = [["task", "check"], ["task", "test"]]
+
+[runtime]
+poll_seconds = 5
+stall_seconds = 1800
+launch_budget_per_hour = 12
+max_agents = 4
+max_consultations = 3
+worker_grace_seconds = 86400
+
+[cao]
+version = "2.4.1"
+provider = "opencode"
+api_port = 9889
+
+[web]
+host = "127.0.0.1"
+port = 9890
+
+[[actors]]
+slug = "human"
+kind = "human"
+reports_to = ""
+profile_template = ""
+specialty = ""
+persistent = true
+capacity = 1
+
+[[actors]]
+slug = "system"
+kind = "system"
+reports_to = ""
+profile_template = ""
+specialty = ""
+persistent = true
+capacity = 1
+
+[[actors]]
+slug = "elder"
+kind = "agent"
+reports_to = "human"
+profile_template = "elder"
+specialty = ""
+persistent = true
+capacity = 1
+
+[[actors]]
+slug = "explorer"
+kind = "agent"
+reports_to = "elder"
+profile_template = "explorer"
+specialty = "research"
+persistent = true
+capacity = 3
+
+[[actors]]
+slug = "yapper"
+kind = "agent"
+reports_to = "elder"
+profile_template = "yapper"
+specialty = "publishing"
+persistent = true
+capacity = 3

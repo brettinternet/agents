@@ -1,3 +1,25 @@
 node_modules/
 .robot-witness.json
 .DS_Store
+.worktrees
+AGENTS.local.md
+
+# local state and secrets
+.env
+.cao/
+.agents/
+.tools/
+.worktrees/*
+.venv/
+.pytest_cache/
+.mypy_cache/
+.pyright/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+*.log
+.DS_Store
+
+# Generated/materialized profiles
+profiles/
+agent-profiles/

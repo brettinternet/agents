@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""Small CAO mock_cli provider used by the isolated smoke run.
+
+CAO starts this program inside a tmux pane and forwards Agents credentials
+through the pane environment. Each wake is acknowledged only after the role's
+fenced HTTP action has a definitive response; repeated wakes replay the same
+request IDs and are therefore harmless.
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+
+BASE = os.environ.get("AGENTS_API_URL", "").rstrip("/")
+TOKEN = os.environ.get("AGENTS_AGENT_TOKEN", "")
+TERMINAL_ID = os.environ.get("CAO_TERMINAL_ID", "")
+DELAY_MS = 50
+for index, argument in enumerate(sys.argv):
+    if argument == "--delay-ms" and index + 1 < len(sys.argv):
+        try:
+            DELAY_MS = max(0, int(sys.argv[index + 1]))
+        except ValueError:
+            pass
+
+
+def _request(method: str, path: str, body: dict[str, Any] | None = None) -> tuple[int, Any]:
+    if not BASE or not TOKEN or not TERMINAL_ID:
+        return 0, {"error": "Agents credentials are not injected"}
+    url = f"{BASE}{path}"
+    data = None if body is None else json.dumps(body, separators=(",", ":")).encode()
+    request = urllib.request.Request(url, data=data, method=method)
+    request.add_header("Authorization", f"Bearer {TOKEN}")
+    request.add_header("X-CAO-Terminal-ID", TERMINAL_ID)
+    if data is not None:
+        request.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            raw = response.read()
+            return response.status, json.loads(raw) if raw else None
+    except urllib.error.HTTPError as exc:
+        try:
+            value = json.loads(exc.read())
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            value = {"error": str(exc)}
+        return exc.code, value
+    except (OSError, ValueError) as exc:
+        return 0, {"error": str(exc)}
+
+
+def _data(value: Any) -> Any:
+    return value.get("data") if isinstance(value, dict) else None
+
+
+def _backlog() -> list[dict[str, Any]]:
+    status, value = _request("GET", "/agent/v1/backlog?limit=100")
+    data = _data(value)
+    return data if status == 200 and isinstance(data, list) else []
+
+
+def _detail(item_id: str) -> dict[str, Any]:
+    encoded = urllib.parse.quote(item_id, safe="")
+    status, value = _request("GET", f"/agent/v1/backlog/{encoded}")
+    data = _data(value)
+    return data if status == 200 and isinstance(data, dict) else {}
+
+
+def _request_id(kind: str, identifier: object, action: str) -> str:
+    return f"purpose:smoke:{kind}:{identifier}:{action}:0"
+
+
+def _post_message(to: str, body: str, key: str) -> None:
+    _request("POST", "/agent/v1/messages", {"request_id": key, "to": to, "body": body})
+
+
+def _elder_step(force_ready: bool = False) -> list[str]:
+    actions: list[str] = []
+    items = _backlog()
+    item = next((row for row in items if row.get("title") == "Smoke delivery"), None)
+    if item is None:
+        return actions
+    item_id = str(item["id"])
+    version = int(item["version"])
+    status = str(item.get("status"))
+    if status == "intake":
+        code, _ = _request(
+            "POST",
+            f"/agent/v1/backlog/{item_id}/start-refinement",
+            {"request_id": _request_id("work", item_id, "start-refinement"), "expected_version": version},
+        )
+        if code in (200, 409):
+            actions.append("refinement-started")
+        item = _detail(item_id)
+        version = int(item.get("version", version))
+        status = str(item.get("status", status))
+    if status == "refining" and version <= 2:
+        criteria = ["A committed change passes the configured verification command."]
+        code, _ = _request(
+            "PUT",
+            f"/agent/v1/backlog/{item_id}",
+            {
+                "request_id": _request_id("work", item_id, "refine"),
+                "expected_version": version,
+                "kind": "story",
+                "title": "Smoke delivery",
+                "problem": "Exercise the isolated mock delivery path.",
+                "outcome": "Agents records immutable submission and review evidence.",
+                "priority": "normal",
+                "specialty": "publishing",
+                "acceptance_criteria": criteria,
+                "dependencies": [],
+                "review_gates": [],
+            },
+        )
+        if code in (200, 409):
+            actions.append("refined")
+        item = _detail(item_id)
+        version = int(item.get("version", version))
+        _request(
+            "POST",
+            f"/agent/v1/backlog/{item_id}/consultations",
+            {
+                "request_id": _request_id("work", item_id, "consult-publishing"),
+                "expected_version": version,
+                "specialty": "publishing",
+                "question": "Review the deterministic smoke implementation approach.",
+            },
+        )
+    if status == "refining" and force_ready:
+        item = _detail(item_id)
+        version = int(item.get("version", version))
+        code, _ = _request(
+            "POST",
+            f"/agent/v1/backlog/{item_id}/ready",
+            {"request_id": _request_id("work", item_id, "ready"), "expected_version": version},
+        )
+        if code in (200, 409):
+            actions.append("ready")
+    return actions
+
+
+def _consultation_step(assignment: dict[str, Any]) -> list[str]:
+    consultation = assignment.get("consultation")
+    if not isinstance(consultation, dict) or consultation.get("state") != "assigned":
+        return []
+    consultation_id = int(consultation["id"])
+    code, _ = _request(
+        "POST",
+        f"/agent/v1/consultations/{consultation_id}/submit",
+        {
+            "request_id": _request_id("consultation", consultation_id, "submit"),
+            "expected_version": int(consultation.get("version", 1)),
+            "response": "Use a clean isolated commit and run the configured argv directly.",
+        },
+    )
+    if code in (200, 409):
+        _post_message(
+            "@elder",
+            "Publishing consultation completed for the smoke delivery.",
+            _request_id("consultation", consultation_id, "notify"),
+        )
+        return ["consultation-submitted"]
+    return []
+
+
+def _git(cwd: str, *args: str) -> str:
+    result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=True)
+    return result.stdout.strip()
+
+
+def _work_step(assignment: dict[str, Any]) -> list[str]:
+    row = assignment.get("assignment")
+    if not isinstance(row, dict) or not row.get("work_id"):
+        return []
+    item_id = str(row["work_id"])
+    detail = _detail(item_id)
+    worktree = Path(str(row.get("worktree_path", "")))
+    if not worktree.is_dir() or not detail:
+        return []
+    marker = worktree / "smoke-delivery.txt"
+    if not marker.exists():
+        marker.write_text("deterministic mock provider delivery\n", encoding="utf-8")
+        _git(str(worktree), "add", marker.name)
+        _git(
+            str(worktree),
+            "-c",
+            "user.name=Agents Smoke",
+            "-c",
+            "user.email=agents-smoke@example.invalid",
+            "commit",
+            "-m",
+            "Complete smoke delivery",
+        )
+    commit_sha = _git(str(worktree), "rev-parse", "HEAD")
+    code, _ = _request(
+        "POST",
+        f"/agent/v1/backlog/{item_id}/submit",
+        {
+            "request_id": _request_id("work", item_id, "submit"),
+            "expected_version": int(detail["version"]),
+            "commit_sha": commit_sha,
+            "summary": "Deterministic mock implementation submitted.",
+        },
+    )
+    if code in (200, 409):
+        return ["work-submitted"]
+    return []
+
+
+def _review_step(assignment: dict[str, Any]) -> list[str]:
+    review = assignment.get("review")
+    if not isinstance(review, dict) or review.get("verdict") != "pending":
+        return []
+    submission_id = int(review["submission_id"])
+    item_id = str(assignment.get("purpose_id", "")).split("-")[0]
+    if not item_id.startswith("AGENT-"):
+        item_id = next((str(row["id"]) for row in _backlog() if row.get("status") in {"reviewing", "verifying"}), "")
+    if not item_id:
+        return []
+    detail = _detail(item_id)
+    gate = str(review.get("gate") or "research")
+    code, _ = _request(
+        "POST",
+        f"/agent/v1/reviews/{submission_id}/{urllib.parse.quote(gate, safe='')}",
+        {
+            "request_id": _request_id("review", submission_id, gate),
+            "item_id": item_id,
+            "expected_version": int(detail.get("version", 1)),
+            "verdict": "pass",
+            "body": "Research verified the immutable submission and clean review worktree.",
+        },
+    )
+    return ["review-submitted"] if code in (200, 409) else []
+
+
+def _handle_wake() -> str:
+    _, inbox_value = _request("GET", "/agent/v1/inbox?limit=50")
+    inbox = _data(inbox_value)
+    _, assignment_value = _request("GET", "/agent/v1/assignment")
+    assignment = _data(assignment_value)
+    actions: list[str] = []
+    if isinstance(assignment, dict):
+        actions.extend(_consultation_step(assignment))
+        actions.extend(_work_step(assignment))
+        actions.extend(_review_step(assignment))
+        if assignment.get("purpose_kind") == "persistent" and assignment.get("purpose_id") == "elder":
+            actions.extend(_elder_step(force_ready=True))
+    if isinstance(inbox, list) and inbox:
+        ids = [int(row["id"]) for row in inbox if isinstance(row, dict) and str(row.get("id", "")).isdigit()]
+        if ids:
+            _request(
+                "POST",
+                "/agent/v1/inbox/ack",
+                {"request_id": _request_id("inbox", ",".join(str(value) for value in ids), "ack"), "message_ids": ids},
+            )
+    return ",".join(actions) or "wake-processed"
+
+
+def main() -> int:
+    print("mock_cli 2.4.1", flush=True)
+    print("❯", flush=True)
+    for line in sys.stdin:
+        payload = line.strip()
+        if payload:
+            time.sleep(DELAY_MS / 1000)
+            result = _handle_wake()
+            print(f"> MOCK: {result}", flush=True)
+        print("❯", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

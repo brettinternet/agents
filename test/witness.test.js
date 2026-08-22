@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { verifyCheckpointSignature, verifyConsistency } from "../src/crypto.js";
@@ -91,6 +91,25 @@ test("pins on first use, then advances only through a valid consistency proof", 
   assert.equal(saved.public_key, PUBLIC_KEY);
 });
 
+test("rejects a consistency endpoint that names another log", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "robot-witness-"));
+  const statePath = join(directory, "state.json");
+  await witness({ statePath, fetchImpl: async () => jsonResponse(checkpointResponse(OLD)) });
+  const before = await readFile(statePath, "utf8");
+  const fetchImpl = async (url) => {
+    if (url.pathname === "/api/checkpoint") return jsonResponse(checkpointResponse(CURRENT));
+    return jsonResponse({
+      log: "identity_events",
+      from: { ...OLD, log: "ledger" },
+      to: CURRENT,
+      proof: PROOF,
+    });
+  };
+
+  await assert.rejects(witness({ statePath, fetchImpl }), /does not match the witnessed endpoints/);
+  assert.equal(await readFile(statePath, "utf8"), before);
+});
+
 test("rejects an advertised key change without replacing witnessed state", async () => {
   const directory = await mkdtemp(join(tmpdir(), "robot-witness-"));
   const statePath = join(directory, "state.json");
@@ -136,4 +155,20 @@ test("refuses concurrent writers instead of regressing witnessed state", async (
   await running;
   const saved = JSON.parse(await readFile(statePath, "utf8"));
   assert.equal(saved.checkpoints.identity_events.tree_size, OLD.tree_size);
+});
+
+test("recovers a lock left by a terminated writer", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "robot-witness-"));
+  const statePath = join(directory, "state.json");
+  await writeFile(`${statePath}.lock`, JSON.stringify({
+    pid: 2_147_483_647,
+    token: "terminated-writer",
+  }));
+
+  const report = await witness({
+    statePath,
+    fetchImpl: async () => jsonResponse(checkpointResponse(OLD)),
+  });
+  assert.equal(report.trust, "trust-on-first-use");
+  assert.equal(JSON.parse(await readFile(statePath, "utf8")).checkpoints.identity_events.root, OLD.root);
 });

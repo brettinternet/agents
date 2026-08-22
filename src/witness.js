@@ -1,4 +1,5 @@
-import { mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { dirname } from "node:path";
 import { checkpointPayload, verifyCheckpointSignature, verifyConsistency } from "./crypto.js";
 
@@ -34,6 +35,59 @@ async function saveState(path, state) {
   await rename(temporary, path);
 }
 
+function processIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code !== "ESRCH";
+  }
+}
+
+async function staleLock(path) {
+  try {
+    const owner = JSON.parse(await readFile(path, "utf8"));
+    if (Number.isSafeInteger(owner.pid) && owner.pid > 0) return !processIsAlive(owner.pid);
+  } catch {
+    // A competing process may still be writing a newly-created lock.
+  }
+  return Date.now() - (await stat(path)).mtimeMs > 5_000;
+}
+
+async function acquireLock(path, statePath, mayRecover = true) {
+  let handle;
+  try {
+    handle = await open(path, "wx", 0o600);
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
+    if (!mayRecover || !(await staleLock(path))) {
+      throw new Error(`another witness is already using ${statePath}`);
+    }
+    await unlink(path);
+    return acquireLock(path, statePath, false);
+  }
+
+  const token = randomUUID();
+  try {
+    await handle.writeFile(JSON.stringify({ pid: process.pid, token }));
+    return { handle, token };
+  } catch (error) {
+    await handle.close().catch(() => {});
+    await unlink(path).catch(() => {});
+    throw error;
+  }
+}
+
+async function releaseLock(path, lock) {
+  await lock.handle.close().catch(() => {});
+  try {
+    const owner = JSON.parse(await readFile(path, "utf8"));
+    if (owner.token === lock.token) await unlink(path);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+}
+
 function publicKeyFrom(response) {
   const key = response?.registry_public_key;
   if (key?.kty !== "OKP" || key?.crv !== "Ed25519" || typeof key.x !== "string") {
@@ -46,9 +100,9 @@ function checkpointMap(checkpoints) {
   if (!Array.isArray(checkpoints) || checkpoints.length === 0) {
     throw new Error("checkpoint response contains no logs");
   }
-  const map = {};
+  const map = Object.create(null);
   for (const checkpoint of checkpoints) {
-    if (!checkpoint || typeof checkpoint.log !== "string" || map[checkpoint.log]) {
+    if (!checkpoint || typeof checkpoint.log !== "string" || Object.hasOwn(map, checkpoint.log)) {
       throw new Error("checkpoint response contains an invalid or duplicate log");
     }
     map[checkpoint.log] = checkpoint;
@@ -93,12 +147,12 @@ async function runWitness({
   const results = [];
   if (saved) {
     for (const log of Object.keys(saved.checkpoints)) {
-      if (!current[log]) throw new Error(`previously witnessed log disappeared: ${log}`);
+      if (!Object.hasOwn(current, log)) throw new Error(`previously witnessed log disappeared: ${log}`);
     }
   }
 
   for (const [log, checkpoint] of Object.entries(current)) {
-    const previous = saved?.checkpoints[log];
+    const previous = saved && Object.hasOwn(saved.checkpoints, log) ? saved.checkpoints[log] : undefined;
     if (!previous) {
       results.push({ log, status: saved ? "new" : "pinned", tree_size: checkpoint.tree_size });
       continue;
@@ -117,7 +171,13 @@ async function runWitness({
     proofUrl.searchParams.set("from", String(previous.tree_size));
     proofUrl.searchParams.set("to", String(checkpoint.tree_size));
     const consistency = await getJson(fetchImpl, proofUrl);
-    if (consistency.log !== log || !sameCheckpoint({ ...consistency.from, log }, previous) || !sameCheckpoint({ ...consistency.to, log }, checkpoint)) {
+    if (
+      consistency.log !== log
+      || (consistency.from?.log !== undefined && consistency.from.log !== log)
+      || (consistency.to?.log !== undefined && consistency.to.log !== log)
+      || !sameCheckpoint({ ...consistency.from, log }, previous)
+      || !sameCheckpoint({ ...consistency.to, log }, checkpoint)
+    ) {
       throw new Error(`${log} consistency response does not match the witnessed endpoints`);
     }
     assertSigned({ ...consistency.from, log }, publicKey, `${log} previous`);
@@ -159,19 +219,11 @@ export async function witness({
 } = {}) {
   await mkdir(dirname(statePath), { recursive: true });
   const lockPath = `${statePath}.lock`;
-  let lock;
-  try {
-    lock = await open(lockPath, "wx", 0o600);
-  } catch (error) {
-    if (error?.code === "EEXIST") throw new Error(`another witness is already using ${statePath}`);
-    throw error;
-  }
+  const lock = await acquireLock(lockPath, statePath);
 
   try {
-    await lock.writeFile(`${process.pid}\n`);
     return await runWitness({ origin, statePath, fetchImpl });
   } finally {
-    await lock.close().catch(() => {});
-    await unlink(lockPath);
+    await releaseLock(lockPath, lock);
   }
 }

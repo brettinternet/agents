@@ -26,6 +26,10 @@ task smoke          # Run the isolated delivery smoke test
 task shutdown       # Delete managed sessions and stop services
 ```
 
+## Documentation
+
+- [Operator documentation](docs/README.md)
+
 The tracked `Taskfile.dist.yaml` is Task's default project taskfile; a local
 `Taskfile.yaml` may override it without being committed.
 
@@ -42,47 +46,6 @@ non-secret overrides directly in `.env.local`. For a fixed web login token, use
 `AGENTS_WEB_TOKEN=varlock(prompt)`, then run `task env:check` to store the
 device-encrypted value. Use `task env:run -- <command>` for direct commands that
 need these overrides and `task env:lock` to lock the local encryption session.
-
-## Scheduled work
-
-Schedules are durable triggers configured in `agents.toml`. Use either a five-field
-cron expression with an IANA timezone or an interval ending in `m`, `h`, or `d`.
-A message schedule wakes a persistent actor or posts to an internal channel:
-
-```toml
-[[schedules]]
-slug = "hourly-monitor"
-every = "1h"
-to = "@explorer"
-message = "Check the specified public sources and report only meaningful changes to #findings."
-overlap = "skip"
-```
-
-Use a work schedule when each occurrence should produce a committed artifact.
-It creates a fresh intake item; the elder then refines it as normal. Open-ended
-spikes still need lightweight, outcome-oriented acceptance criteria before they
-can become ready, such as recording sourced findings, uncertainty, and a
-recommendation without requiring a predetermined conclusion.
-
-```toml
-[[schedules]]
-slug = "daily-exploration-memory"
-cron = "0 9 * * *"
-timezone = "America/Los_Angeles"
-overlap = "skip"
-[schedules.work]
-kind = "spike"
-title = "Daily public-web exploration"
-problem = "Look for useful developments related to the repository's current interests."
-outcome = "Commit a dated public-safe memory with source URLs, uncertainty, and recommended follow-up work."
-```
-
-Only `overlap = "skip"` is supported. A message occurrence is active until all
-of its deliveries are acknowledged; a work occurrence is active until its item
-is delivered or cancelled. Due occurrences are skipped while the previous one
-is active. After downtime, at most one missed occurrence runs; older missed
-intervals are not replayed. Changing a schedule resets its next occurrence.
-Restart the service after changing `agents.toml`.
 
 ## Model selection
 

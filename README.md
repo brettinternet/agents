@@ -7,7 +7,7 @@ Agents is a local control plane for running a durable, observable team of AI age
 Requires [mise](https://mise.jdx.dev/) and Git.
 
 ```sh
-mise exec task -- task init
+task init
 ```
 
 Open `http://127.0.0.1:9890`. Run `task dashboard` to print the login token's path.

@@ -7,8 +7,7 @@ Agents is a local control plane for running a durable, observable team of AI age
 Requires [mise](https://mise.jdx.dev/) and Git.
 
 ```sh
-mise install
-task init
+mise exec task -- task init
 ```
 
 Open `http://127.0.0.1:9890`. Run `task dashboard` to print the login token's path.
@@ -41,8 +40,10 @@ Configure the project, runtime, CAO provider, web server, and agent roster in
 | `.env.schema` | committed | Optional override contract and secret marking |
 | `.env.local`  | ignored   | Local overrides and encrypted secret values   |
 
-`task init` creates `.env.local`, validates it, and installs Lefthook. Set
-non-secret overrides directly in `.env.local`. For a fixed web login token, use
+`task init` installs every pinned mise tool—including SOPS and age—creates and
+validates `.env.local`, initializes and validates the agent secret store,
+installs Lefthook, and initializes Agents. Set non-secret overrides directly in
+`.env.local`. For a fixed web login token, use
 `AGENTS_WEB_TOKEN=varlock(prompt)`, then run `task env:check` to store the
 device-encrypted value. Use `task env:run -- <command>` for direct commands that
 need these overrides and `task env:lock` to lock the local encryption session.
@@ -59,15 +60,11 @@ The shared agent secret store is separate from the operator/runtime values in
 | `.env.sops-age`           | ignored   | Host-local age identity; raw identity data, never dotenv syntax         |
 | `.sops-isolated-home/`    | ignored   | Private SOPS home isolated from user and system identities              |
 
-The operator bootstraps the identity and format-only store once:
-
-```sh
-task secrets:init
-```
-
-If the committed config or ciphertext exists but `.env.sops-age` is missing,
-initialization fails closed. The operator must restore the matching identity;
-the helper never rotates it or rewrites ciphertext with a replacement.
+`task init` creates `.env.sops-age` when initializing a repository that does not
+yet contain a secret store. If committed config or ciphertext already exists
+but the local identity is missing, initialization fails closed. Restore the
+matching `.env.sops-age`, then rerun `task init`; initialization never rotates
+the recipient or rewrites ciphertext with a replacement.
 
 To add a value, first declare the same name with `# @sensitive` in
 `.env.schema`, then provide the value only on stdin:

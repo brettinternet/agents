@@ -25,10 +25,13 @@ tasks:
   init:
     desc: Install dependencies, configure hooks, and initialize Agents
     cmds:
+      - mise install
       - mkdir -p .tools/bin .tools/uv
       - uv tool install --force --managed-python --python 3.14 cli-agent-orchestrator==2.4.1
       - uv sync --all-groups
       - task: env:init
+      - task: secrets:init
+      - task: secrets:check
       - lefthook install
       - "{{.ENV_RUN}} {{.PYTHON}} -m agents.cli init"
   env:init:

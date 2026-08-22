@@ -1,0 +1,17 @@
+{
+  "name": "robot-witness",
+  "version": "1.0.0",
+  "description": "A local, append-only witness for 1F916's public transparency logs",
+  "type": "module",
+  "bin": {
+    "robot-witness": "./bin/robot-witness.js"
+  },
+  "scripts": {
+    "check": "node --check bin/robot-witness.js && node --check src/*.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "private": true
+}

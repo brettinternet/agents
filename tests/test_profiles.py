@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -138,6 +139,59 @@ class ProfileTests(unittest.TestCase):
             self.assertIn(f'"@{claude.mcp_name}"', claude_text)
             self.assertIn("agents-mcp-server", claude_text)
 
+    def test_opencode_install_restores_reasoning_dropped_by_cao_adapter(self):
+        root = Path(__file__).parents[1]
+        with tempfile.TemporaryDirectory() as d:
+            state = Path(d)
+            materialized = materialize_profile(
+                root,
+                state,
+                template="elder",
+                instance="deadbeef",
+                run_id=4,
+                generation=1,
+                provider="opencode_cli",
+                purpose_kind="persistent",
+                specialty="",
+                token="reasoning-token",
+                api_url="http://127.0.0.1:9890",
+                reasoning_effort="high",
+            )
+            cao = state / "cao"
+            cao.write_text(
+                f"""#!/usr/bin/env python3
+import json,os,pathlib,sys
+name={materialized.name!r}
+mcp={materialized.mcp_name!r}
+if sys.argv[1]=="install":
+ root=pathlib.Path.home()/".aws/opencode"
+ (root/"agents").mkdir(parents=True)
+ (root/"agents"/f"{{name}}.md").write_text("---\\ndescription: staged\\nmode: all\\n---\\nbody\\n")
+ (root/"opencode.json").write_text(json.dumps({{"mcp":{{mcp:{{"env":{{"AGENTS_AGENT_TOKEN":"reasoning-token"}}}}}}}}))
+ print("Successfully installed agent profile: "+name)
+else:
+ print(json.dumps({{"name":name}}))
+"""
+            )
+            cao.chmod(0o700)
+            provider_home = state / "provider-home"
+            provider_home.mkdir()
+            with patch.dict(
+                os.environ,
+                {"HOME": str(provider_home), "XDG_STATE_HOME": str(state / "xdg")},
+            ):
+                artifacts = install_profile(
+                    cao,
+                    state / "cao-home",
+                    materialized,
+                    "opencode_cli",
+                    state / "profiles.lock",
+                )
+            installed = provider_home / ".aws/opencode/agents" / f"{materialized.name}.md"
+            self.assertIn('reasoningEffort: "high"', installed.read_text())
+            agent_artifact = next(artifact for artifact in artifacts if artifact["kind"] == "agent")
+            self.assertEqual(agent_artifact["sha256"], hashlib.sha256(installed.read_bytes()).hexdigest())
+
     def test_provider_merge_preserves_unrelated_and_rejects_prefix(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "config.json"
@@ -148,7 +202,7 @@ class ProfileTests(unittest.TestCase):
             with self.assertRaises(ProfileError):
                 merge_owned_json(path, "mcp", "agents", {"command": "x"})
 
-    def test_staged_home_install_requires_exact_success_line(self):
+    def test_staged_home_install_accepts_cao_paths_and_requires_exact_success_line(self):
         root = Path(__file__).parents[1]
         with tempfile.TemporaryDirectory() as d:
             state = Path(d)
@@ -167,7 +221,7 @@ class ProfileTests(unittest.TestCase):
             )
             cao = state / "cao"
             cao.write_text(
-                f'#!/usr/bin/env python3\nimport json,sys\nif sys.argv[1]=="install": print("Successfully installed agent profile: {p.name}")\nelse: print(json.dumps({{"name":"{p.name}"}}))\n'
+                f'#!/usr/bin/env python3\nimport json,os,sys\nif sys.argv[1]=="install":\n print("Successfully installed agent profile: {p.name}")\n print("Context file: "+os.environ["HOME"]+"/agent-context/{p.name}.md")\nelse: print(json.dumps({{"name":"{p.name}"}}))\n'
             )
             cao.chmod(0o700)
             with patch.dict(os.environ, {"XDG_STATE_HOME": str(state / "xdg")}):

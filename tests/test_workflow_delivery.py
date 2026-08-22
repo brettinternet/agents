@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, cast
 from unittest.mock import patch
 
-from agents.config import AgentsConfig, CaoConfig, ProjectConfig, RuntimeConfig, WebConfig
+from agents.config import AgentsConfig, CaoConfig, ModelChoice, ProjectConfig, RuntimeConfig, WebConfig
 from agents.db import connect, migrate, utc_now
 from agents.delivery import Delivery
 from agents.git_worktree import branch_sha, head_sha
@@ -71,7 +71,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.root,
             ProjectConfig("test", repo, "main", (("python3", "-c", "print('ok')"),)),
             RuntimeConfig(5, 1800, 12, 4, 3, 86400),
-            CaoConfig("2.4.1", "mock", "mock_cli", 9889, ""),
+            CaoConfig("2.4.1", "mock", "mock_cli", 9889, (ModelChoice(""),)),
             WebConfig("127.0.0.1", 9890),
             actors,
         )

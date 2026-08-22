@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import re
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -12,10 +14,13 @@ _ALLOWED_ENV = {
     "AGENTS_CONFIG",
     "AGENTS_PROVIDER",
     "AGENTS_MODEL",
+    "AGENTS_REASONING_EFFORT",
     "AGENTS_CAO_PORT",
     "AGENTS_WEB_PORT",
     "AGENTS_WEB_TOKEN",
 }
+_MODEL_ID = re.compile(r"^[A-Za-z0-9._:/-]{1,128}$")
+_REASONING_EFFORT = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
 
 
 class ConfigError(ValueError):
@@ -41,12 +46,18 @@ class RuntimeConfig:
 
 
 @dataclass(frozen=True)
+class ModelChoice:
+    id: str
+    reasoning_effort: str = ""
+
+
+@dataclass(frozen=True)
 class CaoConfig:
     version: str
     provider: str
     provider_id: str
     api_port: int
-    model: str
+    models: tuple[ModelChoice, ...]
 
 
 @dataclass(frozen=True)
@@ -103,6 +114,53 @@ def _verify(value: object) -> tuple[tuple[str, ...], ...]:
             argv.append(arg)
         commands.append(tuple(argv))
     return tuple(commands)
+
+
+def _model_choice(model: object, reasoning_effort: object = "") -> ModelChoice:
+    if not isinstance(model, str) or not _MODEL_ID.fullmatch(model):
+        raise ConfigError("cao model IDs must match ^[A-Za-z0-9._:/-]{1,128}$")
+    if not isinstance(reasoning_effort, str) or (
+        reasoning_effort and not _REASONING_EFFORT.fullmatch(reasoning_effort)
+    ):
+        raise ConfigError("cao reasoning_effort must match ^[A-Za-z0-9._-]{1,32}$")
+    return ModelChoice(model, reasoning_effort)
+
+
+def _models(cao: dict[str, Any], values: Mapping[str, str], provider: str) -> tuple[ModelChoice, ...]:
+    env_model = values.get("AGENTS_MODEL")
+    env_reasoning = values.get("AGENTS_REASONING_EFFORT", "")
+    if env_model:
+        choices = (_model_choice(env_model, env_reasoning),)
+    elif env_reasoning:
+        raise ConfigError("AGENTS_REASONING_EFFORT requires AGENTS_MODEL")
+    else:
+        model = cao.get("model")
+        models = cao.get("models")
+        reasoning = cao.get("reasoning_effort", "")
+        if model is not None and models is not None:
+            raise ConfigError("cao.model and cao.models are mutually exclusive")
+        if models is not None:
+            if reasoning:
+                raise ConfigError("cao.reasoning_effort cannot be combined with cao.models")
+            if not isinstance(models, list) or not models:
+                raise ConfigError("cao.models must be a nonempty array of model tables")
+            parsed: list[ModelChoice] = []
+            for entry in models:
+                if not isinstance(entry, dict) or set(entry) - {"id", "reasoning_effort"} or "id" not in entry:
+                    raise ConfigError("each cao.models entry requires id and optionally reasoning_effort")
+                parsed.append(_model_choice(entry["id"], entry.get("reasoning_effort", "")))
+            choices = tuple(parsed)
+        elif model is not None:
+            choices = (_model_choice(model, reasoning),)
+        elif reasoning:
+            raise ConfigError("cao.reasoning_effort requires cao.model")
+        else:
+            choices = (ModelChoice(""),)
+    if len(choices) != len(set(choices)):
+        raise ConfigError("cao.models contains duplicate model/reasoning choices")
+    if provider != "opencode" and any(choice.reasoning_effort for choice in choices):
+        raise ConfigError("reasoning_effort is supported only by the opencode provider")
+    return choices
 
 
 def load(path: Path | None = None, env: dict[str, str] | None = None) -> AgentsConfig:
@@ -171,7 +229,7 @@ def load(path: Path | None = None, env: dict[str, str] | None = None) -> AgentsC
             provider,
             _PROVIDER_MAP[provider],
             cao_port,
-            values.get("AGENTS_MODEL", ""),
+            _models(cao_raw, values, provider),
         ),
         web=WebConfig(host, web_port),
         actors=actor_rows,

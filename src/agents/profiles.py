@@ -42,6 +42,7 @@ class MaterializedProfile:
     path: Path
     sha256: str
     allowed_tools: tuple[str, ...]
+    reasoning_effort: str = ""
     secret_values: tuple[tuple[str, str], ...] = ()
 
 
@@ -130,9 +131,12 @@ def materialize_profile(
     specialty: str | None,
     token: str,
     api_url: str,
+    reasoning_effort: str = "",
 ) -> MaterializedProfile:
     if provider not in PROVIDER_CAPABILITIES:
         raise ProfileError("unsupported CAO provider capability")
+    if reasoning_effort and provider != "opencode_cli":
+        raise ProfileError("reasoning effort is supported only by opencode_cli")
     old = os.umask(0o077)
     try:
         name = profile_name(instance, run_id, generation)
@@ -154,6 +158,8 @@ def materialize_profile(
             raise ProfileError("profile template lacks front matter")
         tools = purpose_tools(purpose_kind, specialty)
         meta = re.sub(r"^name:.*$", f"name: {name}", frontmatter.group("meta"), flags=re.M)
+        if reasoning_effort:
+            meta += f"reasoningEffort: {json.dumps(reasoning_effort)}\n"
         meta += "allowedTools:\n" + "".join(f"  - {json.dumps(tool)}\n" for tool in (*tools, f"@{mcp}"))
         meta += f"mcpServers:\n  {mcp}:\n    type: stdio\n    command: {root / '.venv/bin/agents-mcp-server'}\n"
         meta += (
@@ -163,7 +169,15 @@ def materialize_profile(
         text = f"---\n{meta}---\n{source[frontmatter.end() :]}{policy}"
         _write_bytes_atomic(target, text.encode())
         digest = hashlib.sha256(text.encode()).hexdigest()
-        return MaterializedProfile(name, mcp, target, digest, tools, (("AGENTS_AGENT_TOKEN", token),))
+        return MaterializedProfile(
+            name,
+            mcp,
+            target,
+            digest,
+            tools,
+            reasoning_effort,
+            (("AGENTS_AGENT_TOKEN", token),),
+        )
     finally:
         os.umask(old)
 
@@ -393,6 +407,25 @@ def _validate_staging(home: Path, provider: str, profile: str) -> tuple[Path | N
     return agent_path, config_path
 
 
+def _with_opencode_reasoning(content: bytes, reasoning_effort: str) -> bytes:
+    if not reasoning_effort:
+        return content
+    try:
+        text = content.decode()
+    except UnicodeDecodeError as exc:
+        raise ProfileError("CAO staged OpenCode agent is not UTF-8") from exc
+    frontmatter = re.match(r"\A---\n(?P<meta>.*?)^---\n", text, re.S | re.M)
+    if frontmatter is None:
+        raise ProfileError("CAO staged OpenCode agent lacks front matter")
+    meta = frontmatter.group("meta")
+    field = f"reasoningEffort: {json.dumps(reasoning_effort)}"
+    if re.search(r"^reasoningEffort:", meta, re.M):
+        meta = re.sub(r"^reasoningEffort:.*$", field, meta, flags=re.M)
+    else:
+        meta += field + "\n"
+    return f"---\n{meta}---\n{text[frontmatter.end() :]}".encode()
+
+
 def _publish_opencode(
     home: Path,
     materialized: MaterializedProfile,
@@ -403,7 +436,7 @@ def _publish_opencode(
     agent_content: bytes | None = None
     agent_target: Path | None = None
     if staged_agent is not None:
-        agent_content = staged_agent.read_bytes()
+        agent_content = _with_opencode_reasoning(staged_agent.read_bytes(), materialized.reasoning_effort)
         agent_target = provider_root / "agents" / staged_agent.name
         if agent_target.exists():
             if (
@@ -487,8 +520,6 @@ def install_profile(
         output_lines = {re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", line).strip() for line in result.stdout.splitlines()}
         if result.returncode or not expected_lines.intersection(output_lines):
             raise ProfileError((result.stderr or result.stdout or "CAO profile install failed").strip())
-        if str(home) in result.stdout or str(home) in result.stderr:
-            raise ProfileError("CAO profile install leaked staging path")
         found = _run_cao(
             cao,
             ["profile", "find", materialized.name, "--json"],

@@ -9,7 +9,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from agents.auth import AgentContext
-from agents.config import AgentsConfig, CaoConfig, ProjectConfig, RuntimeConfig, WebConfig
+from agents.config import AgentsConfig, CaoConfig, ModelChoice, ProjectConfig, RuntimeConfig, WebConfig
 from agents.db import connect, migrate, utc_now
 from agents.messages import Messaging
 from agents.store import Store
@@ -35,7 +35,7 @@ class WebAuthTests(unittest.TestCase):
             root,
             ProjectConfig("test", repo, "main", (("task", "check"),)),
             RuntimeConfig(5, 1800, 12, 4, 3, 86400),
-            CaoConfig("2.4.1", "mock", "mock_cli", 9889, ""),
+            CaoConfig("2.4.1", "mock", "mock_cli", 9889, (ModelChoice(""),)),
             WebConfig("127.0.0.1", 9890),
             (
                 {"slug": "human", "kind": "human", "persistent": True, "capacity": 1},

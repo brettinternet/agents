@@ -129,6 +129,7 @@ def _isolated_environment(config_path: Path, home: Path, xdg: Path) -> Iterator[
         "AGENTS_CONFIG",
         "AGENTS_PROVIDER",
         "AGENTS_MODEL",
+        "AGENTS_REASONING_EFFORT",
         "AGENTS_CAO_PORT",
         "AGENTS_WEB_PORT",
         "AGENTS_WEB_TOKEN",

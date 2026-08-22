@@ -7,13 +7,14 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import patch
 
 from agents.cao_client import CaoNotFound
-from agents.config import AgentsConfig, CaoConfig, ProjectConfig, RuntimeConfig, WebConfig
+from agents.config import AgentsConfig, CaoConfig, ModelChoice, ProjectConfig, RuntimeConfig, WebConfig
 from agents.db import connect, migrate, utc_now
 from agents.delivery import Delivery
 from agents.reconciler import Reconciler, bootstrap_persistent_agents, reserve_terminal
@@ -143,7 +144,7 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
                 max_consultations=3,
                 worker_grace_seconds=86400,
             ),
-            CaoConfig("2.4.1", "mock", "mock_cli", 9889, ""),
+            CaoConfig("2.4.1", "mock", "mock_cli", 9889, (ModelChoice(""),)),
             WebConfig("127.0.0.1", 9890),
             actors,
         )
@@ -365,6 +366,28 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
         )
+
+    async def test_model_choice_is_selected_once_persisted_and_sent_to_cao(self):
+        selected = ModelChoice("mock/second")
+        self.config = replace(
+            self.config,
+            cao=CaoConfig(
+                "2.4.1",
+                "mock",
+                "mock_cli",
+                9889,
+                (ModelChoice("mock/first"), selected),
+            ),
+        )
+        self.reconciler = Reconciler(self.config, self.connection, self.fake)
+        with patch("agents.reconciler.secrets.choice", return_value=selected) as choose:
+            run = self.reserve()
+            self.assertEqual((run["model"], run["reasoning_effort"]), ("mock/second", ""))
+            with patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "xdg")}):
+                await self.reconciler._launch(run["id"])
+                await self.reconciler._launch(run["id"])
+        choose.assert_called_once_with(self.config.cao.models)
+        self.assertEqual(self.fake.created[0]["model"], "mock/second")
 
     async def test_output_digest_prompt_and_wake_are_durable(self):
         run = self.reserve()

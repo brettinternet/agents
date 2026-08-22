@@ -73,6 +73,7 @@ class CaoClientTests(unittest.TestCase):
         request = self.requests[-1]
         self.assertEqual(request.url.path, "/sessions")
         self.assertEqual(request.url.params["session_name"], "cao-agents-name")
+        self.assertEqual(request.url.params["model"], "model")
         self.assertEqual(json.loads(request.content), {"env_vars": {"TOKEN": "secret"}})
         self.assertEqual(request.extensions["timeout"]["read"], 120.0)
 

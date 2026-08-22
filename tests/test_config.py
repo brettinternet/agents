@@ -39,6 +39,73 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.project.verify, (("task", "check"),))
             self.assertEqual(config.cao.provider_id, "mock_cli")
 
+    def test_loads_structured_model_choices(self) -> None:
+        configured = CONFIG.replace(
+            "api_port=9889",
+            """api_port=9889
+models=[
+  {id='openai/gpt-5', reasoning_effort='high'},
+  {id='anthropic/claude-sonnet-4-6'},
+]""",
+        ).replace("provider='mock'", "provider='opencode'")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "agents.toml"
+            path.write_text(configured)
+            choices = load(path, {}).cao.models
+            self.assertEqual(
+                [(choice.id, choice.reasoning_effort) for choice in choices],
+                [("openai/gpt-5", "high"), ("anthropic/claude-sonnet-4-6", "")],
+            )
+
+    def test_environment_model_and_reasoning_override_toml_choices(self) -> None:
+        configured = CONFIG.replace(
+            "api_port=9889",
+            "api_port=9889\nmodels=[{id='openai/gpt-5', reasoning_effort='low'}]",
+        ).replace("provider='mock'", "provider='opencode'")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "agents.toml"
+            path.write_text(configured)
+            choices = load(
+                path,
+                {
+                    "AGENTS_MODEL": "openai/gpt-5-mini",
+                    "AGENTS_REASONING_EFFORT": "medium",
+                },
+            ).cao.models
+            self.assertEqual(
+                [(choice.id, choice.reasoning_effort) for choice in choices], [("openai/gpt-5-mini", "medium")]
+            )
+
+    def test_empty_environment_model_does_not_override_toml(self) -> None:
+        configured = CONFIG.replace("api_port=9889", "api_port=9889\nmodel='mock/model'")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "agents.toml"
+            path.write_text(configured)
+            self.assertEqual(load(path, {"AGENTS_MODEL": ""}).cao.models[0].id, "mock/model")
+
+    def test_rejects_ambiguous_or_invalid_model_choices(self) -> None:
+        invalid_sections = (
+            "model='openai/gpt-5'\nmodels=[{id='openai/gpt-5'}]",
+            "models=[]",
+            "models=[{id='openai/gpt-5'},{id='openai/gpt-5'}]",
+            "models=[{id='bad model'}]",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "agents.toml"
+            for section in invalid_sections:
+                with self.subTest(section=section), self.assertRaises(ConfigError):
+                    path.write_text(CONFIG.replace("api_port=9889", f"api_port=9889\n{section}"))
+                    load(path, {})
+
+    def test_rejects_reasoning_without_opencode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "agents.toml"
+            path.write_text(
+                CONFIG.replace("api_port=9889", "api_port=9889\nmodel='mock/model'\nreasoning_effort='high'")
+            )
+            with self.assertRaisesRegex(ConfigError, "only by the opencode provider"):
+                load(path, {})
+
     def test_rejects_codex_provider(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "agents.toml"

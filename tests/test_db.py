@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agents.config import AgentsConfig, CaoConfig, ProjectConfig, RuntimeConfig, WebConfig
+from agents.config import AgentsConfig, CaoConfig, ModelChoice, ProjectConfig, RuntimeConfig, WebConfig
 from agents.db import (
     MigrationError,
     MutationConflict,
@@ -34,7 +34,7 @@ class DatabaseTests(unittest.TestCase):
             self.root,
             ProjectConfig("test", self.root / "repo", "main", (("task", "check"),)),
             RuntimeConfig(5, 1800, 12, 4, 3, 86400),
-            CaoConfig("2.4.1", "mock", "mock_cli", 9889, ""),
+            CaoConfig("2.4.1", "mock", "mock_cli", 9889, (ModelChoice(""),)),
             WebConfig("127.0.0.1", 9890),
             (
                 {"slug": "human", "kind": "human", "persistent": True, "capacity": 1},
@@ -92,7 +92,12 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.connection.execute("PRAGMA foreign_keys").fetchone()[0], 1)
         self.assertEqual(self.connection.execute("PRAGMA journal_mode").fetchone()[0], "wal")
         self.assertEqual(self.connection.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
-        self.assertEqual(self.connection.execute("SELECT version FROM schema_migrations").fetchone()[0], 1)
+        self.assertEqual(
+            [row[0] for row in self.connection.execute("SELECT version FROM schema_migrations ORDER BY version")],
+            [1, 2],
+        )
+        terminal_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(terminal_runs)")}
+        self.assertIn("reasoning_effort", terminal_columns)
 
     def test_project_identity_is_immutable(self) -> None:
         first = initialize_project(self.connection, self.config)

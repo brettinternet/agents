@@ -9,7 +9,7 @@ from typing import IO, cast
 from unittest.mock import patch
 
 from agents.cao_client import CaoNotFound
-from agents.config import AgentsConfig, CaoConfig, ProjectConfig, RuntimeConfig, WebConfig
+from agents.config import AgentsConfig, CaoConfig, ModelChoice, ProjectConfig, RuntimeConfig, WebConfig
 from agents.db import connect, migrate, utc_now
 from agents.service import ServiceError, _owned, _record, acquire_daemon_lock, shutdown, start
 
@@ -41,7 +41,7 @@ class ServiceTests(unittest.TestCase):
                 root=root,
                 project=ProjectConfig("test", root, "main", (("task", "check"),)),
                 runtime=RuntimeConfig(5, 1800, 12, 4, 3, 86400),
-                cao=CaoConfig("2.4.1", "mock", "mock_cli", 9889, ""),
+                cao=CaoConfig("2.4.1", "mock", "mock_cli", 9889, (ModelChoice(""),)),
                 web=WebConfig("127.0.0.1", 9890),
                 actors=(),
             )
@@ -161,7 +161,7 @@ class ServiceTests(unittest.TestCase):
                 root=root,
                 project=ProjectConfig("test", root, "main", (("task", "check"),)),
                 runtime=RuntimeConfig(5, 1800, 12, 4, 3, 86400),
-                cao=CaoConfig("2.4.1", "mock", "mock_cli", 9889, ""),
+                cao=CaoConfig("2.4.1", "mock", "mock_cli", 9889, (ModelChoice(""),)),
                 web=WebConfig("127.0.0.1", 9890),
                 actors=(),
             )

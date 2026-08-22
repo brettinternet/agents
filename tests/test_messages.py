@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agents.config import AgentsConfig, CaoConfig, ProjectConfig, RuntimeConfig, WebConfig
+from agents.config import AgentsConfig, CaoConfig, ModelChoice, ProjectConfig, RuntimeConfig, WebConfig
 from agents.db import MutationConflict, connect, migrate, utc_now
 from agents.messages import Messages, Messaging
 from agents.policy import DomainError
@@ -61,7 +61,7 @@ class MessageTests(unittest.TestCase):
                 max_consultations=3,
                 worker_grace_seconds=86400,
             ),
-            CaoConfig("2.4.1", "mock", "mock_cli", 9889, ""),
+            CaoConfig("2.4.1", "mock", "mock_cli", 9889, (ModelChoice(""),)),
             WebConfig("127.0.0.1", 9890),
             actors,
         )

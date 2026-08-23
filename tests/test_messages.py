@@ -111,7 +111,7 @@ class MessageTests(unittest.TestCase):
 
     def test_seeded_members_and_notification_policy(self):
         expected = {
-            "#all-hands": (
+            "#general": (
                 {"human", "system", "elder", "explorer", "yapper"},
                 {"elder", "explorer", "yapper"},
             ),
@@ -173,8 +173,8 @@ class MessageTests(unittest.TestCase):
             {"elder", "yapper"},
         )
 
-    def test_all_hands_broadcasts_to_agents_and_ack_is_actor_scoped(self):
-        posted = self.messaging.post("mention-1", "human", "#all-hands", "@explorer inspect")
+    def test_general_broadcasts_to_agents_and_ack_is_actor_scoped(self):
+        posted = self.messaging.post("mention-1", "human", "#general", "@explorer inspect")
         self.assertEqual(posted["deliveries"], 3)
         terminal_run_id = self._terminal_run("persistent", "explorer", "explorer-persistent")
         inbox = Messages(self.connection).inbox("explorer", terminal_run_id, True)

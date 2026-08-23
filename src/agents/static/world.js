@@ -235,11 +235,27 @@
       return { x: rect.x + rect.w * 0.02, y: rect.y + rect.h * 0.5 };
     }
 
+    function isAtHome(agent) {
+      const actor = agent.actor;
+      return (
+        !actor ||
+        !actor.terminal_run_id ||
+        !["work", "review", "consultation"].includes(actor.terminal_purpose_kind)
+      );
+    }
+
     function homePosition(agent) {
       const rect = regionRects().home;
+      const residents = [...entities.agents.values()]
+        .filter(isAtHome)
+        .sort((a, b) => a.slug.localeCompare(b.slug));
+      const index = Math.max(
+        0,
+        residents.findIndex((resident) => resident.slug === agent.slug),
+      );
       return {
-        x: rect.x + agent.appearance.anchor.fx * rect.w,
-        y: rect.y + agent.appearance.anchor.fy * rect.h,
+        x: rect.x + (rect.w * (index + 1)) / (residents.length + 1),
+        y: rect.y + rect.h * 0.5,
       };
     }
 

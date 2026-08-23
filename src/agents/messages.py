@@ -9,7 +9,7 @@ from .db import canonical_json, mutation, utc_now
 from .policy import DomainError, validate_page, validate_text
 
 MENTION = re.compile(r"(?<![A-Za-z0-9_.-])@([a-z0-9-]+)")
-CHANNELS = ("#all-hands", "#findings", "#publishing", "#coordination", "#incidents")
+CHANNELS = ("#general", "#findings", "#publishing", "#coordination", "#incidents")
 WORK_MEMBERS = ("human", "elder", "explorer", "yapper")
 
 
@@ -22,14 +22,14 @@ def seed_conversations(connection: sqlite3.Connection) -> None:
         )
     actors = {str(row[0]) for row in connection.execute("SELECT slug FROM actors")}
     channel_members = {
-        "#all-hands": {"human", "system", "elder", "explorer", "yapper"},
+        "#general": {"human", "system", "elder", "explorer", "yapper"},
         "#findings": {"human", "system", "elder", "explorer"},
         "#publishing": {"human", "system", "elder", "yapper"},
         "#coordination": {"human", "system", "elder"},
         "#incidents": {"human", "system", "elder"},
     }
     channel_notifications = {
-        "#all-hands": {"elder", "explorer", "yapper"},
+        "#general": {"elder", "explorer", "yapper"},
         "#findings": {"elder", "explorer"},
         "#publishing": {"elder", "yapper"},
         "#coordination": {"elder"},
@@ -288,7 +288,7 @@ class Messages:
         return int(rows[0]["id"])
 
     def _recipients(self, cid: int, address: str, sender: str, body: str) -> set[str]:
-        if address == "#all-hands":
+        if address == "#general":
             mentioned = set(MENTION.findall(body))
             if mentioned:
                 marks = ",".join("?" for _ in mentioned)

@@ -96,7 +96,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.connection.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
         self.assertEqual(
             [row[0] for row in self.connection.execute("SELECT version FROM schema_migrations ORDER BY version")],
-            [1, 2, 3],
+            [1, 2, 3, 4],
         )
         terminal_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(terminal_runs)")}
         self.assertIn("reasoning_effort", terminal_columns)
@@ -116,25 +116,37 @@ class DatabaseTests(unittest.TestCase):
         with self.assertRaises(ProjectIdentityError):
             initialize_project(self.connection, changed)
 
-    def test_schedule_migration_upgrades_existing_database(self) -> None:
+    def test_migrations_upgrade_existing_database_and_preserve_general_history(self) -> None:
         migrations = self.root / "upgrade-migrations"
         migrations.mkdir()
         source = Path(__file__).parents[1] / "src/agents/migrations"
-        shutil.copy(source / "001_initial.sql", migrations / "001_initial.sql")
-        shutil.copy(source / "002_terminal_reasoning.sql", migrations / "002_terminal_reasoning.sql")
+        for name in ("001_initial.sql", "002_terminal_reasoning.sql", "003_schedules.sql"):
+            shutil.copy(source / name, migrations / name)
         other = connect(self.root / "upgrade.db")
         migrate(other, migrations)
-        self.assertEqual(
-            [row[0] for row in other.execute("SELECT version FROM schema_migrations ORDER BY version")],
-            [1, 2],
+        now = utc_now()
+        conversation_id = other.execute(
+            "INSERT INTO conversations(address,kind,created_at,updated_at) VALUES('#all-hands','channel',?,?)",
+            (now, now),
+        ).lastrowid
+        self.assertIsNotNone(conversation_id)
+        other.execute(
+            "INSERT INTO actors(slug,kind,persistent,capacity,created_at,updated_at) VALUES('human','human',1,1,?,?)",
+            (now, now),
         )
-        shutil.copy(source / "003_schedules.sql", migrations / "003_schedules.sql")
+        other.execute(
+            "INSERT INTO messages(conversation_id,sender_slug,body,urgency,created_at) VALUES(?, 'human', 'history', 'normal', ?)",
+            (conversation_id, now),
+        )
+        shutil.copy(source / "004_general_channel.sql", migrations / "004_general_channel.sql")
         migrate(other, migrations)
-        tables = {row[0] for row in other.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        self.assertTrue({"schedule_states", "schedule_runs"} <= tables)
+        upgraded = other.execute(
+            "SELECT c.address,m.body FROM conversations c JOIN messages m ON m.conversation_id=c.id"
+        ).fetchone()
+        self.assertEqual(tuple(upgraded), ("#general", "history"))
         self.assertEqual(
             [row[0] for row in other.execute("SELECT version FROM schema_migrations ORDER BY version")],
-            [1, 2, 3],
+            [1, 2, 3, 4],
         )
         other.close()
 
@@ -142,7 +154,7 @@ class DatabaseTests(unittest.TestCase):
         migrations = self.root / "migrations"
         migrations.mkdir()
         source = Path(__file__).parents[1] / "src/agents/migrations"
-        for name in ("001_initial.sql", "002_terminal_reasoning.sql", "003_schedules.sql"):
+        for name in ("001_initial.sql", "002_terminal_reasoning.sql", "003_schedules.sql", "004_general_channel.sql"):
             shutil.copy(source / name, migrations / name)
         other = connect(self.root / "other.db")
         migrate(other, migrations)

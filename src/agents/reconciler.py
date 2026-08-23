@@ -704,6 +704,41 @@ class Reconciler:
         async with self._profile_lock:
             await self._delete_session_locked(name)
 
+    async def _replace_stale_session(self, run: sqlite3.Row) -> bool:
+        try:
+            await self._delete_session(str(run["session_name"]))
+        except CaoUnavailable:
+            return False
+        now = utc_now()
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            fence = self.connection.execute(
+                "SELECT tr.state terminal_state,la.state launch_state,tr.token_revoked_at "
+                "FROM terminal_runs tr JOIN launch_attempts la ON la.terminal_run_id=tr.id WHERE tr.id=?",
+                (run["id"],),
+            ).fetchone()
+            if (
+                fence is None
+                or fence["terminal_state"] != "creating"
+                or fence["launch_state"] not in {"posting", "uncertain"}
+                or fence["token_revoked_at"] is not None
+            ):
+                self.connection.rollback()
+                return True
+            self.connection.execute(
+                "UPDATE terminal_runs SET state='reserved',terminal_id=NULL,error=NULL,updated_at=? WHERE id=?",
+                (now, run["id"]),
+            )
+            self.connection.execute(
+                "UPDATE launch_attempts SET state='reserved',counted=0,error=NULL,updated_at=? WHERE terminal_run_id=?",
+                (now, run["id"]),
+            )
+            self.connection.commit()
+            return True
+        except BaseException:
+            self.connection.rollback()
+            raise
+
     def _abort_prepost(self, run_id: int, reason: str) -> None:
         run = self.connection.execute("SELECT * FROM terminal_runs WHERE id=?", (run_id,)).fetchone()
         if run is None:
@@ -932,6 +967,8 @@ class Reconciler:
             expected_directory = Path(str(run["working_directory"])).resolve()
             actual_directory = Path(directory).resolve()
             if actual_directory != expected_directory:
+                if await self._replace_stale_session(run):
+                    return
                 await self._fail_uncertain(
                     run,
                     f"CAO terminal working directory mismatch: expected {expected_directory}, got {actual_directory}",

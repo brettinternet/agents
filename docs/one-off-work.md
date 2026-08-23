@@ -72,7 +72,7 @@ approval and integration.
 Select a channel in the dashboard and use its message composer when the message
 belongs to an ongoing conversation:
 
-- `#all-hands` — broad instruction; wakes every notified role.
+- `#general` — broad instruction; wakes every notified role.
 - `#findings` — research findings and discussion.
 - `#publishing` — publishing discussion.
 - `#coordination` — elder coordination.

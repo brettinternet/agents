@@ -81,10 +81,10 @@ class McpBoundaryTests(unittest.TestCase):
             ),
             patch("httpx.request", return_value=response) as request,
         ):
-            mcp_server.conversation_history("#all-hands", before_id=4, limit=10)
+            mcp_server.conversation_history("#general", before_id=4, limit=10)
             mcp_server.backlog_list(after_id="AGENT-0004", limit=10)
             urls = [call.args[1] for call in request.call_args_list]
-            self.assertIn("address=%23all-hands", urls[0])
+            self.assertIn("address=%23general", urls[0])
             self.assertIn("before_id=4", urls[0])
             self.assertIn("after_id=AGENT-0004", urls[1])
 

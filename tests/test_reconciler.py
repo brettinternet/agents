@@ -367,6 +367,27 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+    async def test_wrong_directory_collision_is_deleted_and_retried_without_error(self):
+        run = self.reserve()
+        wrong = str(self.root / "previous-project")
+        expected = str(self.config.project.path)
+        with (
+            patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "xdg")}),
+            patch.object(self.fake, "get_working_directory", side_effect=[wrong, wrong, expected]),
+        ):
+            await self.reconciler._launch(run["id"])
+            reset = self.connection.execute(
+                "SELECT state,terminal_id,error FROM terminal_runs WHERE id=?", (run["id"],)
+            ).fetchone()
+            self.assertEqual(tuple(reset), ("reserved", None, None))
+            self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM blockers").fetchone()[0], 0)
+            self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM incidents").fetchone()[0], 0)
+            await self.reconciler._launch(run["id"])
+        saved = self.connection.execute(
+            "SELECT state,terminal_id,error FROM terminal_runs WHERE id=?", (run["id"],)
+        ).fetchone()
+        self.assertEqual(tuple(saved), ("live", "terminal-1", None))
+
     async def test_actor_model_choice_is_selected_once_persisted_and_sent_to_cao(self):
         selected = ModelChoice("mock/actor-second")
         actor_models = (ModelChoice("mock/actor-first"), selected)

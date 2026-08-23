@@ -26,7 +26,7 @@ _MODEL_ID = re.compile(r"^[A-Za-z0-9._:/-]{1,128}$")
 _EFFORT = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
 _SCHEDULE_SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _SCHEDULE_DURATION = re.compile(r"^([1-9][0-9]*)([mhd])$")
-_SCHEDULE_CHANNELS = frozenset({"#all-hands", "#findings", "#publishing", "#coordination", "#incidents"})
+_SCHEDULE_CHANNELS = frozenset({"#general", "#findings", "#publishing", "#coordination", "#incidents"})
 
 
 class ConfigError(ValueError):

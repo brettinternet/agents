@@ -173,6 +173,13 @@ class ServiceTests(unittest.TestCase):
                         _owned(pidfile)
                     inspect.assert_not_called()
 
+    def test_owned_reports_non_utf8_record_as_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            pidfile = Path(temporary) / "service.pid"
+            pidfile.write_bytes(b"\xff\xfe")
+            with self.assertRaisesRegex(ServiceError, "invalid service ownership record.*not UTF-8"):
+                _owned(pidfile)
+
     def test_owned_returns_none_when_recorded_process_is_gone(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             pidfile = Path(temporary) / "service.pid"

@@ -146,6 +146,8 @@ def _owned(path: Path) -> tuple[int, dict[str, object]] | None:
         raw_record = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
+    except UnicodeError as exc:
+        raise ServiceError(f"invalid service ownership record {path}: record is not UTF-8") from exc
     except OSError as exc:
         raise ServiceError(f"cannot read service ownership record {path}: {exc}") from exc
     try:

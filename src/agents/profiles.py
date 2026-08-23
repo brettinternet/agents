@@ -423,8 +423,14 @@ _OPENCODE_CATEGORY_MAP: dict[str, tuple[str, ...]] = {
     "fs_*": ("read", "edit", "write", "glob", "grep"),
 }
 _OPENCODE_VOCABULARY = frozenset(tool for values in _OPENCODE_CATEGORY_MAP.values() for tool in values)
-_OPENCODE_HARDCODED_DENY = frozenset({"task", "question", "webfetch", "websearch", "codesearch"})
-_OPENCODE_HARDCODED_ALLOW = frozenset({"todowrite", "skill"})
+# Agent OpenCode processes run as the operator's real host user (no HOME
+# isolation), so they can discover ~/.claude/skills and other global
+# skill directories. "skill" is force-denied for every profile so a
+# playground actor can never load personal/unrelated skills (for example
+# draft-in-editor, user-voice); each actor's behavior is fully specified by
+# its own agents/*.md template instead.
+_OPENCODE_HARDCODED_DENY = frozenset({"task", "question", "webfetch", "websearch", "codesearch", "skill"})
+_OPENCODE_HARDCODED_ALLOW = frozenset({"todowrite"})
 _CLAUDE_CATEGORY_MAP: dict[str, tuple[str, ...]] = {
     "execute_bash": ("Bash", "BashOutput", "KillShell", "Task", "Agent", "Monitor"),
     "fs_read": ("Read",),
@@ -449,7 +455,7 @@ def _resolve_allowed_tools(
 
 def _tools_to_opencode_permission(allowed_tools: Sequence[str]) -> dict[str, str]:
     if "*" in allowed_tools:
-        return {tool: "allow" for tool in _ALL_OPENCODE_TOOLS}
+        return {tool: ("deny" if tool == "skill" else "allow") for tool in _ALL_OPENCODE_TOOLS}
     expanded: list[str] = []
     for entry in allowed_tools:
         if entry == "@builtin":

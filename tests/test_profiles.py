@@ -189,6 +189,7 @@ class ProfileTests(unittest.TestCase):
             self.assertIn('reasoningEffort: "high"', agent_text)
             self.assertIn("permission:", agent_text)
             self.assertIn("  bash: allow", agent_text)
+            self.assertIn("  skill: deny", agent_text)
             self.assertEqual(agent.stat().st_mode & 0o777, 0o600)
             self.assertTrue(all(Path(item["path"]).stat().st_mode & 0o777 == 0o600 for item in launch.artifacts))
             agent_record = next(item for item in launch.artifacts if item["kind"] == "agent")
@@ -196,6 +197,15 @@ class ProfileTests(unittest.TestCase):
             self.assertEqual(
                 provider_lock_path({"XDG_STATE_HOME": str(state / "xdg")}), state / "xdg/agents/provider-config.lock"
             )
+
+    def test_opencode_permission_denies_skill_tool_always(self):
+        restricted = profiles_module._tools_to_opencode_permission(("fs_*", "execute_bash"))
+        self.assertEqual(restricted["skill"], "deny")
+        self.assertEqual(restricted["bash"], "allow")
+        wildcard = profiles_module._tools_to_opencode_permission(("*",))
+        self.assertEqual(wildcard["skill"], "deny")
+        self.assertEqual(wildcard["task"], "allow")
+        self.assertEqual(wildcard["bash"], "allow")
 
     def test_claude_install_uses_manifest_owned_runtime_files_and_filtered_env(self):
         root = Path(__file__).parents[1]
@@ -361,6 +371,11 @@ class ProfileTests(unittest.TestCase):
             self.assertFalse(profile.path.exists())
             self.assertFalse((runtime / f"{profile.name}.prompt").exists())
             self.assertFalse((runtime / f"{profile.name}.mcp.json").exists())
+
+    def test_project_opencode_config_denies_skill_permission(self):
+        root = Path(__file__).parents[1]
+        data = json.loads((root / "opencode.json").read_text())
+        self.assertEqual(data["permission"]["skill"], {"*": "deny"})
 
 
 if __name__ == "__main__":

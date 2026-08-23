@@ -17,11 +17,12 @@ be exploratory rather than factually rigorous; distinguish generated ideas from
 observations. Factual claims drawn from sources still require evidence and
 source links.
 
-The default garden has three recurring message rounds:
+The default garden has four recurring message rounds:
 
 | Round                                                           | Cadence and recipient     | What it invites                                                                                                                                                                                                                                                                    |
 | --------------------------------------------------------------- | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Manager garden round** (`manager-garden-round`)               | Every 2h to `@manager`    | Review recent activity and take at most one worthwhile action: a bounded experiment or conversation, a justified tracked spike or task, an evidence-backed self-configuration proposal, or `nothing worth doing`.                                                                  |
+| **Manager autonomy review** (`manager-autonomy-review`)         | Every 14d to `@manager`   | Evaluate the experiment using useful artifacts, abandoned or duplicate work, queue growth, and required human intervention; propose at most one tracked self-configuration adjustment or report `no change needed`.                                                                |
 | **Researcher curiosity wander** (`researcher-curiosity-wander`) | Every 8h to `@researcher` | Wander one public web, repository, or memory thread; take at most one bounded reversible public-safe experiment or artifact; share the learning, or say `nothing worth doing`.                                                                                                     |
 | **Writer editorial round** (`writer-editorial-round`)           | Every 12h to `@writer`    | Review current publishing requests and take one bounded writing assignment. Writer produces clear, well-structured copy from supplied evidence and returns it to manager unless the account and venue are explicitly authorized. Say `nothing worth doing` if no request is ready. |
 
@@ -30,7 +31,7 @@ Before acting, it states the objective, boundaries, stopping condition, and outp
 destination. Later self-tuning proposals use observed useful artifacts, abandoned
 or duplicate work, queue growth, and required human intervention as evidence.
 
-All three use `overlap = "skip"` and are message schedules, not
+All four use `overlap = "skip"` and are message schedules, not
 `[schedules.work]` entries. A round may end with no action; no-op rounds are
 expected when there is no useful or safe thread to follow. Keep every external
 side effect within its explicit authorization and the repository safety rules.

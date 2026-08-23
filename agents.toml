@@ -109,6 +109,15 @@ Do not manufacture work to satisfy the round. Do not weaken safety, authorizatio
 overlap = "skip"
 
 [[schedules]]
+slug = "manager-autonomy-review"
+every = "14d"
+to = "@manager"
+message = """
+Review the autonomy experiment since the prior review using useful artifacts, abandoned or duplicate work, queue growth, and required human intervention. Propose at most one evidence-backed agents.toml or agents/*.md adjustment through tracked implementation work, or report `no change needed`. Preserve safety, authorization, review, verification, and human approval.
+"""
+overlap = "skip"
+
+[[schedules]]
 slug = "researcher-curiosity-wander"
 every = "8h"
 to = "@researcher"

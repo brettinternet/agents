@@ -137,6 +137,33 @@ class WebAuthTests(unittest.TestCase):
         self.assertEqual(response.headers["x-content-type-options"], "nosniff")
         self.assertEqual(response.headers["referrer-policy"], "same-origin")
 
+    def test_persistent_repository_routes_expose_only_committed_public_files(self):
+        repo = self.config.project.path
+        (repo / "README.md").write_text("public\n")
+        (repo / ".env.local").write_text("TOKEN=private\n")
+        (repo / "linked.md").symlink_to("../host-secret")
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Agent Test"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "agent@example.test"], check=True)
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "fixture"], check=True)
+        (repo / "untracked.md").write_text("not committed\n")
+        context = AgentContext(1, "researcher", "persistent", "researcher", True)
+        headers = {"Authorization": "Bearer test-token", "X-Agents-Execution-ID": "persistent-execution"}
+
+        with patch("agents.web.authenticate_agent", return_value=context):
+            listing = self.client.get("/agent/v1/repository", headers=headers)
+            read = self.client.get("/agent/v1/repository/file", params={"path": "README.md"}, headers=headers)
+            sensitive = self.client.get("/agent/v1/repository/file", params={"path": ".env.local"}, headers=headers)
+            symlink = self.client.get("/agent/v1/repository/file", params={"path": "linked.md"}, headers=headers)
+            untracked = self.client.get("/agent/v1/repository/file", params={"path": "untracked.md"}, headers=headers)
+
+        self.assertEqual(listing.status_code, 200)
+        self.assertEqual(listing.json()["data"], ["README.md"])
+        self.assertEqual(read.json()["data"], {"path": "README.md", "text": "public\n"})
+        self.assertEqual(sensitive.status_code, 403)
+        self.assertEqual(symlink.status_code, 403)
+        self.assertEqual(untracked.status_code, 403)
+
     def test_json_errors_and_idempotency_are_stable(self):
         self.client.post("/auth/login", data={"token": "w" * 64}, headers={"Origin": "http://testserver"})
         csrf = self.client.cookies.get("agents_csrf")

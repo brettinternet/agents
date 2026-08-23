@@ -34,6 +34,7 @@ from .delivery import Delivery
 from .messages import Messages, Messaging
 from .policy import DomainError, validate_request_id, validate_text
 from .reconciler import Reconciler
+from .repository_access import RepositoryAccessError, list_repository, read_repository
 from .service import acquire_daemon_lock
 from .store import Store
 from .workflow import Workflow
@@ -505,6 +506,20 @@ def create_app(config: AgentsConfig | None = None, connection: sqlite3.Connectio
                 lambda: Messages(request.app.state.connection).history(context.actor_slug, address, before_id, limit)
             )
         )
+
+    @app.get("/agent/v1/repository")
+    async def agent_repository_list(request: Request, _: AgentAuth, path: str = "."):
+        try:
+            return ok(list_repository(request.app.state.config.project.path, path))
+        except RepositoryAccessError as exc:
+            raise HTTPException(403, detail=error("repository_access_denied", str(exc))) from exc
+
+    @app.get("/agent/v1/repository/file")
+    async def agent_repository_read(request: Request, _: AgentAuth, path: str):
+        try:
+            return ok({"path": path, "text": read_repository(request.app.state.config.project.path, path)})
+        except RepositoryAccessError as exc:
+            raise HTTPException(403, detail=error("repository_access_denied", str(exc))) from exc
 
     @app.get("/agent/v1/assignment")
     async def agent_assignment(request: Request, context: AgentAuth):

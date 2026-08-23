@@ -19,6 +19,7 @@ from agents.profiles import (
     merge_owned_json,
     profile_name,
     provider_lock_path,
+    purpose_tools,
     remove_profile,
     validate_templates,
 )
@@ -52,6 +53,21 @@ class ProfileTests(unittest.TestCase):
 
     def test_repository_templates_validate(self):
         validate_templates(Path(__file__).resolve().parents[1])
+
+    def test_persistent_profiles_have_no_generic_filesystem_or_command_tools(self):
+        self.assertEqual(purpose_tools("persistent"), ())
+
+    def test_materialized_profiles_explain_repository_interaction_methods(self):
+        root = Path(__file__).parents[1]
+        with tempfile.TemporaryDirectory() as d:
+            profile = self._materialize(root, Path(d))
+            text = profile.path.read_text()
+        self.assertEqual(profile.allowed_tools, ())
+        self.assertIn("`repository_list` and `repository_read`", text)
+        self.assertIn("not native filesystem tools or browser `file://` URLs", text)
+        self.assertIn("Use Agent MCP backlog tools", text)
+        self.assertIn("durable memory changes", text)
+        self.assertIn("request an execute-capable work item for any secret operation", text)
 
     def test_packaged_templates_fallback_when_editable_templates_are_absent(self):
         repository = Path(__file__).resolve().parents[1]

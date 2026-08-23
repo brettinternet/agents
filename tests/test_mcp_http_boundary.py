@@ -83,10 +83,12 @@ class McpBoundaryTests(unittest.TestCase):
         ):
             mcp_server.conversation_history("#general", before_id=4, limit=10)
             mcp_server.backlog_list(after_id="AGENT-0004", limit=10)
+            mcp_server.repository_list("memory/research notes")
             urls = [call.args[1] for call in request.call_args_list]
             self.assertIn("address=%23general", urls[0])
             self.assertIn("before_id=4", urls[0])
             self.assertIn("after_id=AGENT-0004", urls[1])
+            self.assertIn("path=memory%2Fresearch+notes", urls[2])
 
     def test_rejects_oversized_payload_and_bad_envelope(self):
         with patch.dict(

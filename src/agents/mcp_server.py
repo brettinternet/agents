@@ -327,6 +327,16 @@ def fetch_url(url: str) -> dict[str, str]:
 
 
 @mcp.tool
+def repository_list(path: str = ".") -> list[str]:
+    return _request("GET", "/repository?" + urlencode({"path": path}))
+
+
+@mcp.tool
+def repository_read(path: str) -> dict[str, str]:
+    return _request("GET", "/repository/file?" + urlencode({"path": path}))
+
+
+@mcp.tool
 def backlog_list(status: str | None = None, limit: int = 50, after_id: str | None = None) -> Any:
     params: dict[str, Any] = {"limit": limit}
     if status:

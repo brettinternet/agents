@@ -581,6 +581,7 @@ $("dm-form").addEventListener("submit", async (event) => {
       body: { to: `@${actor}`, body },
       intent: true,
     });
+    state.messagesStickToBottom = true;
     form.reset();
     $("dm-dialog").close();
     notify("Direct message sent");

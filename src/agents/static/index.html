@@ -89,17 +89,21 @@
             </div>
             <form id="compose" class="compose">
               <p class="form-error" role="alert" hidden></p>
-              <label for="message-body">Message</label>
-              <textarea id="message-body" required maxlength="16384"></textarea>
-              <div class="form-row">
-                <label
-                  >Urgency
-                  <select id="message-urgency">
+              <label class="sr-only" for="message-body">Message</label>
+              <div class="compose-box">
+                <textarea id="message-body" required maxlength="16384"></textarea>
+                <div class="compose-controls">
+                  <label class="sr-only" for="message-urgency">Urgency</label>
+                  <select id="message-urgency" aria-label="Message urgency">
                     <option value="normal">Normal</option>
                     <option value="urgent">Urgent</option>
                   </select>
-                </label>
-                <button class="primary" type="submit">Send</button>
+                  <button class="compose-send" type="submit" aria-label="Send message">
+                    <svg aria-hidden="true" viewBox="0 0 20 20">
+                      <path d="M10 15V5m0 0L6 9m4-4 4 4" />
+                    </svg>
+                  </button>
+                </div>
               </div>
             </form>
           </section>

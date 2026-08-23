@@ -192,14 +192,66 @@ main > header {
 .compose {
   margin-top: 0.5rem;
 }
-.form-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: end;
-  gap: 0.4rem;
+.compose-box {
+  border: 1px solid var(--line);
+  border-radius: 1rem;
+  background: white;
+  box-shadow: 0 2px 8px #17203312;
+  overflow: hidden;
 }
-.form-row label {
-  margin: 0;
+.compose-box:focus-within {
+  border-color: #68a7ea;
+  box-shadow: 0 0 0 2px #68a7ea42;
+}
+.compose-box #message-body {
+  min-height: 4.5rem;
+  border: 0;
+  border-radius: 0;
+  padding: 0.75rem 0.85rem 0.35rem;
+  resize: none;
+}
+.compose-box #message-body:focus-visible,
+.compose-box #message-urgency:focus-visible,
+.compose-box .compose-send:focus-visible {
+  outline-width: 2px;
+  outline-offset: 0;
+}
+.compose-controls {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.45rem 0.45rem;
+}
+.compose-box #message-urgency {
+  width: auto;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.compose-send {
+  display: grid;
+  width: 2.25rem;
+  height: 2.25rem;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  padding: 0;
+  background: var(--ink);
+  color: white;
+}
+.compose-send:hover {
+  background: var(--accent);
+}
+.compose-send svg {
+  width: 1.2rem;
+  height: 1.2rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
 }
 .board {
   display: grid;

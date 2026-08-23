@@ -815,6 +815,12 @@ $("answer-form").addEventListener("submit", async (event) => {
     notify(error.message, true);
   }
 });
+$("message-body").addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
+  event.preventDefault();
+  $("compose").requestSubmit();
+});
+
 $("compose").addEventListener("submit", async (event) => {
   event.preventDefault();
   if (!state.conversation) return;
@@ -822,7 +828,11 @@ $("compose").addEventListener("submit", async (event) => {
   try {
     await api("/api/v1/messages", {
       method: "POST",
-      body: { to: state.conversation.address, body },
+      body: {
+        to: state.conversation.address,
+        body,
+        urgency: $("message-urgency").value,
+      },
       intent: true,
     });
     $("message-body").value = "";

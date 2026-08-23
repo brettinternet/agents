@@ -1,8 +1,8 @@
 "use strict";
 
-// The Internet Garden: a read-only, deterministic projection of the control
-// plane. The snapshot is authoritative; events drive only bounded transient
-// effects. No workflow state is read from or written by this canvas.
+// Deterministic, read-only projection of the control plane. The snapshot is
+// authoritative; events drive only bounded transient effects. No workflow
+// state is read from or written by this canvas.
 (function () {
   function fnv1a(str) {
     let h = 0x811c9dc5;
@@ -46,7 +46,7 @@
   const REGIONS = [
     {
       key: "dock",
-      label: "Signal dock",
+      label: "Intake",
       x: 0.015,
       y: 0.1,
       w: 0.2,
@@ -56,7 +56,7 @@
     },
     {
       key: "workshop",
-      label: "Workshop",
+      label: "In progress",
       x: 0.235,
       y: 0.1,
       w: 0.2,
@@ -66,7 +66,7 @@
     },
     {
       key: "verification",
-      label: "Verification tower",
+      label: "Verification",
       x: 0.455,
       y: 0.1,
       w: 0.2,
@@ -76,7 +76,7 @@
     },
     {
       key: "archive",
-      label: "Archive garden",
+      label: "Completed",
       x: 0.675,
       y: 0.1,
       w: 0.31,
@@ -86,7 +86,7 @@
     },
     {
       key: "distress",
-      label: "Distress clearing",
+      label: "Blocked",
       x: 0.015,
       y: 0.66,
       w: 0.97,
@@ -96,7 +96,7 @@
     },
     {
       key: "home",
-      label: "Home stations",
+      label: "Idle",
       x: 0.015,
       y: 0.86,
       w: 0.97,

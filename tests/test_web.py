@@ -360,7 +360,7 @@ class WebAuthTests(unittest.TestCase):
         self.assertIn('type="password"', page.text)
         self.assertIn('id="thread-dialog"', page.text)
         self.assertIn('id="open-thread"', page.text)
-        self.assertIn("Internet exploration", page.text)
+        self.assertIn("<h1>Agents</h1>", page.text)
         self.assertIn('option value="research">Research</option>', page.text)
         self.assertIn('option value="publishing">Publishing</option>', page.text)
         self.assertIn('name="review_gate" value="publishing"', page.text)

@@ -542,8 +542,12 @@ def main(argv: list[str] | None = None) -> None:
             client.close()
         errors = []
     elif args.command == "shutdown":
-        service.shutdown(config)
-        errors = []
+        try:
+            service.shutdown(config)
+        except service.ServiceError as exc:
+            errors = [str(exc)]
+        else:
+            errors = []
     elif args.command == "smoke":
         errors = doctor(config, online=True)
     elif args.command == "dev-mock":

@@ -1,19 +1,24 @@
 from __future__ import annotations
 
+import errno
 import json
 import signal
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from agents.config import AgentsConfig, ExecutionConfig, ModelChoice, ProjectConfig, RuntimeConfig, WebConfig
 from agents.service import (
     ServiceError,
+    _acquire_daemon_lock_after_stop,
     _close_mapped_workspaces,
     _owned,
     _record,
+    _stop_named,
     acquire_daemon_lock,
     shutdown,
     start,
@@ -170,6 +175,72 @@ class ServiceTests(unittest.TestCase):
                 self.assertEqual((state / "agentsd.lock").stat().st_mode & 0o777, 0o600)
             finally:
                 first.close()
+
+    def test_acquire_daemon_lock_error_names_path_and_errno(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            first = acquire_daemon_lock(state)
+            try:
+                with self.assertRaisesRegex(
+                    ServiceError, r"agentsd\.lock is already locked by another process \(errno \d+"
+                ):
+                    acquire_daemon_lock(state)
+            finally:
+                first.close()
+
+    def test_acquire_daemon_lock_after_stop_retries_transient_contention(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            blocker = acquire_daemon_lock(state)
+
+            def release_soon() -> None:
+                time.sleep(0.2)
+                blocker.close()
+
+            releaser = threading.Thread(target=release_soon)
+            releaser.start()
+            try:
+                handle = _acquire_daemon_lock_after_stop(state, timeout=2.0, interval=0.05)
+                handle.close()
+            finally:
+                releaser.join()
+
+    def test_acquire_daemon_lock_after_stop_gives_up_after_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            holder = acquire_daemon_lock(state)
+            try:
+                with self.assertRaises(ServiceError):
+                    _acquire_daemon_lock_after_stop(state, timeout=0.2, interval=0.05)
+            finally:
+                holder.close()
+
+    def test_acquire_daemon_lock_after_stop_does_not_retry_non_lock_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            with (
+                patch("agents.service.fcntl.flock", side_effect=OSError(errno.EACCES, "Permission denied")),
+                patch("agents.service.time.sleep") as sleep,
+                self.assertRaisesRegex(ServiceError, "Permission denied"),
+            ):
+                _acquire_daemon_lock_after_stop(state, timeout=2.0, interval=0.05)
+            sleep.assert_not_called()
+
+    def test_stop_raises_when_process_survives_sigterm_and_sigkill(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = _config(Path(temporary))
+            config.state_dir.mkdir(mode=0o700)
+            record = config.state_dir / "agentsd.pid"
+            record.write_text('{"pid": 123, "executable": "/owned", "started": "now"}')
+            with (
+                patch("agents.service._owned", return_value=(123, {})),
+                patch("agents.service.os.killpg") as kill_group,
+                patch("agents.service._wait_for_exit", return_value=False),
+                self.assertRaisesRegex(ServiceError, "did not exit after SIGTERM and SIGKILL"),
+            ):
+                _stop_named(config, "agentsd")
+            self.assertEqual(kill_group.call_args_list, [call(123, signal.SIGTERM), call(123, signal.SIGKILL)])
+            self.assertTrue(record.exists())
 
     def test_owned_rejects_malformed_field_types_before_inspecting_process(self) -> None:
         invalid_records = (

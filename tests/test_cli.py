@@ -9,6 +9,7 @@ from unittest.mock import patch
 from agents.cli import _missing_herdr_methods, main, preflight
 from agents.config import AgentsConfig, ExecutionConfig, ModelChoice, ProjectConfig, RuntimeConfig, WebConfig
 from agents.git_worktree import GitError
+from agents.service import ServiceError
 
 
 def _config(root: Path, provider: str = "opencode", provider_id: str = "opencode_cli") -> AgentsConfig:
@@ -93,6 +94,27 @@ class CliTests(unittest.TestCase):
         for operation in (prepare, check_preflight, install, start_services, run_doctor):
             self.assertEqual(operation.call_count, 2)
             operation.assert_called_with(config)
+
+    def test_shutdown_renders_service_error_as_clean_exit_without_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = _config(Path(temporary))
+            with (
+                patch("agents.cli._config", return_value=config),
+                patch("agents.cli.service.shutdown", side_effect=ServiceError("agentsd.lock is already locked")),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                main(["shutdown"])
+            self.assertEqual(str(raised.exception), "agentsd.lock is already locked")
+
+    def test_shutdown_success_does_not_raise(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = _config(Path(temporary))
+            with (
+                patch("agents.cli._config", return_value=config),
+                patch("agents.cli.service.shutdown") as shutdown,
+            ):
+                main(["shutdown"])
+            shutdown.assert_called_once_with(config)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import fcntl
 import json
 import os
@@ -19,6 +20,18 @@ from .config import AgentsConfig, resolve_execution_session
 
 class ServiceError(RuntimeError):
     pass
+
+
+class DaemonLockHeldError(ServiceError):
+    """Raised when agentsd.lock could not be acquired; carries the OSError errno for callers
+    that need to distinguish transient contention (EAGAIN/EWOULDBLOCK) from other failures."""
+
+    def __init__(self, message: str, *, errno: int | None) -> None:
+        super().__init__(message)
+        self.errno = errno
+
+
+_RETRYABLE_LOCK_ERRNOS = frozenset({errno.EAGAIN, errno.EWOULDBLOCK})
 
 
 _LOCK_HANDLE: IO[str] | None = None
@@ -204,9 +217,32 @@ def acquire_daemon_lock(state_dir: Path) -> IO[str]:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as exc:
         handle.close()
-        raise ServiceError("agentsd lock is already held") from exc
+        if exc.errno in _RETRYABLE_LOCK_ERRNOS:
+            raise DaemonLockHeldError(
+                f"{path} is already locked by another process (errno {exc.errno}: {exc.strerror}); "
+                "stop it first, e.g. `task server:stop`, then retry",
+                errno=exc.errno,
+            ) from exc
+        raise DaemonLockHeldError(
+            f"cannot lock {path} (errno {exc.errno}: {exc.strerror}); "
+            "check filesystem support for file locking and permissions on the .agents state directory",
+            errno=exc.errno,
+        ) from exc
     _LOCK_HANDLE = handle
     return handle
+
+
+def _acquire_daemon_lock_after_stop(state_dir: Path, *, timeout: float = 2.0, interval: float = 0.1) -> IO[str]:
+    """Acquire the daemon lock after stopping its owner, tolerating the brief window
+    between a confirmed process exit and the kernel reclaiming its file descriptors."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return acquire_daemon_lock(state_dir)
+        except DaemonLockHeldError as exc:
+            if exc.errno not in _RETRYABLE_LOCK_ERRNOS or time.monotonic() >= deadline:
+                raise
+            time.sleep(interval)
 
 
 def _herdr_command(config: AgentsConfig, session: str, *arguments: str) -> tuple[list[str], dict[str, str]]:
@@ -325,6 +361,35 @@ def start(config: AgentsConfig) -> None:
     raise ServiceError("services did not become ready within 30 seconds")
 
 
+def _signal_process(pid: int, sig: int) -> bool:
+    """Send sig to pid's process group (or the pid itself). Returns False if it is already gone."""
+    try:
+        os.killpg(pid, sig)
+    except PermissionError:
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            return False
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _wait_for_exit(pid: int, timeout: float) -> bool:
+    """Poll pid for exit up to timeout seconds. Returns True once it is confirmed gone."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except OSError as exc:
+            raise ServiceError(f"cannot inspect process {pid} while waiting for it to exit: {exc}") from exc
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
+
+
 def _stop_named(config: AgentsConfig, name: str, *, remove_record: bool = True) -> Path | None:
     path = config.state_dir / f"{name}.pid"
     if not path.exists() and not path.is_symlink():
@@ -340,22 +405,16 @@ def _stop_named(config: AgentsConfig, name: str, *, remove_record: bool = True) 
         path.unlink(missing_ok=True)
         return path
     pid, _ = owned
-    try:
-        os.killpg(pid, signal.SIGTERM)
-    except PermissionError:
-        os.kill(pid, signal.SIGTERM)
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except OSError:
-            break
-        time.sleep(0.1)
-    else:
-        try:
-            os.killpg(pid, signal.SIGKILL)
-        except PermissionError:
-            os.kill(pid, signal.SIGKILL)
+    if (
+        _signal_process(pid, signal.SIGTERM)
+        and not _wait_for_exit(pid, 10)
+        and _signal_process(pid, signal.SIGKILL)
+        and not _wait_for_exit(pid, 5)
+    ):
+        raise ServiceError(
+            f"{name} (pid {pid}) did not exit after SIGTERM and SIGKILL; "
+            f"the ownership record at {path} was left unchanged; inspect and stop it manually"
+        )
     if remove_record:
         path.unlink(missing_ok=True)
     return path
@@ -534,7 +593,7 @@ def shutdown(config: AgentsConfig, client: Any | None = None) -> None:
             pid_record.unlink(missing_ok=True)
         return
 
-    shutdown_lock = acquire_daemon_lock(config.state_dir)
+    shutdown_lock = _acquire_daemon_lock_after_stop(config.state_dir)
     connection = connect(database)
     herdr_client: Any | None = client
     cleanup_complete = False

@@ -56,6 +56,9 @@ select:focus-visible,
   color: white;
   box-shadow: 0 5px 25px #0003;
 }
+#status:empty {
+  display: none;
+}
 .shell {
   display: grid;
   grid-template-columns: 13rem minmax(32rem, 1fr) minmax(30rem, 34rem);

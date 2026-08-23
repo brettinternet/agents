@@ -379,15 +379,32 @@ async function selectConversation(value, announce = true) {
   const rows = await api(`/api/v1/conversations/${row.id}/messages?limit=50`);
   renderMessages(rows, rows.length === 50, { forceBottom: changed });
 }
+function detailButton(label) {
+  const button = text("button", label, "primary");
+  button.type = "button";
+  button.setAttribute("aria-haspopup", "dialog");
+  button.addEventListener("click", () => $("detail-dialog").showModal());
+  return button;
+}
+function setFullDetail(...nodes) {
+  const heading = nodes.find((node) => node.tagName === "H2");
+  if (heading) heading.id = "detail-dialog-title";
+  $("detail-full").replaceChildren(...nodes);
+}
 async function loadTerminal(id) {
   try {
     const data = await api(`/api/v1/terminals/${id}/output`),
-      section = $("detail");
-    section.replaceChildren(
-      text("h2", `${data.actor_slug} terminal`),
-      text("p", `${data.state} · ${data.status || "unknown"} · ${data.updated_at}`),
-      text("pre", data.output_tail || "No captured output", "evidence"),
+      title = `${data.actor_slug} terminal`,
+      status = `${data.state} · ${data.status || "unknown"} · ${data.updated_at}`,
+      output = data.output_tail || "No captured output";
+    $("detail").replaceChildren(
+      text("p", "Terminal preview", "eyebrow"),
+      text("h2", title),
+      text("p", status, "meta"),
+      text("pre", output, "evidence preview-evidence"),
+      detailButton("Open terminal output"),
     );
+    setFullDetail(text("h2", title), text("p", status), text("pre", output, "evidence"));
   } catch (error) {
     notify(error.message, true);
   }
@@ -396,18 +413,33 @@ async function loadWork(id) {
   try {
     const data = await api(`/api/v1/work/${id}`);
     state.work = data;
-    const section = $("detail");
-    section.replaceChildren(
-      text("h2", `${data.work.id} ${data.work.title}`),
-      text("p", `${data.work.status} · ${data.work.priority} · v${data.work.version}`),
+    const title = `${data.work.id} ${data.work.title}`,
+      status = `${data.work.status} · ${data.work.priority} · v${data.work.version}`,
+      summary = text(
+        "p",
+        `${data.criteria.length} criteria · ${data.dependencies.length} dependencies`,
+        "preview-summary",
+      );
+    $("detail").replaceChildren(
+      text("p", "Task preview", "eyebrow"),
+      text("h2", title),
+      text("p", status, "meta"),
+      text("h3", "Problem"),
+      text("p", data.work.problem, "preview-copy"),
+      text("h3", "Outcome"),
+      text("p", data.work.outcome, "preview-copy"),
+      summary,
+      detailButton("Open full task"),
+    );
+    const criteria = document.createElement("ul");
+    for (const row of data.criteria) criteria.append(text("li", row.body));
+    setFullDetail(
+      text("h2", title),
+      text("p", status),
       text("h3", "Problem"),
       text("p", data.work.problem),
       text("h3", "Outcome"),
       text("p", data.work.outcome),
-    );
-    const criteria = document.createElement("ul");
-    for (const row of data.criteria) criteria.append(text("li", row.body));
-    section.append(
       text("h3", "Acceptance criteria"),
       criteria,
       text("h3", "Dependencies"),
@@ -750,6 +782,20 @@ $("blocker-form").addEventListener("submit", async (event) => {
   } catch (error) {
     notify(error.message, true);
   }
+});
+$("open-thread").addEventListener("click", () => {
+  const thread = $("thread");
+  thread.classList.remove("thread-preview");
+  thread.classList.add("thread-expanded");
+  $("thread-dialog").append(thread);
+  $("thread-dialog").showModal();
+  $("messages").scrollTop = $("messages").scrollHeight;
+});
+$("thread-dialog").addEventListener("close", () => {
+  const thread = $("thread");
+  thread.classList.remove("thread-expanded");
+  thread.classList.add("thread-preview");
+  $("thread-home").append(thread);
 });
 $("answer-form").addEventListener("submit", async (event) => {
   event.preventDefault();

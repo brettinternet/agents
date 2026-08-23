@@ -99,6 +99,21 @@
       </aside>
     </div>
 
+    <dialog id="incident-dialog" class="wide-dialog" aria-labelledby="incident-title">
+      <header class="dialog-header">
+        <p class="eyebrow">Operations queue</p>
+        <h2 id="incident-title">Open incidents</h2>
+      </header>
+      <p>
+        These records are unresolved. Inspect the entity, summary, and details to determine whether
+        they need action.
+      </p>
+      <div id="incident-list" class="incident-list"></div>
+      <div class="actions">
+        <button type="button" data-close>Close</button>
+      </div>
+    </dialog>
+
     <dialog id="intake-dialog">
       <form id="intake-form">
         <header class="dialog-header">

@@ -290,6 +290,7 @@ class WebAuthTests(unittest.TestCase):
         page = self.client.get("/")
         self.assertIn('id="board"', page.text)
         self.assertIn('id="intake-dialog"', page.text)
+        self.assertIn('id="incident-dialog"', page.text)
         self.assertIn("Internet exploration", page.text)
         self.assertIn('option value="research">Research</option>', page.text)
         self.assertIn('option value="publishing">Publishing</option>', page.text)

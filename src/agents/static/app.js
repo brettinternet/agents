@@ -215,10 +215,19 @@ function renderQueues() {
     ["Decisions", state.snapshot.decisions.length, true],
     ["Blockers", state.snapshot.blockers.length, true],
     ["Approvals", state.snapshot.approvals.length, true],
-    ["Incidents", state.snapshot.incidents.length, true],
   ];
   for (const [label, count, alert] of summary)
     container.append(text("span", `${label}: ${count}`, `queue ${alert && count ? "alert" : ""}`));
+  const incidentCount = state.snapshot.incidents.length,
+    incidents = text(
+      "button",
+      `Incidents: ${incidentCount}`,
+      `queue ${incidentCount ? "alert" : ""}`,
+    );
+  incidents.type = "button";
+  incidents.setAttribute("aria-haspopup", "dialog");
+  incidents.addEventListener("click", openIncidents);
+  container.append(incidents);
   for (const row of state.snapshot.decisions) {
     const button = text("button", `Decision ${row.id}: ${row.title}`, "queue alert");
     button.addEventListener("click", () => openDecision(row));
@@ -521,6 +530,41 @@ function openDecision(row) {
     options.append(label);
   }
   $("decision-dialog").showModal();
+}
+function openIncidents() {
+  const rows = [...state.snapshot.incidents].sort((left, right) => right.id - left.id),
+    list = $("incident-list");
+  $("incident-title").textContent = `Open incidents (${rows.length})`;
+  list.replaceChildren();
+  if (!rows.length) {
+    list.append(text("p", "No open incidents.", "empty-state"));
+  }
+  for (const row of rows) {
+    const incident = text("article", "", "incident-detail"),
+      heading = text("h3", `Incident ${row.id} · ${row.kind}`),
+      summary = text("p", row.summary, "callout"),
+      metadata = document.createElement("dl");
+    for (const [label, value] of [
+      ["Severity", row.severity],
+      ["State", row.state],
+      ["Entity", `${row.entity_kind}:${row.entity_id}`],
+      ["Created", row.created_at],
+      ["Updated", row.updated_at],
+    ]) {
+      metadata.append(text("dt", label), text("dd", value));
+    }
+    const details = text("pre", "", "evidence");
+    try {
+      const parsed = JSON.parse(row.details_json || "{}");
+      details.textContent =
+        Object.keys(parsed).length > 0 ? JSON.stringify(parsed, null, 2) : "No additional details.";
+    } catch {
+      details.textContent = row.details_json || "No additional details.";
+    }
+    incident.append(heading, summary, metadata, text("h4", "Details"), details);
+    list.append(incident);
+  }
+  $("incident-dialog").showModal();
 }
 function openBlocker(row) {
   const form = $("blocker-form"),

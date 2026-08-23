@@ -57,7 +57,7 @@ select:focus-visible,
 }
 .shell {
   display: grid;
-  grid-template-columns: 13rem minmax(32rem, 1fr) 26rem;
+  grid-template-columns: 13rem minmax(32rem, 1fr) minmax(30rem, 34rem);
   min-height: 100vh;
 }
 .shell > nav,
@@ -222,6 +222,9 @@ main > header {
   padding: 0;
   text-align: left;
 }
+.card-action {
+  margin-top: 0.65rem;
+}
 .meta {
   color: var(--muted);
   font-size: 0.78rem;
@@ -251,7 +254,7 @@ main > header {
   color: var(--danger);
 }
 .messages {
-  height: clamp(22rem, 44vh, 34rem);
+  height: clamp(28rem, 58vh, 44rem);
   overflow: auto;
   border: 1px solid var(--line);
   border-radius: 0.5rem;
@@ -301,6 +304,46 @@ dialog {
   padding: 1.25rem;
   box-shadow: 0 15px 50px #0005;
   width: min(32rem, calc(100% - 2rem));
+}
+#decision-dialog {
+  width: min(46rem, calc(100% - 2rem));
+}
+.decision-options {
+  display: grid;
+  gap: 0.55rem;
+  margin: 1rem 0;
+  padding: 0;
+  border: 0;
+}
+.decision-options legend {
+  margin-bottom: 0.25rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+.decision-option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 0.65rem;
+  margin: 0;
+  padding: 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+  color: var(--ink);
+  font-size: 0.9rem;
+  line-height: 1.35;
+  cursor: pointer;
+}
+.decision-option:hover {
+  background: var(--accent2);
+}
+.decision-option:has(input:checked) {
+  border-color: var(--accent);
+  background: var(--accent2);
+}
+.decision-option input {
+  width: auto;
+  margin: 0.15rem 0 0;
 }
 dialog::backdrop {
   background: #17203388;
@@ -379,7 +422,7 @@ dialog::backdrop {
     border-left: 0;
     border-top: 1px solid var(--line);
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: minmax(0, 1fr);
     gap: 1rem;
   }
   .board {
@@ -409,7 +452,7 @@ dialog::backdrop {
     padding: 0.75rem;
   }
   .messages {
-    height: 15rem;
+    height: clamp(24rem, 58vh, 36rem);
   }
   #status {
     left: 0.5rem;

@@ -6,6 +6,7 @@ const state = {
   eventId: 0,
   eventSource: null,
   reloadTimer: null,
+  messagesStickToBottom: true,
 };
 let agentWorld = null;
 const $ = (id) => document.getElementById(id);
@@ -164,9 +165,19 @@ function renderConversations() {
     list.append(item);
   }
 }
-function renderMessages(rows = state.snapshot?.messages || [], hasMore = rows.length === 50) {
+function isMessageListAtBottom(list) {
+  return list.scrollHeight - list.scrollTop - list.clientHeight <= 24;
+}
+function renderMessages(
+  rows = state.snapshot?.messages || [],
+  hasMore = rows.length === 50,
+  { forceBottom = false, preserveScroll = false } = {},
+) {
   state.snapshot.messages = rows;
-  const list = $("messages");
+  const list = $("messages"),
+    previousHeight = list.scrollHeight,
+    previousTop = list.scrollTop,
+    shouldStick = forceBottom || state.messagesStickToBottom;
   list.replaceChildren();
   for (const row of [...rows].reverse()) {
     const message = text("article", "", "message"),
@@ -181,6 +192,13 @@ function renderMessages(rows = state.snapshot?.messages || [], hasMore = rows.le
   if (!rows.length) list.append(text("p", "No messages yet.", "empty-state"));
   list.setAttribute("aria-busy", "false");
   $("older").disabled = !hasMore;
+  if (preserveScroll) {
+    list.scrollTop = previousTop + list.scrollHeight - previousHeight;
+  } else if (shouldStick) {
+    list.scrollTop = list.scrollHeight;
+  } else {
+    list.scrollTop = previousTop;
+  }
 }
 const groups = [
   { name: "Prepare", states: ["intake", "refining"] },
@@ -245,7 +263,7 @@ function renderBoard() {
           "blocked",
         ].includes(item.status)
       ) {
-        const action = text("button", "Actions");
+        const action = text("button", "Actions", "card-action");
         action.addEventListener("click", () => openAction(item));
         card.append(action);
       }
@@ -345,10 +363,12 @@ async function selectConversation(value, announce = true) {
     if (announce) notify("That role has no active conversation", true);
     return;
   }
+  const changed = state.conversation?.id !== row.id;
   state.conversation = row;
+  if (changed) state.messagesStickToBottom = true;
   $("thread-title").textContent = row.address;
   const rows = await api(`/api/v1/conversations/${row.id}/messages?limit=50`);
-  renderMessages(rows);
+  renderMessages(rows, rows.length === 50, { forceBottom: changed });
 }
 async function loadTerminal(id) {
   try {
@@ -487,12 +507,18 @@ function openDecision(row) {
   $("decision-title").textContent = row.title;
   $("decision-question").textContent = row.question;
   $("decision-recommendation").textContent = `Recommendation: ${row.recommendation}`;
-  const select = form.elements.resolution;
-  select.replaceChildren();
-  for (const value of JSON.parse(row.options_json)) {
-    const option = text("option", value);
-    option.value = value;
-    select.append(option);
+  const options = $("decision-options");
+  options.querySelectorAll(".decision-option").forEach((option) => option.remove());
+  for (const [index, value] of JSON.parse(row.options_json).entries()) {
+    const label = text("label", "", "decision-option"),
+      input = document.createElement("input");
+    input.type = "radio";
+    input.name = "resolution";
+    input.value = value;
+    input.required = true;
+    input.checked = index === 0;
+    label.append(input, text("span", value));
+    options.append(label);
   }
   $("decision-dialog").showModal();
 }
@@ -674,6 +700,7 @@ $("compose").addEventListener("submit", async (event) => {
       intent: true,
     });
     $("message-body").value = "";
+    state.messagesStickToBottom = true;
     await selectConversation(state.conversation, false);
   } catch (error) {
     notify(error.message, true);
@@ -687,8 +714,15 @@ $("older").addEventListener("click", async () => {
   const rows = await api(
     `/api/v1/conversations/${state.conversation.id}/messages?before_id=${oldest.id}&limit=50`,
   );
-  renderMessages([...current, ...rows], rows.length === 50);
+  renderMessages([...current, ...rows], rows.length === 50, { preserveScroll: true });
 });
+$("messages").addEventListener(
+  "scroll",
+  (event) => {
+    state.messagesStickToBottom = isMessageListAtBottom(event.currentTarget);
+  },
+  { passive: true },
+);
 $("search").addEventListener("input", (event) => {
   clearTimeout(state.searchTimer);
   state.searchTimer = setTimeout(async () => {

@@ -2,6 +2,14 @@
 
 Agents is a local control plane for running a durable, observable team of AI agents who don't really do anything other than browse the web and poke around the internet. They're not very productive, but they're curious.
 
+## Demo
+
+![Agents board showing the live control plane, agent roster, work queues, and task preview](docs/assets/agents-board.webp)
+
+| Durable task details                                                                                                                  | Human decision workflow                                                                                           |
+| ------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| ![Task detail view with acceptance criteria, consultations, submissions, checks, reviews, and blockers](docs/assets/task-detail.webp) | ![Human decision dialog with a recommendation and structured resolution options](docs/assets/human-decision.webp) |
+
 ## Run
 
 Requires [mise](https://mise.jdx.dev/) and Git.

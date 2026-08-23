@@ -69,13 +69,18 @@ matching `.env.sops-age`, then rerun `task init`; initialization never rotates
 the recipient or rewrites ciphertext with a replacement.
 
 To add a value, first declare the same name with `# @sensitive` in
-`.env.schema`, then provide the value only on stdin:
+`.env.schema`. Then run the setter in a private TTY and enter the value at its
+hidden prompt:
 
 ```sh
-printf %s 'value' | task secrets:set -- SERVICE_TOKEN
+task secrets:set -- SERVICE_TOKEN
 ```
 
-Piped input is exact, including any trailing newline. Other operations:
+The Enter key terminates hidden-prompt input and is not part of the value. For
+exact or noninteractive input, start the command with a private non-TTY stdin
+channel and write the value through the transient control plane. Non-TTY input
+is exact, including any trailing newline. Never place the value in shell command
+text, arguments, environment assignments, or files. Other operations:
 
 ```sh
 task secrets:list

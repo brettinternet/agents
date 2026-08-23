@@ -163,10 +163,12 @@ def _owned(path: Path) -> tuple[int, dict[str, object]] | None:
             raise TypeError("executable must be an absolute path")
         if not isinstance(started, str) or not started:
             raise TypeError("started must be a non-empty string")
-    except (TypeError, KeyError, json.JSONDecodeError) as exc:
+    except (TypeError, ValueError, KeyError) as exc:
         raise ServiceError(f"invalid service ownership record {path}: {exc}") from exc
     try:
         os.kill(pid, 0)
+    except OverflowError as exc:
+        raise ServiceError(f"invalid service ownership record {path}: pid is outside the supported range") from exc
     except ProcessLookupError:
         return None
     except OSError as exc:

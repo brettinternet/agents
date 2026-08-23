@@ -173,6 +173,16 @@ class ServiceTests(unittest.TestCase):
                         _owned(pidfile)
                     inspect.assert_not_called()
 
+    def test_owned_reports_out_of_range_pid_as_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            pidfile = Path(temporary) / "service.pid"
+            pidfile.write_text('{"pid": 10000000000, "executable": "/missing", "started": "old"}')
+            with (
+                patch("agents.service.os.kill", side_effect=OverflowError),
+                self.assertRaisesRegex(ServiceError, "invalid service ownership record.*supported range"),
+            ):
+                _owned(pidfile)
+
     def test_owned_reports_non_utf8_record_as_invalid(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             pidfile = Path(temporary) / "service.pid"

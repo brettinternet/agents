@@ -5,7 +5,6 @@ version: "3"
 vars:
   UV_TOOL_DIR: "{{.ROOT_DIR}}/.tools/uv"
   UV_TOOL_BIN_DIR: "{{.ROOT_DIR}}/.tools/bin"
-  CAO_HOME_DIR: "{{.ROOT_DIR}}/.cao"
   AGENTS_STATE_DIR: "{{.ROOT_DIR}}/.agents"
   PYTHON: "{{.ROOT_DIR}}/.venv/bin/python"
   ENV_RUN: mise exec varlock -- varlock run -p .env.schema -p .env.local --
@@ -14,7 +13,6 @@ vars:
 env:
   UV_TOOL_DIR: "{{.UV_TOOL_DIR}}"
   UV_TOOL_BIN_DIR: "{{.UV_TOOL_BIN_DIR}}"
-  CAO_HOME_DIR: "{{.CAO_HOME_DIR}}"
   AGENTS_CONFIG: "{{.ROOT_DIR}}/agents.toml"
 
 tasks:
@@ -27,9 +25,7 @@ tasks:
     cmds:
       - mise install
       - mkdir -p .tools/bin .tools/uv
-      - uv tool install --force --managed-python --python 3.14 cli-agent-orchestrator==2.4.1
       - uv sync --all-groups
-      - task: env:init
       - task: secrets:init
       - task: secrets:check
       - lefthook install
@@ -84,10 +80,10 @@ tasks:
     desc: Check local Agents prerequisites and service ownership
     cmd: "{{.ENV_RUN}} {{.PYTHON}} -m agents.cli doctor"
   server:start:
-    desc: Start CAO and Agents services
+    desc: Start or reuse the local Herdr and Agents services
     cmd: "{{.ENV_RUN}} {{.PYTHON}} -m agents.cli service start"
   server:stop:
-    desc: Stop Agents and CAO services, retaining sessions
+    desc: Stop Agents while retaining the owned Herdr session
     cmd: "{{.ENV_RUN}} {{.PYTHON}} -m agents.cli service stop"
   server:status:
     desc: Show owned service status
@@ -119,11 +115,11 @@ tasks:
     desc: Run the unittest suite
     cmd: '{{.PYTHON}} -m unittest discover -s tests -p "test_*.py"'
   smoke:
-    desc: Run the isolated CAO/tmux mock-provider delivery smoke
-    cmd: "{{.PYTHON}} -m tests.smoke_e2e"
+    desc: Run the isolated direct Herdr mock-provider delivery smoke
+    cmd: "{{.PYTHON}} -m tests.smoke_e2e --backend herdr"
   dev:mock:
     desc: Seed and serve a mock development instance
     cmd: "AGENTS_PROVIDER=mock {{.ENV_RUN}} {{.PYTHON}} -m agents.cli dev-mock"
   shutdown:
-    desc: Revoke/delete mapped sessions and stop both services
+    desc: Revoke/delete mapped workspaces, remove artifacts, and stop Herdr
     cmd: "{{.ENV_RUN}} {{.PYTHON}} -m agents.cli shutdown"

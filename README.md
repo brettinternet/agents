@@ -10,21 +10,22 @@ Requires [mise](https://mise.jdx.dev/) and Git.
 task init
 ```
 
-`task init` installs dependencies, initializes state, and starts the Agents web
-server and CAO service. Open `http://127.0.0.1:9890`. Run `task dashboard` to
-print the login token's path.
+`task init` installs dependencies, initializes state, runs the selected Herdr
+provider integration, and starts the Agents web server plus the owned Herdr
+socket service. Open `http://127.0.0.1:9890`. Run `task dashboard` to print the
+login token's path.
 
 ```sh
-task server:status  # Show service status
-task server:start   # Start (or reuse the already-running) services
-task server:stop    # Stop services, retaining sessions
-task doctor         # Check prerequisites and ownership
+task server:status  # Show agentsd and Herdr ownership
+task server:start   # Start (or reuse) the owned Herdr and Agents services
+task server:stop    # Stop agentsd; retain Herdr panes and processes
+task doctor         # Check prerequisites, socket schema, and ownership
 task check          # Run formatting, lint, and type checks
 task check:staged   # Run the pre-commit checks against staged files
 task fix            # Format and autofix project files
 task test           # Run tests
-task smoke          # Run the isolated delivery smoke test
-task shutdown       # Delete managed sessions and stop services
+task smoke          # Run the isolated direct-Herdr delivery smoke test
+task shutdown       # Fence runs, remove artifacts, close workspaces, and delete the session
 ```
 
 ## Documentation
@@ -33,9 +34,8 @@ task shutdown       # Delete managed sessions and stop services
 
 The tracked `Taskfile.dist.yaml` is Task's default project taskfile; a local
 `Taskfile.yaml` may override it without being committed.
-
-Configure the project, runtime, CAO provider, web server, and agent roster in
-`agents.toml`. Varlock uses two environment files:
+Configure the project, runtime, local Herdr execution backend, web server, and
+agent roster in `agents.toml`. Varlock uses two environment files:
 
 | File          | Git       | Purpose                                       |
 | ------------- | --------- | --------------------------------------------- |
@@ -101,18 +101,18 @@ for schema validation and output redaction.
 
 ## Model selection
 
-Set one model for every new terminal run:
+Set one model for every new execution:
 
 ```toml
-[cao]
+[execution]
 model = "openai/gpt-5"
 effort = "high"
 ```
 
-Or choose a model/effort pair uniformly when each run is reserved:
+Or choose a model/effort pair uniformly when each execution is reserved:
 
 ```toml
-[cao]
+[execution]
 models = [
   { id = "openai/gpt-5", effort = "high" },
   { id = "openai/gpt-5", effort = "medium" },
@@ -139,7 +139,8 @@ models = [
 ]
 ```
 
-Actor choices take precedence over `[cao]`; actors without choices use the global configuration. The selected
-pair is persisted for the run, so retries never re-roll it. `effort` is available only with the OpenCode
-provider. `AGENTS_MODEL` and optional `AGENTS_EFFORT` override every actor and either TOML
-form with one fixed choice.
+Actor choices take precedence over `[execution]`; actors without choices use the
+global configuration. The selected pair is persisted for the execution, so
+retries never re-roll it. `effort` is available only with the OpenCode
+provider. `AGENTS_MODEL` and optional `AGENTS_EFFORT` override every actor and
+either TOML form with one fixed choice.

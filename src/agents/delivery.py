@@ -10,9 +10,17 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .cao_client import CaoClient, CaoNotFound, CaoUnavailable
 from .config import AgentsConfig
 from .db import utc_now
+from .execution import (
+    ExecutionBackend,
+    ExecutionBusy,
+    ExecutionError,
+    ExecutionNotFound,
+    ExecutionTimeout,
+    ExecutionUnavailable,
+    RunHandle,
+)
 from .git_worktree import (
     add_detached,
     branch_sha,
@@ -23,6 +31,7 @@ from .git_worktree import (
     remove_recorded_worktree,
     reserve_execution,
 )
+from .herdr_client import HerdrBackend
 from .policy import CONSULTATION_SPECIALTIES, DomainError, validate_text, validate_title
 from .reconciler import reserve_terminal
 from .store import Store
@@ -85,10 +94,15 @@ async def _terminate_process_group(process: asyncio.subprocess.Process) -> None:
 
 
 class Delivery:
-    def __init__(self, config: AgentsConfig, connection: sqlite3.Connection, client: Any | None = None) -> None:
+    def __init__(
+        self,
+        config: AgentsConfig,
+        connection: sqlite3.Connection,
+        backend: ExecutionBackend | None = None,
+    ) -> None:
         self.config = config
         self.connection = connection
-        self.client = client
+        self.backend = backend or HerdrBackend.from_config(config)
 
     def request_consultation(
         self, actor: str, item_id: str, expected_version: int, specialty: str, question: str
@@ -1042,7 +1056,7 @@ class Delivery:
         return {"state": "delivered", "integration_sha": default}
 
     def _restart_terminal(self, run_id: int, reason: str) -> None:
-        """Fence a stale terminal and prove its named CAO session is gone."""
+        """Fence a stale terminal and prove its mapped backend run is gone."""
         row = self.connection.execute("SELECT * FROM terminal_runs WHERE id=?", (run_id,)).fetchone()
         if row is None:
             return
@@ -1053,36 +1067,33 @@ class Delivery:
             "error=COALESCE(error,?),updated_at=? WHERE id=?",
             (now, reason, now, run_id),
         )
-        if str(row["session_name"]) not in {"", "reserved"}:
-            client = self.client or CaoClient(self.config.cao.api_port)
-            owned_client = self.client is None
+        handle: RunHandle | None = None
+        if row["backend_run_id"] and row["backend_terminal_id"]:
+            handle = RunHandle(
+                str(row["execution_name"]),
+                str(row["backend_run_id"]),
+                str(row["backend_terminal_id"]),
+            )
+        elif str(row["execution_name"]) not in {"", "reserved"}:
             try:
-                try:
-                    client.get_session(str(row["session_name"]))
-                except CaoNotFound:
-                    pass
-                except (CaoUnavailable, AttributeError) as exc:
-                    raise DomainError("cao_unavailable", f"cannot verify old terminal: {exc}") from exc
-                else:
-                    try:
-                        client.delete_session(str(row["session_name"]))
-                    except CaoNotFound:
-                        pass
-                    except (CaoUnavailable, AttributeError) as exc:
-                        raise DomainError("cao_unavailable", f"cannot delete old terminal: {exc}") from exc
-                    try:
-                        client.get_session(str(row["session_name"]))
-                    except CaoNotFound:
-                        pass
-                    except (CaoUnavailable, AttributeError) as exc:
-                        raise DomainError("cao_unavailable", f"cannot confirm old terminal removal: {exc}") from exc
-                    else:
-                        raise DomainError("terminal_cleanup_pending", "old CAO session still exists")
-            finally:
-                if owned_client:
-                    close = getattr(client, "close", None)
-                    if callable(close):
-                        close()
+                snapshot = self.backend.find_run(str(row["execution_name"]))
+            except (ExecutionUnavailable, ExecutionBusy, ExecutionTimeout) as exc:
+                raise DomainError("execution_unavailable", f"cannot verify old terminal: {exc}") from exc
+            except ExecutionError as exc:
+                raise DomainError("execution_cleanup_failed", f"cannot verify old terminal: {exc}") from exc
+            if snapshot is not None:
+                if snapshot.cwd != Path(str(row["working_directory"])).resolve():
+                    raise DomainError("execution_identity_changed", "old backend run cwd changed")
+                handle = snapshot.handle
+        if handle is not None:
+            try:
+                self.backend.delete_run(handle)
+            except ExecutionNotFound:
+                pass
+            except (ExecutionUnavailable, ExecutionBusy, ExecutionTimeout) as exc:
+                raise DomainError("execution_unavailable", f"cannot delete old terminal: {exc}") from exc
+            except ExecutionError as exc:
+                raise DomainError("execution_cleanup_failed", f"cannot delete old terminal: {exc}") from exc
         self.connection.execute(
             "UPDATE launch_attempts SET state='aborted',error=?,updated_at=? "
             "WHERE terminal_run_id=? AND state IN ('reserved','posting','uncertain')",

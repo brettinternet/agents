@@ -74,11 +74,11 @@ def token_digest(token: str) -> str:
 
 
 def authenticate_agent(
-    connection: sqlite3.Connection, terminal_id: str, bearer: str, key: bytes, instance_id: str
+    connection: sqlite3.Connection, agent_auth_id: str, bearer: str, key: bytes, instance_id: str
 ) -> AgentContext:
     row = connection.execute(
-        "SELECT tr.* FROM terminal_runs tr WHERE tr.terminal_id=? AND tr.state IN ('creating','live','retained')",
-        (terminal_id,),
+        "SELECT tr.* FROM terminal_runs tr WHERE tr.agent_auth_id=? AND tr.state IN ('creating','live','retained')",
+        (agent_auth_id,),
     ).fetchone()
     if row is None or row["token_revoked_at"] is not None:
         raise AuthenticationError("unknown or revoked terminal")

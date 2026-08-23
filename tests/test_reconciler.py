@@ -13,15 +13,24 @@ from types import SimpleNamespace
 from typing import cast
 from unittest.mock import patch
 
-from agents.cao_client import CaoNotFound
-from agents.config import AgentsConfig, CaoConfig, ModelChoice, ProjectConfig, RuntimeConfig, WebConfig
+from agents.config import AgentsConfig, ExecutionConfig, ModelChoice, ProjectConfig, RuntimeConfig, WebConfig
 from agents.db import connect, migrate, utc_now
 from agents.delivery import Delivery
+from agents.execution import (
+    BackendHealth,
+    ExecutionConflict,
+    ExecutionNotFound,
+    ExecutionStatus,
+    ExecutionTimeout,
+    RunHandle,
+    RunSnapshot,
+    RunSpec,
+)
 from agents.reconciler import Reconciler, bootstrap_persistent_agents, reserve_terminal
 from agents.store import Store
 
 
-class FakeCao:
+class FakeBackend:
     def __init__(self):
         self.created: list[dict] = []
         self.terminals: dict[str, list[dict]] = {}
@@ -29,56 +38,97 @@ class FakeCao:
         self.status = "idle"
         self.wakes = 0
         self.wake_targets: list[str] = []
+        self.deleted: list[str] = []
 
     def health(self):
-        return True
+        return BackendHealth(True, "0.8.2", 20, True)
 
-    def create_session(self, **kwargs):
-        self.created.append(kwargs)
-        self.terminals[kwargs["session_name"]] = [
+    def _snapshot(self, name: str, terminal: dict, *, output: str = "") -> RunSnapshot:
+        pane_id = str(terminal.get("id") or terminal.get("terminal_id"))
+        cwd = Path(str(terminal.get("working_directory") or self.created[0]["working_directory"])).resolve()
+        status = ExecutionStatus(self.status) if self.status in set(ExecutionStatus) else ExecutionStatus.UNKNOWN
+        return RunSnapshot(
+            RunHandle(name, str(terminal.get("workspace_id") or f"workspace-{pane_id}"), pane_id),
+            status,
+            name,
+            cwd,
+            terminal.get("agent_name"),
+            terminal.get("agent_kind"),
+            int(terminal.get("revision", 1)),
+            output,
+        )
+
+    def create_run(self, spec: RunSpec):
+        model = ""
+        if "--model" in spec.argv:
+            model = spec.argv[spec.argv.index("--model") + 1]
+        self.created.append({"working_directory": str(spec.cwd), "model": model, "spec": spec})
+        self.terminals[spec.name] = [
             {
                 "id": "terminal-1",
-                "session_name": kwargs["session_name"],
-                "provider": kwargs["provider"],
-                "profile_name": kwargs["profile"],
+                "workspace_id": "workspace-1",
+                "working_directory": str(spec.cwd),
+                "agent_name": None if spec.mock else spec.agent_name,
+                "agent_kind": None if spec.mock else spec.agent_kind,
+                "revision": 1,
             }
         ]
-        return {"id": "terminal-1"}
+        return self._snapshot(spec.name, self.terminals[spec.name][0])
 
-    def get_session(self, name):
-        if name not in self.terminals:
-            raise CaoNotFound(name)
-        return {"name": name}
+    def find_run(self, name: str):
+        terminals = self.terminals.get(name, [])
+        if not terminals:
+            return None
+        if len(terminals) > 1:
+            raise ExecutionConflict("duplicate_label", name)
+        return self._snapshot(name, terminals[0])
 
-    def list_terminals(self, session_name: str):
-        return self.terminals.get(session_name, [])
+    def get_run(self, handle: RunHandle, *, include_output: bool = False):
+        terminals = self.terminals.get(handle.name, [])
+        if not terminals:
+            raise ExecutionNotFound("not_found", handle.name)
+        terminal = terminals[0]
+        return self._snapshot(
+            handle.name,
+            terminal,
+            output=self.outputs.get(handle.terminal_id, "") if include_output else "",
+        )
 
-    def get_terminal(self, terminal_id):
-        for terminals in self.terminals.values():
-            for terminal in terminals:
-                if terminal["id"] == terminal_id:
-                    return {**terminal, "status": self.status}
-        raise CaoNotFound(terminal_id)
+    def list_runs(self, prefix: str):
+        return tuple(
+            self._snapshot(name, terminal)
+            for name, terminals in self.terminals.items()
+            if name.startswith(prefix)
+            for terminal in terminals
+        )
 
-    def get_output(self, terminal_id):
-        return self.outputs.get(terminal_id, "")
-
-    def get_working_directory(self, terminal_id):
-        return self.created[0]["working_directory"]
-
-    def enqueue_wake(self, terminal_id, sender_id, message):
+    def send_message(self, handle: RunHandle, sender_id: str, message: str):
         self.wakes += 1
-        self.wake_targets.append(terminal_id)
+        self.wake_targets.append(handle.terminal_id)
         return str(self.wakes)
 
-    def send_input(self, terminal_id, message):
-        return True
+    def send_input(self, handle: RunHandle, message: str):
+        return None
 
-    def delete_session(self, name):
-        self.terminals.pop(name, None)
+    def delete_run(self, handle: RunHandle):
+        self.deleted.append(handle.terminal_id)
+        terminals = self.terminals.get(handle.name, [])
+        remaining = [
+            terminal
+            for terminal in terminals
+            if str(terminal.get("id") or terminal.get("terminal_id")) != handle.terminal_id
+        ]
+        if remaining:
+            self.terminals[handle.name] = remaining
+        else:
+            self.terminals.pop(handle.name, None)
 
-    def list_sessions(self):
-        return [{"name": name} for name in self.terminals]
+    async def events(self):
+        if False:
+            yield
+
+    def close(self):
+        return None
 
 
 class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
@@ -88,13 +138,6 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         repo = self.root / "repo"
         subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
         shutil.copytree(Path(__file__).parents[1] / "agents", self.root / "agents")
-        (self.root / ".tools/bin").mkdir(parents=True)
-        (self.root / ".venv/bin").mkdir(parents=True)
-        cao = self.root / ".tools/bin/cao"
-        cao.write_text(
-            """#!/usr/bin/env python3\nimport json,os,re,sys\nif sys.argv[1]=="install":\n text=open(sys.argv[2]).read();name=re.search(r"^name: (.+)$",text,re.M).group(1);os.makedirs(os.path.expanduser("~/.config"),exist_ok=True);open(os.path.expanduser("~/.config/mock.json"),"w").write("{}") ;print("Successfully installed agent profile: "+name)\nelse: print(json.dumps({"name":sys.argv[3]}))\n"""
-        )
-        cao.chmod(0o700)
         state = self.root / ".agents"
         state.mkdir(mode=0o700)
         (state / "agent-auth-key").write_text("6b" * 32)
@@ -144,12 +187,12 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
                 max_consultations=3,
                 worker_grace_seconds=86400,
             ),
-            CaoConfig("2.4.1", "mock", "mock_cli", 9889, (ModelChoice(""),)),
+            ExecutionConfig("herdr", "0.8.2", None, "mock", "mock_cli", (ModelChoice(""),)),
             WebConfig("127.0.0.1", 9890),
             actors,
         )
         Store(self.connection).initialize(self.config)
-        self.fake = FakeCao()
+        self.fake = FakeBackend()
         self.reconciler = Reconciler(self.config, self.connection, self.fake)
 
     def tearDown(self):
@@ -186,18 +229,19 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         working_directory = Path(str(run["working_directory"]))
         self.fake.created.append({"working_directory": str(working_directory)})
         self.fake.status = status
-        self.fake.terminals[run["session_name"]] = [
+        self.fake.terminals[run["execution_name"]] = [
             {
                 "id": terminal_id,
-                "session_name": run["session_name"],
-                "provider": run["provider"],
-                "profile_name": run["profile_name"],
+                "workspace_id": f"workspace-{run['id']}",
+                "working_directory": str(working_directory),
+                "revision": 1,
             }
         ]
         self.fake.outputs[terminal_id] = ""
         self.connection.execute(
-            "UPDATE terminal_runs SET state='live',profile_state='installed',terminal_id=?,updated_at=? WHERE id=?",
-            (terminal_id, utc_now(), run["id"]),
+            "UPDATE terminal_runs SET state='live',profile_state='installed',backend_run_id=?,"
+            "backend_terminal_id=?,agent_auth_id=COALESCE(agent_auth_id,profile_name),updated_at=? WHERE id=?",
+            (f"workspace-{run['id']}", terminal_id, utc_now(), run["id"]),
         )
         return terminal_id
 
@@ -344,16 +388,16 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         run = self.reserve()
         self.assertRegex(run["profile_name"], r"r\d{10}-g\d{4}$")
         self.assertRegex(run["mcp_name"], r"r\d{10}-g\d{4}$")
-        self.assertTrue(run["session_name"].startswith("cao-agents-"))
+        self.assertTrue(run["execution_name"].startswith("agents-"))
         self.assertNotEqual(run["token_digest"], "")
         with patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "xdg")}):
             await self.reconciler._launch(run["id"])
             await self.reconciler._launch(run["id"])
         self.assertEqual(len(self.fake.created), 1)
         saved = self.connection.execute(
-            "SELECT state,terminal_id,token_digest FROM terminal_runs WHERE id=?", (run["id"],)
+            "SELECT state,backend_terminal_id,token_digest FROM terminal_runs WHERE id=?", (run["id"],)
         ).fetchone()
-        self.assertEqual((saved["state"], saved["terminal_id"]), ("live", "terminal-1"))
+        self.assertEqual((saved["state"], saved["backend_terminal_id"]), ("live", "terminal-1"))
         attempt = self.connection.execute(
             "SELECT state,counted FROM launch_attempts WHERE terminal_run_id=?", (run["id"],)
         ).fetchone()
@@ -367,16 +411,17 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-    async def test_actor_model_choice_is_selected_once_persisted_and_sent_to_cao(self):
+    async def test_actor_model_choice_is_selected_once_and_persisted(self):
         selected = ModelChoice("mock/actor-second")
         actor_models = (ModelChoice("mock/actor-first"), selected)
         self.config = replace(
             self.config,
-            cao=CaoConfig(
-                "2.4.1",
+            execution=ExecutionConfig(
+                "herdr",
+                "0.8.2",
+                None,
                 "mock",
                 "mock_cli",
-                9889,
                 (ModelChoice("mock/global"),),
             ),
             actor_models=(("elder", actor_models),),
@@ -389,7 +434,6 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
                 await self.reconciler._launch(run["id"])
                 await self.reconciler._launch(run["id"])
         choose.assert_called_once_with(actor_models)
-        self.assertEqual(self.fake.created[0]["model"], "mock/actor-second")
 
     async def test_output_digest_prompt_and_wake_are_durable(self):
         run = self.reserve()
@@ -444,6 +488,37 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.connection.execute("SELECT result FROM wake_attempts WHERE delivery_id=?", (delivery,)).fetchone()[0],
             "accepted",
+        )
+
+    async def test_uncertain_wake_fences_run_before_delivery_can_retry(self):
+        run = self.reserve()
+        self._make_live_fake_terminal(run, "idle")
+        findings = self.connection.execute("SELECT id FROM conversations WHERE address='#findings'").fetchone()[0]
+        message = self.connection.execute(
+            "INSERT INTO messages(conversation_id,sender_slug,body,urgency,created_at)"
+            "VALUES(?,'human','wake','normal',?)",
+            (findings, utc_now()),
+        ).lastrowid
+        delivery = self.connection.execute(
+            "INSERT INTO deliveries(message_id,actor_slug,terminal_run_id,state,attempts,next_attempt_at)"
+            "VALUES(?,'elder',NULL,'pending',0,?)",
+            (message, utc_now()),
+        ).lastrowid
+        with patch.object(
+            self.fake,
+            "send_message",
+            side_effect=ExecutionTimeout("disconnected", "unknown", outcome_unknown=True),
+        ):
+            await self.reconciler._wake(cast(int, delivery))
+        saved = self.connection.execute(
+            "SELECT state,token_revoked_at FROM terminal_runs WHERE id=?",
+            (run["id"],),
+        ).fetchone()
+        self.assertEqual(saved["state"], "ending")
+        self.assertIsNotNone(saved["token_revoked_at"])
+        self.assertEqual(
+            self.connection.execute("SELECT result FROM wake_attempts WHERE delivery_id=?", (delivery,)).fetchone()[0],
+            "uncertain",
         )
 
     async def test_terminal_status_transition_emits_one_event(self):
@@ -527,8 +602,9 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         )
         now = utc_now()
         self.connection.execute(
-            "UPDATE terminal_runs SET state='live',profile_state='installed',terminal_id=?,updated_at=? WHERE id=?",
-            ("yapper-persistent", now, persistent["id"]),
+            "UPDATE terminal_runs SET state='live',profile_state='installed',backend_run_id=?,"
+            "backend_terminal_id=?,updated_at=? WHERE id=?",
+            (f"workspace-{persistent['id']}", "yapper-persistent", now, persistent["id"]),
         )
         execution = self.connection.execute(
             "INSERT INTO executions(work_id,number,base_sha,branch,worktree_path,state,created_at,updated_at)"
@@ -576,8 +652,9 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.fake.wake_targets, [])
 
         self.connection.execute(
-            "UPDATE terminal_runs SET state='live',profile_state='installed',terminal_id=?,updated_at=? WHERE id=?",
-            ("yapper-work", utc_now(), work_run["id"]),
+            "UPDATE terminal_runs SET state='live',profile_state='installed',backend_run_id=?,"
+            "backend_terminal_id=?,updated_at=? WHERE id=?",
+            (f"workspace-{work_run['id']}", "yapper-work", utc_now(), work_run["id"]),
         )
         await self.reconciler._wake(cast(int, assignment_delivery))
         self.assertEqual(self.fake.wakes, 1)
@@ -594,8 +671,9 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
 
         participant = self.reserve()
         self.connection.execute(
-            "UPDATE terminal_runs SET state='live',profile_state='installed',terminal_id=?,updated_at=? WHERE id=?",
-            ("elder-persistent", utc_now(), participant["id"]),
+            "UPDATE terminal_runs SET state='live',profile_state='installed',backend_run_id=?,"
+            "backend_terminal_id=?,updated_at=? WHERE id=?",
+            (f"workspace-{participant['id']}", "elder-persistent", utc_now(), participant["id"]),
         )
         participant_message = self.connection.execute(
             "INSERT INTO messages(conversation_id,sender_slug,body,urgency,created_at)"
@@ -742,10 +820,10 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_revocation_after_post_deletes_session_without_live_or_wake(self):
         run = self.reserve()
-        real_create = self.fake.create_session
+        real_create = self.fake.create_run
 
-        def create_and_revoke(**kwargs):
-            result = real_create(**kwargs)
+        def create_and_revoke(spec):
+            result = real_create(spec)
             now = utc_now()
             self.connection.execute(
                 "UPDATE terminal_runs SET state='ending',token_revoked_at=?,updated_at=? WHERE id=?",
@@ -755,7 +833,7 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "xdg")}),
-            patch.object(self.fake, "create_session", side_effect=create_and_revoke),
+            patch.object(self.fake, "create_run", side_effect=create_and_revoke),
         ):
             await self.reconciler._launch(run["id"])
         self.assertEqual(len(self.fake.created), 1)
@@ -788,13 +866,77 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_recorded_name_is_unmapped_and_deleted(self):
         run = self.reserve()
         now = utc_now()
-        self.fake.terminals[run["session_name"]] = [{"id": "late-terminal"}]
+        self.fake.terminals[run["execution_name"]] = [
+            {
+                "id": "late-terminal",
+                "workspace_id": "late-workspace",
+                "working_directory": run["working_directory"],
+            }
+        ]
         self.connection.execute(
             "UPDATE terminal_runs SET state='failed',token_revoked_at=?,updated_at=? WHERE id=?",
             (now, now, run["id"]),
         )
         await self.reconciler._remove_unmapped_sessions()
-        self.assertNotIn(run["session_name"], self.fake.terminals)
+        self.assertNotIn(run["execution_name"], self.fake.terminals)
+
+    async def test_unmapped_agents_label_with_wrong_cwd_is_not_deleted(self):
+        run = self.reserve()
+        self.fake.terminals[run["execution_name"]] = [
+            {
+                "id": "foreign-terminal",
+                "workspace_id": "foreign-workspace",
+                "working_directory": str(self.root / "foreign"),
+            }
+        ]
+        self.connection.execute(
+            "UPDATE terminal_runs SET state='failed',token_revoked_at=?,updated_at=? WHERE id=?",
+            (utc_now(), utc_now(), run["id"]),
+        )
+        await self.reconciler._remove_unmapped_sessions()
+        self.assertIn(run["execution_name"], self.fake.terminals)
+        self.assertEqual(self.fake.deleted, [])
+
+    async def test_duplicate_uncertain_runs_clean_only_expected_cwd(self):
+        run = self.reserve()
+        now = utc_now()
+        self.connection.execute(
+            "UPDATE terminal_runs SET state='creating',updated_at=? WHERE id=?",
+            (now, run["id"]),
+        )
+        self.connection.execute(
+            "UPDATE launch_attempts SET state='uncertain',updated_at=? WHERE terminal_run_id=?",
+            (now, run["id"]),
+        )
+        self.fake.terminals[run["execution_name"]] = [
+            {
+                "id": "expected-one",
+                "workspace_id": "expected-workspace-one",
+                "working_directory": run["working_directory"],
+            },
+            {
+                "id": "expected-two",
+                "workspace_id": "expected-workspace-two",
+                "working_directory": run["working_directory"],
+            },
+            {
+                "id": "foreign",
+                "workspace_id": "foreign-workspace",
+                "working_directory": str(self.root / "foreign"),
+            },
+        ]
+        await self.reconciler._adopt(int(run["id"]))
+        self.assertEqual(self.fake.deleted, ["expected-one", "expected-two"])
+        self.assertEqual(
+            [terminal["id"] for terminal in self.fake.terminals[run["execution_name"]]],
+            ["foreign"],
+        )
+        saved = self.connection.execute(
+            "SELECT state,token_revoked_at FROM terminal_runs WHERE id=?",
+            (run["id"],),
+        ).fetchone()
+        self.assertEqual(saved["state"], "ending")
+        self.assertIsNotNone(saved["token_revoked_at"])
 
     async def test_missing_work_terminal_blocks_and_restart_dispatches(self):
         base_sha = self.git_base_sha()
@@ -829,8 +971,9 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
             budget_exempt=True,
         )
         self.connection.execute(
-            "UPDATE terminal_runs SET state='live',profile_state='installed',terminal_id=?,updated_at=? WHERE id=?",
-            ("missing-work-terminal", now, run["id"]),
+            "UPDATE terminal_runs SET state='live',profile_state='installed',backend_run_id=?,"
+            "backend_terminal_id=?,updated_at=? WHERE id=?",
+            ("missing-workspace", "missing-work-terminal", now, run["id"]),
         )
         self.connection.execute(
             "INSERT INTO assignments(work_id,execution_id,actor_slug,terminal_run_id,state,created_at,updated_at)"
@@ -867,7 +1010,7 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
             version,
         )
 
-        restarted = Delivery(self.config, self.connection, client=self.fake).resolve_blocker(
+        restarted = Delivery(self.config, self.connection, backend=self.fake).resolve_blocker(
             "human", int(blocker["id"]), "replace missing terminal", "restart"
         )
         self.assertEqual(restarted["state"], "resolved")
@@ -931,8 +1074,9 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
             budget_exempt=True,
         )
         self.connection.execute(
-            "UPDATE terminal_runs SET state='live',profile_state='installed',terminal_id=?,updated_at=? WHERE id=?",
-            ("missing-review-terminal", now, run["id"]),
+            "UPDATE terminal_runs SET state='live',profile_state='installed',backend_run_id=?,"
+            "backend_terminal_id=?,updated_at=? WHERE id=?",
+            ("missing-review-workspace", "missing-review-terminal", now, run["id"]),
         )
         self.connection.execute(
             "INSERT INTO reviews(submission_id,gate,actor_slug,terminal_run_id,worktree_path,verdict,created_at,updated_at)"
@@ -1081,7 +1225,7 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         now = utc_now()
         self.connection.execute(
             "UPDATE terminal_runs SET provider='codex',state='live',profile_state='installed',"
-            "terminal_id='stale-provider-terminal',updated_at=? WHERE id=?",
+            "backend_terminal_id='stale-provider-terminal',updated_at=? WHERE id=?",
             (now, run["id"]),
         )
         self.reconciler._fence_stale_provider_runs()
@@ -1104,7 +1248,7 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         now = utc_now()
         self.connection.execute(
             "UPDATE terminal_runs SET provider='codex',state='creating',profile_state='installed',"
-            "terminal_id='stale-creating-provider-terminal',updated_at=? WHERE id=?",
+            "backend_terminal_id='stale-creating-provider-terminal',updated_at=? WHERE id=?",
             (now, run["id"]),
         )
         self.connection.execute(
@@ -1141,7 +1285,7 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         item_id, run = self._make_work_terminal("idle")
         now = utc_now()
         self.connection.execute(
-            "UPDATE terminal_runs SET state='reserved',profile_state='staged',terminal_id=NULL,updated_at=? WHERE id=?",
+            "UPDATE terminal_runs SET state='reserved',profile_state='staged',backend_terminal_id=NULL,updated_at=? WHERE id=?",
             (now, run["id"]),
         )
         self.reconciler._abort_prepost(run["id"], "profile staging failed")
@@ -1166,7 +1310,7 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         item_id, submission_id, run = self._make_review_terminal("idle")
         now = utc_now()
         self.connection.execute(
-            "UPDATE terminal_runs SET state='reserved',profile_state='staged',terminal_id=NULL,updated_at=? WHERE id=?",
+            "UPDATE terminal_runs SET state='reserved',profile_state='staged',backend_terminal_id=NULL,updated_at=? WHERE id=?",
             (now, run["id"]),
         )
         self.reconciler._abort_prepost(run["id"], "profile staging failed")

@@ -3,29 +3,40 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
-import json
 import secrets
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any
 
 from .auth import derive_agent_token, read_private_secret, token_digest
-from .cao_client import CaoClient, CaoNotFound, CaoUnavailable
 from .config import AgentsConfig
 from .db import canonical_json, utc_now
+from .execution import (
+    ExecutionBackend,
+    ExecutionBusy,
+    ExecutionConflict,
+    ExecutionError,
+    ExecutionNotFound,
+    ExecutionStatus,
+    ExecutionTerminated,
+    ExecutionTimeout,
+    ExecutionUnavailable,
+    RunHandle,
+    RunSnapshot,
+    RunSpec,
+)
 from .git_worktree import GitError, head_sha, remove_recorded_worktree
+from .herdr_client import HerdrBackend
 from .profiles import (
     PROVIDER_CAPABILITIES,
     ProfileError,
+    execution_name,
     install_profile,
     materialize_profile,
     mcp_name,
     profile_name,
-    purpose_tools,
     remove_profile,
-    session_name,
-    validate_manifest_artifact,
 )
 
 _RETRY = (1, 5, 30, 120, 300)
@@ -99,12 +110,13 @@ def _reserve_terminal_unchecked(
         ).fetchone()[0]
     )
     now = utc_now()
-    provider = config.cao.provider_id
+    provider = config.execution.provider_id
     model = secrets.choice(config.models_for(actor))
     cursor = connection.execute(
-        "INSERT INTO terminal_runs(session_name,profile_name,mcp_name,profile_sha256,provider,model,reasoning_effort,generation,actor_slug,purpose_kind,purpose_id,working_directory,token_digest,profile_state,state,output_tail,launch_count,created_at,updated_at)VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'reserved','',0,?,?)",
+        "INSERT INTO terminal_runs(execution_name,execution_backend,profile_name,mcp_name,profile_sha256,provider,model,reasoning_effort,generation,actor_slug,purpose_kind,purpose_id,working_directory,token_digest,agent_auth_id,profile_state,state,output_tail,launch_count,created_at,updated_at)VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'',0,?,?)",
         (
             "reserved",
+            config.execution.backend,
             "reserved",
             "reserved",
             "",
@@ -117,6 +129,8 @@ def _reserve_terminal_unchecked(
             purpose_id,
             str(working_directory.resolve()),
             "",
+            None,
+            "reserved",
             "reserved",
             now,
             now,
@@ -142,12 +156,12 @@ def _reserve_terminal_unchecked(
             ).fetchone()
         if work is not None and execution is not None:
             session_purpose_id = f"{int(work['seq'])}-{int(execution['number'])}"
-    session = session_name(instance, purpose_kind, session_purpose_id, actor, generation)
+    execution = execution_name(instance, purpose_kind, session_purpose_id, actor, generation)
     key = bytes.fromhex(read_private_secret(config.state_dir / "agent-auth-key"))
     token = derive_agent_token(key, instance, run_id, generation)
     connection.execute(
-        "UPDATE terminal_runs SET session_name=?,profile_name=?,mcp_name=?,token_digest=?,updated_at=? WHERE id=?",
-        (session, profile, mcp, token_digest(token), now, run_id),
+        "UPDATE terminal_runs SET execution_name=?,profile_name=?,mcp_name=?,agent_auth_id=?,token_digest=?,updated_at=? WHERE id=?",
+        (execution, profile, mcp, profile, token_digest(token), now, run_id),
     )
     connection.execute(
         "INSERT INTO actor_leases(actor_slug,purpose_kind,purpose_id,terminal_run_id,acquired_at)VALUES(?,?,?,?,?)",
@@ -191,25 +205,19 @@ def bootstrap_persistent_agents(connection: sqlite3.Connection, config: AgentsCo
     return reserved
 
 
-class CaoApi(Protocol):
-    def health(self) -> bool: ...
-    def create_session(self, **kwargs: Any) -> dict[str, Any]: ...
-    def get_session(self, name: str) -> dict[str, Any]: ...
-    def list_terminals(self, session_name: str) -> list[dict[str, Any]]: ...
-    def get_terminal(self, terminal_id: str) -> dict[str, Any]: ...
-    def get_output(self, terminal_id: str) -> str: ...
-    def get_working_directory(self, terminal_id: str) -> str: ...
-    def enqueue_wake(self, terminal_id: str, sender_id: str, message: str) -> str: ...
-    def send_input(self, terminal_id: str, message: str) -> bool: ...
-    def delete_session(self, name: str) -> None: ...
-    def list_sessions(self) -> list[dict[str, Any]]: ...
-
-
 class Reconciler:
-    def __init__(self, config: AgentsConfig, connection: sqlite3.Connection, client: CaoApi | None = None) -> None:
+    def __init__(
+        self,
+        config: AgentsConfig,
+        connection: sqlite3.Connection,
+        backend: ExecutionBackend | None = None,
+    ) -> None:
         self.config = config
         self.connection = connection
-        self.client = client or CaoClient(config.cao.api_port)
+        self.backend = backend or HerdrBackend.from_config(config)
+        self._dirty_runs: set[int] = set()
+        self._terminated_runs: set[int] = set()
+        self._event_task: asyncio.Task[Any] | None = None
         self._tasks: set[asyncio.Task[Any]] = set()
         self._inflight: dict[str, asyncio.Task[Any]] = {}
         self._launch_locks: dict[int, asyncio.Lock] = {}
@@ -244,6 +252,7 @@ class Reconciler:
         task.add_done_callback(finished)
 
     async def run(self) -> None:
+        self._event_task = asyncio.create_task(self._consume_events())
         try:
             while True:
                 try:
@@ -254,14 +263,48 @@ class Reconciler:
                     self._incident("reconciler_cycle_failed", "system", "global", str(exc))
                 await asyncio.sleep(self.config.runtime.poll_seconds)
         finally:
-            tasks = tuple(self._tasks)
+            if self._event_task is not None:
+                self._event_task.cancel()
+            tasks = (*self._tasks, *((self._event_task,) if self._event_task is not None else ()))
             for task in tasks:
                 task.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
+            self.backend.close()
+
+    async def _consume_events(self) -> None:
+        async for event in self.backend.events():
+            if event.kind not in {
+                "pane.updated",
+                "pane.agent_status_changed",
+                "pane.exited",
+                "pane.closed",
+                "workspace.closed",
+            }:
+                continue
+            conditions: list[str] = []
+            values: list[str] = []
+            if event.run_id is not None:
+                conditions.append("backend_run_id=?")
+                values.append(event.run_id)
+            if event.terminal_id is not None:
+                conditions.append("backend_terminal_id=?")
+                values.append(event.terminal_id)
+            if not conditions:
+                continue
+            rows = self.connection.execute(
+                f"SELECT id FROM terminal_runs WHERE state='live' AND ({' OR '.join(conditions)})",
+                tuple(values),
+            )
+            for row in rows:
+                run_id = int(row["id"])
+                if event.kind in {"pane.exited", "pane.closed", "workspace.closed"}:
+                    self._terminated_runs.add(run_id)
+                self._dirty_runs.add(run_id)
+                self._spawn(f"poll:{run_id}", self._poll(run_id))
 
     def _fence_stale_provider_runs(self) -> None:
-        configured = self.config.cao.provider_id
+        configured = self.config.execution.provider_id
         for run in list(
             self.connection.execute(
                 "SELECT DISTINCT tr.* FROM terminal_runs tr LEFT JOIN launch_attempts la "
@@ -288,7 +331,7 @@ class Reconciler:
             self._fence_stale_provider_runs()
             bootstrap_persistent_agents(self.connection, self.config)
             if not self._recovered_checks:
-                Delivery(self.config, self.connection).recover_running_checks()
+                Delivery(self.config, self.connection, backend=self.backend).recover_running_checks()
                 self._recovered_checks = True
         except Exception as exc:
             self._incident("bootstrap_failed", "persistent", "global", str(exc))
@@ -296,7 +339,8 @@ class Reconciler:
             Scheduler(self.config, self.connection).dispatch_due()
         except Exception as exc:
             self._incident("schedule_dispatch_failed", "schedule", "global", str(exc))
-        healthy = self.client.health()
+        health = await asyncio.to_thread(self.backend.health)
+        healthy = health.healthy
         await self._advance_delivery(healthy)
         self._cleanup_expired()
         for row in self.connection.execute("SELECT id FROM terminal_runs WHERE state IN ('retained','ending')"):
@@ -335,48 +379,46 @@ class Reconciler:
             self._spawn(f"wake:{delivery_id}", self._wake(delivery_id))
 
     async def _remove_unmapped_sessions(self) -> None:
-        list_sessions = getattr(self.client, "list_sessions", None)
-        delete_session = getattr(self.client, "delete_session", None)
-        if not callable(list_sessions) or not callable(delete_session):
-            return
-        try:
-            sessions = cast(list[dict[str, Any]], await asyncio.to_thread(list_sessions))
-        except CaoUnavailable:
-            return
         project = self.connection.execute("SELECT instance_id FROM project WHERE id=1").fetchone()
         if project is None:
             return
-        prefix = f"cao-agents-{project['instance_id']}-"
+        prefix = f"agents-{project['instance_id']}-"
         mapped = {
-            str(row["session_name"])
+            str(row["execution_name"])
             for row in self.connection.execute(
-                "SELECT session_name FROM terminal_runs "
+                "SELECT execution_name FROM terminal_runs "
                 "WHERE state IN ('reserved','creating','live') AND token_revoked_at IS NULL"
             )
         }
-        for session in sessions:
-            name = session.get("name", session.get("session_name"))
-            if isinstance(name, str) and name.startswith(prefix) and name not in mapped:
-                try:
-                    async with self._profile_lock:
-                        await asyncio.to_thread(delete_session, name)
-                        await asyncio.to_thread(self.client.get_session, name)
-                except CaoNotFound:
-                    continue
-                except CaoUnavailable as exc:
-                    self._incident("terminal_cleanup_failed", "terminal", name, str(exc))
-                    continue
+        expected_cwds = {
+            Path(str(row["working_directory"])).resolve()
+            for row in self.connection.execute("SELECT DISTINCT working_directory FROM terminal_runs")
+        }
+        try:
+            runs = await asyncio.to_thread(self.backend.list_runs, prefix)
+        except ExecutionUnavailable, ExecutionTimeout, ExecutionBusy:
+            return
+        for run in runs:
+            if run.handle.name in mapped:
+                continue
+            if run.cwd not in expected_cwds:
                 self._incident(
-                    "terminal_cleanup_failed",
+                    "terminal_cleanup_refused",
                     "terminal",
-                    name,
-                    "unmapped CAO session still exists after deletion",
+                    run.handle.name,
+                    f"backend cwd {run.cwd} is not recorded in Agents state",
                 )
+                continue
+            try:
+                async with self._profile_lock:
+                    await asyncio.to_thread(self.backend.delete_run, run.handle)
+            except ExecutionError as exc:
+                self._incident("terminal_cleanup_failed", "terminal", run.handle.name, str(exc))
 
     async def _advance_delivery(self, provider_healthy: bool) -> None:
         from .delivery import Delivery
 
-        delivery = Delivery(self.config, self.connection)
+        delivery = Delivery(self.config, self.connection, backend=self.backend)
         try:
             if any(self.connection.execute("SELECT 1 FROM checks WHERE state='queued'").fetchone() for _ in (0,)):
                 self._spawn("check", delivery.run_next_check())
@@ -440,204 +482,196 @@ class Reconciler:
             "JOIN actors a ON a.slug=tr.actor_slug JOIN project p ON p.id=1 WHERE tr.id=?",
             (run_id,),
         ).fetchone()
-        if run is None:
+        if run is None or not self._launch_fence(run_id, {"reserved"}, {"reserved"}):
             return
-        posted = False
         materialized = None
-        artifacts: list[dict[str, Any]] = []
-        terminal_id: str | None = None
-        cancelled = False
+        launch = None
+        posted = False
         try:
             key = bytes.fromhex(read_private_secret(self.config.state_dir / "agent-auth-key"))
             token = derive_agent_token(key, str(run["instance_id"]), run_id, int(run["generation"]))
-            async with self._profile_lock:
-                if not self._launch_fence(run_id, {"reserved"}, {"reserved"}):
-                    cancelled = True
-                else:
-                    materialized = await asyncio.to_thread(
-                        materialize_profile,
-                        self.config.root,
-                        self.config.state_dir,
-                        template=str(run["profile_template"]),
-                        instance=str(run["instance_id"]),
-                        run_id=run_id,
-                        generation=int(run["generation"]),
-                        provider=str(run["provider"]),
-                        purpose_kind=str(run["purpose_kind"]),
-                        specialty=run["specialty"],
-                        token=token,
-                        api_url=f"http://127.0.0.1:{self.config.web.port}",
-                        reasoning_effort=str(run["reasoning_effort"]),
-                    )
-                if not cancelled:
-                    assert materialized is not None
-                    now = utc_now()
-                    self.connection.execute("BEGIN IMMEDIATE")
-                    try:
-                        fence = self.connection.execute(
-                            "SELECT tr.state,la.state,tr.token_revoked_at FROM terminal_runs tr "
-                            "JOIN launch_attempts la ON la.terminal_run_id=tr.id WHERE tr.id=?",
-                            (run_id,),
-                        ).fetchone()
-                        if fence is None or tuple(fence) != ("reserved", "reserved", None):
-                            self.connection.rollback()
-                            cancelled = True
-                        else:
-                            self.connection.execute(
-                                "UPDATE terminal_runs SET profile_sha256=?,profile_state='staged',updated_at=? "
-                                "WHERE id=? AND state='reserved' AND token_revoked_at IS NULL",
-                                (materialized.sha256, now, run_id),
-                            )
-                            self.connection.commit()
-                    except BaseException:
-                        self.connection.rollback()
-                        raise
-                if not cancelled:
-                    assert materialized is not None
-                    if not self._launch_fence(run_id, {"reserved"}, {"reserved"}):
-                        cancelled = True
-                    else:
-                        artifacts = await asyncio.to_thread(
-                            install_profile,
-                            self.config.root / ".tools/bin/cao",
-                            self.config.cao_home,
-                            materialized,
-                            str(run["provider"]),
-                            self.config.state_dir / "profiles.lock",
-                        )
-                if not cancelled:
-                    assert materialized is not None
-                    now = utc_now()
-                    self.connection.execute("BEGIN IMMEDIATE")
-                    try:
-                        fence = self.connection.execute(
-                            "SELECT tr.state,la.state,tr.token_revoked_at FROM terminal_runs tr "
-                            "JOIN launch_attempts la ON la.terminal_run_id=tr.id WHERE tr.id=?",
-                            (run_id,),
-                        ).fetchone()
-                        if fence is None or tuple(fence) != ("reserved", "reserved", None):
-                            self.connection.rollback()
-                            cancelled = True
-                        else:
-                            self.connection.execute(
-                                "UPDATE terminal_runs SET profile_sha256=?,profile_state='installed',"
-                                "state='creating',updated_at=? WHERE id=? AND state='reserved' "
-                                "AND token_revoked_at IS NULL",
-                                (materialized.sha256, now, run_id),
-                            )
-                            self.connection.execute(
-                                "UPDATE launch_attempts SET counted=1,state='posting',updated_at=? "
-                                "WHERE terminal_run_id=? AND state='reserved'",
-                                (now, run_id),
-                            )
-                            for artifact in artifacts:
-                                self.connection.execute(
-                                    "INSERT OR IGNORE INTO terminal_artifacts(terminal_run_id,kind,path,"
-                                    "fragment_key,expected_sha256,expected_json_redacted,secret_fields_json,"
-                                    "state,created_at,updated_at)"
-                                    "VALUES(?,?,?,?,?,?,?,'installed',?,?)",
-                                    (
-                                        run_id,
-                                        str(artifact.get("kind", "config")),
-                                        artifact["path"],
-                                        artifact.get("fragment_key"),
-                                        artifact["sha256"],
-                                        artifact.get("expected_json_redacted"),
-                                        artifact.get("secret_fields_json", "{}"),
-                                        now,
-                                        now,
-                                    ),
-                                )
-                            self.connection.commit()
-                    except BaseException:
-                        self.connection.rollback()
-                        raise
-                if not cancelled and not self._launch_fence(run_id, {"creating"}, {"posting"}):
-                    self._mark_cancelled_launch(run_id, "launch revoked before CAO POST", actual_posted=False)
-                    cancelled = True
-                if not cancelled:
-                    posted = True
-                    value = await asyncio.to_thread(
-                        self.client.create_session,
-                        profile=str(run["profile_name"]),
-                        provider=str(run["provider"]),
-                        session_name=str(run["session_name"]),
-                        working_directory=str(run["working_directory"]),
-                        allowed_tools=list(purpose_tools(str(run["purpose_kind"]), run["specialty"])),
-                        env_vars={
-                            "AGENTS_AGENT_TOKEN": token,
-                            "AGENTS_API_URL": f"http://127.0.0.1:{self.config.web.port}",
-                        },
-                        model=str(run["model"]),
-                    )
-                    terminal_id = value.get("id") or value.get("terminal_id")
-                    if not isinstance(terminal_id, str):
-                        raise CaoUnavailable("create session response has no terminal ID")
-                    self._record_terminal_id(run_id, terminal_id)
-                    session = await asyncio.to_thread(self.client.get_session, str(run["session_name"]))
-                    terminals = await asyncio.to_thread(self.client.list_terminals, str(run["session_name"]))
-                    if not self._session_matches(run, session):
-                        raise CaoUnavailable("CAO returned a mismatched session identity")
-                    if (
-                        len(terminals) != 1
-                        or (terminals[0].get("id") or terminals[0].get("terminal_id")) != terminal_id
-                        or not self._terminal_matches(run, terminals[0])
-                    ):
-                        raise CaoUnavailable("CAO session does not contain the expected terminal")
-                    directory = await asyncio.to_thread(self.client.get_working_directory, terminal_id)
-                    if Path(directory).resolve() != Path(str(run["working_directory"])).resolve():
-                        raise CaoUnavailable("created terminal has the wrong working directory")
-                    self._seal_runtime_artifacts(run_id, terminal_id, terminals[0])
-                    now = utc_now()
-                    self.connection.execute("BEGIN IMMEDIATE")
-                    try:
-                        fence = self.connection.execute(
-                            "SELECT tr.state,la.state,tr.token_revoked_at FROM terminal_runs tr "
-                            "JOIN launch_attempts la ON la.terminal_run_id=tr.id WHERE tr.id=?",
-                            (run_id,),
-                        ).fetchone()
-                        if fence is None or tuple(fence) != ("creating", "posting", None):
-                            self.connection.rollback()
-                            self._mark_cancelled_launch(
-                                run_id, "launch revoked after CAO POST", terminal_id=terminal_id, actual_posted=True
-                            )
-                            await self._delete_session_locked(str(run["session_name"]))
-                            cancelled = True
-                        else:
-                            self.connection.execute(
-                                "UPDATE terminal_runs SET terminal_id=?,state='live',launch_count=launch_count+1,"
-                                "updated_at=? WHERE id=? AND state='creating' AND token_revoked_at IS NULL",
-                                (terminal_id, now, run_id),
-                            )
-                            self.connection.execute(
-                                "UPDATE launch_attempts SET state='succeeded',updated_at=? "
-                                "WHERE terminal_run_id=? AND state='posting'",
-                                (now, run_id),
-                            )
-                            self.connection.commit()
-                    except BaseException:
-                        if self.connection.in_transaction:
-                            self.connection.rollback()
-                        raise
-            if cancelled:
-                if materialized is not None:
-                    self._discard_profile(materialized, artifacts)
-                return
-        except BaseException as exc:
-            if not posted:
-                if self._run_revoked(run_id):
-                    self._mark_cancelled_launch(run_id, str(exc), actual_posted=False)
-                else:
-                    self._abort_prepost(run_id, str(exc))
-                if materialized is not None:
-                    self._discard_profile(materialized, artifacts)
-                return
-            self.connection.execute(
-                "UPDATE launch_attempts SET state='uncertain',error=?,updated_at=? "
-                "WHERE terminal_run_id=? AND state='posting'",
-                (str(exc), utc_now(), run_id),
+            materialized = await asyncio.to_thread(
+                materialize_profile,
+                self.config.root,
+                self.config.state_dir,
+                template=str(run["profile_template"]),
+                instance=str(run["instance_id"]),
+                run_id=run_id,
+                generation=int(run["generation"]),
+                provider=str(run["provider"]),
+                purpose_kind=str(run["purpose_kind"]),
+                specialty=run["specialty"],
+                token=token,
+                api_url=f"http://127.0.0.1:{self.config.web.port}",
+                reasoning_effort=str(run["reasoning_effort"]),
             )
-            await self._adopt(run_id)
+            if not self._launch_fence(run_id, {"reserved"}, {"reserved"}):
+                self._discard_profile(materialized, [])
+                return
+            async with self._profile_lock:
+                launch = await asyncio.to_thread(
+                    install_profile,
+                    materialized,
+                    str(run["provider"]),
+                    self.config.state_dir / "profiles.lock",
+                    runtime_dir=self.config.state_dir / "runtime",
+                    agent_auth_id=str(run["agent_auth_id"]),
+                    model=str(run["model"]),
+                )
+            artifacts = list(launch.artifacts)
+            now = utc_now()
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                fence = self.connection.execute(
+                    "SELECT tr.state,la.state,tr.token_revoked_at FROM terminal_runs tr "
+                    "JOIN launch_attempts la ON la.terminal_run_id=tr.id WHERE tr.id=?",
+                    (run_id,),
+                ).fetchone()
+                if fence is None or tuple(fence) != ("reserved", "reserved", None):
+                    self.connection.rollback()
+                    self._discard_profile(materialized, artifacts)
+                    return
+                self.connection.execute(
+                    "UPDATE terminal_runs SET profile_sha256=?,profile_state='installed',state='creating',updated_at=? "
+                    "WHERE id=? AND state='reserved' AND token_revoked_at IS NULL",
+                    (materialized.sha256, now, run_id),
+                )
+                self.connection.execute(
+                    "UPDATE launch_attempts SET counted=1,state='posting',updated_at=? "
+                    "WHERE terminal_run_id=? AND state='reserved'",
+                    (now, run_id),
+                )
+                for artifact in artifacts:
+                    self.connection.execute(
+                        "INSERT OR IGNORE INTO terminal_artifacts(terminal_run_id,kind,path,fragment_key,"
+                        "expected_sha256,expected_json_redacted,secret_fields_json,state,created_at,updated_at)"
+                        "VALUES(?,?,?,?,?,?,?,'installed',?,?)",
+                        (
+                            run_id,
+                            str(artifact.get("kind", "config")),
+                            artifact["path"],
+                            artifact.get("fragment_key"),
+                            artifact["sha256"],
+                            artifact.get("expected_json_redacted"),
+                            artifact.get("secret_fields_json", "{}"),
+                            now,
+                            now,
+                        ),
+                    )
+                self.connection.commit()
+            except BaseException:
+                self.connection.rollback()
+                raise
+            if not self._launch_fence(run_id, {"creating"}, {"posting"}):
+                self._mark_cancelled_launch(run_id, "launch revoked before backend create", actual_posted=False)
+                self._discard_profile(materialized, artifacts)
+                return
+            provider = str(run["provider"])
+            mock = provider == "mock_cli"
+            kind = {"opencode_cli": "opencode", "claude_code": "claude"}.get(provider, "mock")
+            agent_name = f"agents-r{run_id:010d}-g{int(run['generation']):04d}"
+            environment = dict(launch.env)
+            environment.update(
+                {
+                    "AGENTS_AGENT_TOKEN": token,
+                    "AGENTS_API_URL": f"http://127.0.0.1:{self.config.web.port}",
+                    "AGENTS_EXECUTION_ID": str(run["agent_auth_id"]),
+                }
+            )
+            spec = RunSpec(
+                str(run["execution_name"]),
+                run_id,
+                int(run["generation"]),
+                Path(str(run["working_directory"])),
+                agent_name,
+                kind,
+                tuple(launch.argv),
+                tuple(sorted(environment.items())),
+                provider,
+                mock,
+            )
+            posted = True
+            snapshot = await asyncio.to_thread(self.backend.create_run, spec)
+            if not self._snapshot_matches(run, snapshot, agent_name=agent_name, agent_kind=kind, mock=mock):
+                raise ExecutionConflict("identity_mismatch", "backend created a mismatched run")
+            now = utc_now()
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                fence = self.connection.execute(
+                    "SELECT tr.state,la.state,tr.token_revoked_at FROM terminal_runs tr "
+                    "JOIN launch_attempts la ON la.terminal_run_id=tr.id WHERE tr.id=?",
+                    (run_id,),
+                ).fetchone()
+                if fence is None or tuple(fence) != ("creating", "posting", None):
+                    self.connection.rollback()
+                    self._mark_cancelled_launch(
+                        run_id,
+                        "launch revoked after backend create",
+                        handle=snapshot.handle,
+                        actual_posted=True,
+                    )
+                    await asyncio.to_thread(self.backend.delete_run, snapshot.handle)
+                    return
+                self.connection.execute(
+                    "UPDATE terminal_runs SET backend_run_id=?,backend_terminal_id=?,backend_revision=?,"
+                    "state='live',launch_count=launch_count+1,updated_at=? "
+                    "WHERE id=? AND state='creating' AND token_revoked_at IS NULL",
+                    (
+                        snapshot.handle.run_id,
+                        snapshot.handle.terminal_id,
+                        snapshot.revision,
+                        now,
+                        run_id,
+                    ),
+                )
+                self.connection.execute(
+                    "UPDATE launch_attempts SET state='succeeded',updated_at=? "
+                    "WHERE terminal_run_id=? AND state='posting'",
+                    (now, run_id),
+                )
+                self.connection.commit()
+            except BaseException:
+                if self.connection.in_transaction:
+                    self.connection.rollback()
+                raise
+        except (ExecutionUnavailable, ExecutionBusy) as exc:
+            if posted and not exc.outcome_unknown:
+                now = utc_now()
+                self.connection.execute(
+                    "UPDATE terminal_runs SET state='reserved',updated_at=? WHERE id=? AND state='creating'",
+                    (now, run_id),
+                )
+                self.connection.execute(
+                    "UPDATE launch_attempts SET state='reserved',error=?,updated_at=? "
+                    "WHERE terminal_run_id=? AND state='posting'",
+                    (str(exc), now, run_id),
+                )
+            elif not posted:
+                self._abort_prepost(run_id, str(exc))
+        except ExecutionError as exc:
+            if posted and (exc.outcome_unknown or isinstance(exc, (ExecutionTimeout, ExecutionConflict))):
+                self.connection.execute(
+                    "UPDATE launch_attempts SET state='uncertain',error=?,updated_at=? "
+                    "WHERE terminal_run_id=? AND state='posting'",
+                    (str(exc), utc_now(), run_id),
+                )
+                await self._adopt(run_id)
+            else:
+                current = self.connection.execute("SELECT * FROM terminal_runs WHERE id=?", (run_id,)).fetchone()
+                if current is not None:
+                    self._recover_terminal(current, str(exc), incident_kind="terminal_launch_failed")
+        except BaseException as exc:
+            if posted:
+                self.connection.execute(
+                    "UPDATE launch_attempts SET state='uncertain',error=?,updated_at=? "
+                    "WHERE terminal_run_id=? AND state='posting'",
+                    (str(exc), utc_now(), run_id),
+                )
+                await self._adopt(run_id)
+            else:
+                self._abort_prepost(run_id, str(exc))
+                if materialized is not None:
+                    self._discard_profile(materialized, list(launch.artifacts) if launch is not None else [])
 
     def _launch_fence(self, run_id: int, terminal_states: set[str], attempt_states: set[str]) -> bool:
         row = self.connection.execute(
@@ -660,14 +694,15 @@ class Reconciler:
             row["token_revoked_at"] is not None or row["state"] in {"ending", "ended", "failed"}
         )
 
-    def _record_terminal_id(self, run_id: int, terminal_id: str) -> None:
+    def _record_backend_handle(self, run_id: int, handle: RunHandle, revision: int | None) -> None:
         self.connection.execute(
-            "UPDATE terminal_runs SET terminal_id=?,updated_at=? WHERE id=? AND terminal_id IS NULL",
-            (terminal_id, utc_now(), run_id),
+            "UPDATE terminal_runs SET backend_run_id=COALESCE(backend_run_id,?),"
+            "backend_terminal_id=COALESCE(backend_terminal_id,?),backend_revision=?,updated_at=? WHERE id=?",
+            (handle.run_id, handle.terminal_id, revision, utc_now(), run_id),
         )
 
     def _mark_cancelled_launch(
-        self, run_id: int, reason: str, *, terminal_id: str | None = None, actual_posted: bool
+        self, run_id: int, reason: str, *, handle: RunHandle | None = None, actual_posted: bool
     ) -> None:
         now = utc_now()
         self.connection.execute("BEGIN IMMEDIATE")
@@ -675,8 +710,16 @@ class Reconciler:
             self.connection.execute(
                 "UPDATE terminal_runs SET token_revoked_at=COALESCE(token_revoked_at,?),"
                 "state=CASE WHEN state IN ('reserved','creating','live','retained') THEN 'ending' ELSE state END,"
-                "terminal_id=COALESCE(terminal_id,?),error=COALESCE(error,?),updated_at=? WHERE id=?",
-                (now, terminal_id, reason, now, run_id),
+                "backend_run_id=COALESCE(backend_run_id,?),"
+                "backend_terminal_id=COALESCE(backend_terminal_id,?),error=COALESCE(error,?),updated_at=? WHERE id=?",
+                (
+                    now,
+                    handle.run_id if handle is not None else None,
+                    handle.terminal_id if handle is not None else None,
+                    reason,
+                    now,
+                    run_id,
+                ),
             )
             self.connection.execute(
                 "UPDATE launch_attempts SET state='aborted',counted=CASE WHEN ? THEN counted ELSE 0 END,"
@@ -692,17 +735,12 @@ class Reconciler:
             self.connection.rollback()
             raise
 
-    async def _delete_session_locked(self, name: str) -> None:
-        try:
-            await asyncio.to_thread(self.client.delete_session, name)
-            await asyncio.to_thread(self.client.get_session, name)
-        except CaoNotFound:
-            return
-        raise CaoUnavailable(f"CAO session still exists after deletion: {name}")
+    async def _delete_run_locked(self, handle: RunHandle) -> None:
+        await asyncio.to_thread(self.backend.delete_run, handle)
 
-    async def _delete_session(self, name: str) -> None:
+    async def _delete_run(self, handle: RunHandle) -> None:
         async with self._profile_lock:
-            await self._delete_session_locked(name)
+            await self._delete_run_locked(handle)
 
     def _abort_prepost(self, run_id: int, reason: str) -> None:
         run = self.connection.execute("SELECT * FROM terminal_runs WHERE id=?", (run_id,)).fetchone()
@@ -719,305 +757,304 @@ class Reconciler:
 
     def _discard_profile(self, materialized: Any, artifacts: list[dict[str, Any]]) -> None:
         try:
-            path = Path(materialized.path)
-            secret_values = dict(getattr(materialized, "secret_values", None) or {})
-            cao = self.config.root / ".tools/bin/cao"
-            if cao.is_file():
-                managed_artifacts = artifacts
-                if not managed_artifacts and path.is_file() and not path.is_symlink():
-                    digest = getattr(materialized, "sha256", hashlib.sha256(path.read_bytes()).hexdigest())
-                    managed_artifacts = [{"path": str(path), "sha256": str(digest)}]
-                remove_profile(
-                    cao,
-                    self.config.cao_home,
-                    str(materialized.name),
-                    path,
-                    managed_artifacts,
-                    self.config.state_dir / "profiles.lock",
-                    secret_values=secret_values,
+            row = self.connection.execute(
+                "SELECT provider,agent_auth_id FROM terminal_runs WHERE profile_name=? ORDER BY id DESC LIMIT 1",
+                (str(materialized.name),),
+            ).fetchone()
+            managed_artifacts = artifacts or [
+                {
+                    "kind": "source",
+                    "path": str(materialized.path),
+                    "sha256": str(materialized.sha256),
+                    "secret_fields_json": "{}",
+                }
+            ]
+            remove_profile(
+                str(materialized.name),
+                Path(materialized.path),
+                managed_artifacts,
+                self.config.state_dir / "profiles.lock",
+                runtime_dir=self.config.state_dir / "runtime",
+                secret_values=dict(getattr(materialized, "secret_values", None) or {}),
+            )
+            if row is not None:
+                self.connection.execute(
+                    "UPDATE terminal_artifacts SET state='removed',updated_at=? "
+                    "WHERE terminal_run_id=(SELECT id FROM terminal_runs WHERE profile_name=? ORDER BY id DESC LIMIT 1) "
+                    "AND state IN ('staged','installed')",
+                    (utc_now(), str(materialized.name)),
                 )
-                return
-            if path.is_symlink():
-                self._incident("profile_cleanup_mismatch", "terminal", str(materialized.name), "profile is a symlink")
-            elif path.exists():
-                path.unlink()
-            for artifact in artifacts:
-                artifact_path = Path(str(artifact["path"]))
-                if not artifact_path.exists():
-                    continue
-                valid = validate_manifest_artifact(
-                    artifact_path,
-                    str(artifact["sha256"]),
-                    fragment_key=artifact.get("fragment_key"),
-                    expected_json_redacted=artifact.get("expected_json_redacted"),
-                    secret_fields_json=artifact.get("secret_fields_json"),
-                    secret_values=secret_values,
-                )
-                if valid and artifact.get("fragment_key") is None:
-                    artifact_path.unlink()
-                else:
-                    self._incident(
-                        "profile_cleanup_mismatch",
-                        "terminal",
-                        str(materialized.name),
-                        f"artifact cannot be safely removed: {artifact_path}",
-                    )
         except (OSError, ProfileError) as exc:
             self._incident("profile_cleanup_failed", "terminal", str(materialized.name), str(exc))
 
     @staticmethod
-    def _session_matches(run: sqlite3.Row, session: dict[str, Any]) -> bool:
-        identity = session.get("session_name", session.get("name"))
-        if identity not in {None, run["session_name"]}:
+    def _snapshot_matches(
+        run: sqlite3.Row,
+        snapshot: RunSnapshot,
+        *,
+        agent_name: str | None = None,
+        agent_kind: str | None = None,
+        mock: bool | None = None,
+    ) -> bool:
+        expected_name = str(run["execution_name"])
+        expected_run_id = run["backend_run_id"]
+        expected_terminal_id = run["backend_terminal_id"]
+        if snapshot.handle.name != expected_name or snapshot.backend_name != expected_name:
             return False
-        for keys, expected in (
-            (("provider", "provider_id"), str(run["provider"])),
-            (("profile", "profile_name", "agent_profile"), str(run["profile_name"])),
-            (("working_directory", "workdir"), str(run["working_directory"])),
-        ):
-            values = [session[key] for key in keys if key in session and session[key] is not None]
-            if values and any(str(value) != expected for value in values):
-                return False
-        return True
+        if expected_run_id is not None and snapshot.handle.run_id != expected_run_id:
+            return False
+        if expected_terminal_id is not None and snapshot.handle.terminal_id != expected_terminal_id:
+            return False
+        if snapshot.cwd != Path(str(run["working_directory"])).resolve():
+            return False
+        is_mock = str(run["provider"]) == "mock_cli" if mock is None else mock
+        if is_mock:
+            return snapshot.agent_name is None and snapshot.agent_kind is None
+        expected_agent_name = agent_name or f"agents-r{int(run['id']):010d}-g{int(run['generation']):04d}"
+        expected_agent_kind = agent_kind or {
+            "opencode_cli": "opencode",
+            "claude_code": "claude",
+        }.get(str(run["provider"]))
+        return (snapshot.agent_name, snapshot.agent_kind) == (expected_agent_name, expected_agent_kind)
 
-    @staticmethod
-    def _terminal_matches(run: sqlite3.Row, terminal: dict[str, Any]) -> bool:
-        identity = terminal.get("session_name", terminal.get("tmux_session", terminal.get("name")))
-        provider = terminal.get("provider", terminal.get("provider_id"))
-        profile = terminal.get("profile", terminal.get("profile_name", terminal.get("agent_profile")))
-        return identity == run["session_name"] and provider == run["provider"] and profile == run["profile_name"]
-
-    def _runtime_paths(self, run_id: int, terminal_id: str) -> tuple[tuple[str, Path], ...]:
-        provider = self.connection.execute("SELECT provider FROM terminal_runs WHERE id=?", (run_id,)).fetchone()
-        if provider is None or str(provider["provider"]) != "claude_code":
-            return ()
-        if not terminal_id or Path(terminal_id).name != terminal_id or terminal_id in {".", ".."}:
-            raise CaoUnavailable("CAO terminal ID is unsafe for runtime artifact paths")
-        base = (self.config.cao_home / "tmp").resolve()
-        prompt = (base / f"{terminal_id}.prompt").resolve()
-        mcp = (base / f"{terminal_id}.mcp.json").resolve()
-        if prompt.parent != base or mcp.parent != base:
-            raise CaoUnavailable("CAO runtime artifact path escapes its owned directory")
-        return (("runtime_prompt", prompt), ("runtime_mcp", mcp))
-
-    def _seal_runtime_artifacts(self, run_id: int, terminal_id: str, terminal: dict[str, Any]) -> None:
-        expected = dict(self._runtime_paths(run_id, terminal_id))
-        candidates: list[tuple[str, Path]] = list(expected.items())
-        for kind, keys in (
-            ("runtime_prompt", ("runtime_prompt_path", "prompt_path")),
-            ("runtime_mcp", ("runtime_mcp_path", "mcp_path")),
-        ):
-            for key in keys:
-                value = terminal.get(key)
-                if isinstance(value, str):
-                    path = Path(value).resolve()
-                    if kind in expected and path != expected[kind].resolve():
-                        raise CaoUnavailable(f"CAO runtime artifact path mismatch: {path}")
-                    if kind not in expected:
-                        raise CaoUnavailable(f"unexpected CAO runtime artifact path: {path}")
-                    break
-        for value in terminal.get("runtime_artifacts", ()):
-            if isinstance(value, dict) and isinstance(value.get("path"), str):
-                kind = str(value.get("kind", "runtime_mcp"))
-                if kind not in {"runtime_prompt", "runtime_mcp"}:
-                    continue
-                path = Path(str(value["path"])).resolve()
-                if kind in expected and path != expected[kind].resolve():
-                    raise CaoUnavailable(f"CAO runtime artifact path mismatch: {path}")
-                if kind not in expected:
-                    raise CaoUnavailable(f"unexpected CAO runtime artifact path: {path}")
-        now = utc_now()
-        run = self.connection.execute(
-            "SELECT tr.generation,p.instance_id FROM terminal_runs tr JOIN project p ON p.id=1 WHERE tr.id=?",
-            (run_id,),
-        ).fetchone()
-        if run is None:
-            raise CaoUnavailable("terminal run identity is missing")
+    async def _spec_for_uncertain_run(self, run: sqlite3.Row) -> RunSpec:
+        run_id = int(run["id"])
+        generation = int(run["generation"])
         key = bytes.fromhex(read_private_secret(self.config.state_dir / "agent-auth-key"))
-        token = derive_agent_token(key, str(run["instance_id"]), run_id, int(run["generation"]))
-        secret_fields_json = json.dumps(
-            {"AGENTS_AGENT_TOKEN": hashlib.sha256(token.encode()).hexdigest()},
-            sort_keys=True,
-            separators=(",", ":"),
+        token = derive_agent_token(key, str(run["instance_id"]), run_id, generation)
+        materialized = await asyncio.to_thread(
+            materialize_profile,
+            self.config.root,
+            self.config.state_dir,
+            template=str(run["profile_template"]),
+            instance=str(run["instance_id"]),
+            run_id=run_id,
+            generation=generation,
+            provider=str(run["provider"]),
+            purpose_kind=str(run["purpose_kind"]),
+            specialty=run["specialty"],
+            token=token,
+            api_url=f"http://127.0.0.1:{self.config.web.port}",
+            reasoning_effort=str(run["reasoning_effort"]),
         )
-        for kind, path in candidates:
-            if path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o777 != 0o600:
-                raise CaoUnavailable(f"unsafe CAO runtime artifact: {path}")
-            content = path.read_bytes()
-            digest = hashlib.sha256(content).hexdigest()
-            if not validate_manifest_artifact(
-                path,
-                digest,
-                secret_fields_json=secret_fields_json,
-                secret_values={"AGENTS_AGENT_TOKEN": token},
-                require_secret_values=True,
-            ):
-                raise CaoUnavailable(f"CAO runtime artifact has invalid secret content: {path}")
-            self.connection.execute(
-                "INSERT OR IGNORE INTO terminal_artifacts(terminal_run_id,kind,path,expected_sha256,"
-                "secret_fields_json,state,created_at,updated_at)VALUES(?,?,?,?,?,'installed',?,?)",
-                (run_id, kind, str(path), digest, secret_fields_json, now, now),
+        async with self._profile_lock:
+            launch = await asyncio.to_thread(
+                install_profile,
+                materialized,
+                str(run["provider"]),
+                self.config.state_dir / "profiles.lock",
+                runtime_dir=self.config.state_dir / "runtime",
+                agent_auth_id=str(run["agent_auth_id"]),
+                model=str(run["model"]),
             )
+        provider = str(run["provider"])
+        environment = dict(launch.env)
+        environment.update(
+            {
+                "AGENTS_AGENT_TOKEN": token,
+                "AGENTS_API_URL": f"http://127.0.0.1:{self.config.web.port}",
+                "AGENTS_EXECUTION_ID": str(run["agent_auth_id"]),
+            }
+        )
+        return RunSpec(
+            str(run["execution_name"]),
+            run_id,
+            generation,
+            Path(str(run["working_directory"])),
+            f"agents-r{run_id:010d}-g{generation:04d}",
+            {"opencode_cli": "opencode", "claude_code": "claude"}.get(provider, "mock"),
+            tuple(launch.argv),
+            tuple(sorted(environment.items())),
+            provider,
+            provider == "mock_cli",
+        )
 
     async def _adopt(self, run_id: int) -> None:
         run = self.connection.execute(
-            "SELECT tr.*,la.updated_at launch_updated FROM terminal_runs tr "
-            "JOIN launch_attempts la ON la.terminal_run_id=tr.id WHERE tr.id=?",
+            "SELECT tr.*,la.updated_at launch_updated,p.instance_id,a.profile_template,a.specialty "
+            "FROM terminal_runs tr JOIN launch_attempts la ON la.terminal_run_id=tr.id "
+            "JOIN project p ON p.id=1 JOIN actors a ON a.slug=tr.actor_slug WHERE tr.id=?",
             (run_id,),
         ).fetchone()
         if run is None:
             return
-        session: dict[str, Any] = {}
         try:
-            session = await asyncio.to_thread(self.client.get_session, str(run["session_name"]))
-        except CaoNotFound:
-            session = {}
-        except CaoUnavailable:
+            snapshot = await asyncio.to_thread(self.backend.find_run, str(run["execution_name"]))
+        except ExecutionUnavailable, ExecutionBusy, ExecutionTimeout:
             return
-        try:
-            terminals = await asyncio.to_thread(self.client.list_terminals, str(run["session_name"]))
-        except CaoNotFound:
-            terminals = []
-        except CaoUnavailable:
+        except ExecutionConflict as exc:
+            await self._fail_uncertain(run, str(exc), cleanup_matches=True)
             return
-        if len(terminals) > 1 or (session and not terminals):
-            await self._fail_uncertain(run, "CAO session has zero or multiple terminals")
+        if snapshot is None:
+            if datetime.now(UTC) - _parse(str(run["launch_updated"])) > timedelta(seconds=120):
+                await self._fail_uncertain(run, "uncertain backend run creation")
             return
-        terminal_id = None
-        if len(terminals) == 1:
-            terminal = terminals[0]
-            value = terminal.get("id") or terminal.get("terminal_id")
-            if not isinstance(value, str) or not self._terminal_matches(run, terminal):
-                await self._fail_uncertain(run, "CAO terminal identity/provider/profile mismatch")
-                return
-            if isinstance(run["terminal_id"], str) and value != run["terminal_id"]:
-                await self._fail_uncertain(run, "persisted CAO terminal identity changed")
-                return
-            terminal_id = value
-            self._record_terminal_id(run_id, terminal_id)
-        if terminal_id is None and not session and not terminals and isinstance(run["terminal_id"], str):
-            try:
-                terminal = await asyncio.to_thread(self.client.get_terminal, str(run["terminal_id"]))
-            except CaoNotFound:
-                terminal = None
-            except CaoUnavailable:
-                return
-            if terminal is not None:
-                value = terminal.get("id") or terminal.get("terminal_id")
-                if value != run["terminal_id"] or not self._terminal_matches(run, terminal):
-                    await self._fail_uncertain(run, "persisted CAO terminal identity changed")
-                    return
-                terminal_id = str(run["terminal_id"])
-                terminals = [terminal]
         if self._run_revoked(run_id) or str(run["state"]) != "creating":
-            if session or terminals:
-                with contextlib.suppress(CaoNotFound):
-                    await self._delete_session(str(run["session_name"]))
+            self._mark_cancelled_launch(
+                run_id,
+                "revoked launch run removed",
+                handle=snapshot.handle,
+                actual_posted=True,
+            )
+            with contextlib.suppress(ExecutionNotFound):
+                await self._delete_run(snapshot.handle)
+            return
+        if not self._snapshot_matches(run, snapshot):
+            empty_shell = snapshot.agent_name is None and snapshot.agent_kind is None
+            if empty_shell:
+                try:
+                    spec = await self._spec_for_uncertain_run(run)
+                    snapshot = await asyncio.to_thread(self.backend.create_run, spec)
+                except ExecutionUnavailable, ExecutionBusy, ExecutionTimeout:
+                    return
+                except ExecutionError as exc:
+                    await self._fail_uncertain(run, str(exc))
+                    return
+                if self._snapshot_matches(run, snapshot):
+                    self._record_backend_handle(run_id, snapshot.handle, snapshot.revision)
+                else:
+                    empty_shell = False
+            if not self._snapshot_matches(run, snapshot):
+                expected_prefix = f"agents-{run['instance_id']}-"
+                expected_cwd = Path(str(run["working_directory"])).resolve()
+                await self._fail_uncertain(run, "backend run identity, occupant, or cwd mismatch")
+                if snapshot.handle.name.startswith(expected_prefix) and snapshot.cwd == expected_cwd:
+                    with contextlib.suppress(ExecutionNotFound):
+                        await self._delete_run(snapshot.handle)
+                return
+        now = utc_now()
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            fence = self.connection.execute(
+                "SELECT tr.state terminal_state,la.state launch_state,tr.token_revoked_at "
+                "FROM terminal_runs tr JOIN launch_attempts la ON la.terminal_run_id=tr.id WHERE tr.id=?",
+                (run_id,),
+            ).fetchone()
+            if (
+                fence is None
+                or fence["terminal_state"] != "creating"
+                or fence["launch_state"] not in {"posting", "uncertain"}
+                or fence["token_revoked_at"] is not None
+            ):
+                self.connection.rollback()
                 self._mark_cancelled_launch(
                     run_id,
-                    "revoked launch session removed",
-                    terminal_id=terminal_id,
+                    "launch revoked during adoption",
+                    handle=snapshot.handle,
                     actual_posted=True,
                 )
-            return
-        session_identity = session.get("session_name", session.get("name"))
-        if session_identity not in {None, run["session_name"]} or not self._session_matches(run, session):
-            await self._fail_uncertain(run, "CAO session identity/provider/profile mismatch")
-            return
-        if terminal_id is not None:
-            try:
-                directory = await asyncio.to_thread(self.client.get_working_directory, terminal_id)
-            except CaoUnavailable:
+                await self._delete_run(snapshot.handle)
                 return
-            expected_directory = Path(str(run["working_directory"])).resolve()
-            actual_directory = Path(directory).resolve()
-            if actual_directory != expected_directory:
-                await self._fail_uncertain(
-                    run,
-                    f"CAO terminal working directory mismatch: expected {expected_directory}, got {actual_directory}",
-                )
-                return
-            try:
-                self._seal_runtime_artifacts(int(run_id), terminal_id, terminals[0])
-            except CaoUnavailable as exc:
-                await self._fail_uncertain(run, str(exc))
-                return
-            now = utc_now()
-            self.connection.execute("BEGIN IMMEDIATE")
-            try:
-                fence = self.connection.execute(
-                    "SELECT tr.state terminal_state,la.state launch_state,tr.token_revoked_at "
-                    "FROM terminal_runs tr JOIN launch_attempts la ON la.terminal_run_id=tr.id WHERE tr.id=?",
-                    (run_id,),
-                ).fetchone()
-                if (
-                    fence is None
-                    or fence["terminal_state"] != "creating"
-                    or fence["launch_state"] not in {"posting", "uncertain"}
-                    or fence["token_revoked_at"] is not None
-                ):
-                    self.connection.rollback()
-                    self._mark_cancelled_launch(
-                        run_id, "launch revoked during adoption", terminal_id=terminal_id, actual_posted=True
-                    )
-                    await self._delete_session(str(run["session_name"]))
-                    return
-                self.connection.execute(
-                    "UPDATE terminal_runs SET terminal_id=?,state='live',launch_count=launch_count+1,updated_at=? "
-                    "WHERE id=? AND state='creating' AND token_revoked_at IS NULL",
-                    (terminal_id, now, run_id),
-                )
-                self.connection.execute(
-                    "UPDATE launch_attempts SET state='succeeded',updated_at=? "
-                    "WHERE terminal_run_id=? AND state IN ('posting','uncertain')",
-                    (now, run_id),
-                )
-                self.connection.commit()
-                return
-            except BaseException:
-                self.connection.rollback()
-                raise
-        if datetime.now(UTC) - _parse(str(run["launch_updated"])) > timedelta(seconds=120):
-            await self._fail_uncertain(run, "uncertain session creation")
+            self.connection.execute(
+                "UPDATE terminal_runs SET backend_run_id=?,backend_terminal_id=?,backend_revision=?,"
+                "state='live',launch_count=launch_count+1,updated_at=? "
+                "WHERE id=? AND state='creating' AND token_revoked_at IS NULL",
+                (
+                    snapshot.handle.run_id,
+                    snapshot.handle.terminal_id,
+                    snapshot.revision,
+                    now,
+                    run_id,
+                ),
+            )
+            self.connection.execute(
+                "UPDATE launch_attempts SET state='succeeded',updated_at=? "
+                "WHERE terminal_run_id=? AND state IN ('posting','uncertain')",
+                (now, run_id),
+            )
+            self.connection.commit()
+        except BaseException:
+            self.connection.rollback()
+            raise
 
-    async def _fail_uncertain(self, run: sqlite3.Row, reason: str) -> None:
+    async def _fail_uncertain(
+        self,
+        run: sqlite3.Row,
+        reason: str,
+        *,
+        cleanup_matches: bool = False,
+    ) -> None:
         self._recover_terminal(
             run,
             reason,
             terminal_state="ending",
             incident_kind="uncertain_launch",
         )
-        try:
-            await self._delete_session(str(run["session_name"]))
-        except CaoUnavailable as exc:
-            self._incident("terminal_cleanup_failed", "terminal", str(run["id"]), str(exc))
+        handles: list[RunHandle] = []
+        if run["backend_run_id"] and run["backend_terminal_id"]:
+            handles.append(
+                RunHandle(
+                    str(run["execution_name"]),
+                    str(run["backend_run_id"]),
+                    str(run["backend_terminal_id"]),
+                )
+            )
+        elif cleanup_matches:
+            try:
+                matches = await asyncio.to_thread(self.backend.list_runs, str(run["execution_name"]))
+            except ExecutionError as exc:
+                self._incident("terminal_cleanup_failed", "terminal", str(run["id"]), str(exc))
+                return
+            expected_cwd = Path(str(run["working_directory"])).resolve()
+            handles.extend(
+                snapshot.handle
+                for snapshot in matches
+                if snapshot.handle.name == str(run["execution_name"]) and snapshot.cwd == expected_cwd
+            )
+        for handle in handles:
+            try:
+                await self._delete_run(handle)
+            except ExecutionError as exc:
+                self._incident("terminal_cleanup_failed", "terminal", str(run["id"]), str(exc))
 
     async def _poll(self, run_id: int) -> None:
         run = self.connection.execute("SELECT * FROM terminal_runs WHERE id=?", (run_id,)).fetchone()
-        if run is None or not run["terminal_id"]:
+        if run is None or not run["backend_run_id"] or not run["backend_terminal_id"]:
             return
-        try:
-            terminal = await asyncio.to_thread(self.client.get_terminal, str(run["terminal_id"]))
-            output = await asyncio.to_thread(self.client.get_output, str(run["terminal_id"]))
-            directory = await asyncio.to_thread(self.client.get_working_directory, str(run["terminal_id"]))
-        except CaoNotFound:
+        handle = RunHandle(
+            str(run["execution_name"]),
+            str(run["backend_run_id"]),
+            str(run["backend_terminal_id"]),
+        )
+        if run_id in self._terminated_runs:
+            self._terminated_runs.discard(run_id)
             self._missing(run)
             return
-        except CaoUnavailable:
+        try:
+            snapshot = await asyncio.to_thread(self.backend.get_run, handle, include_output=False)
+            if not self._snapshot_matches(run, snapshot):
+                self._recover_terminal(run, "backend run identity, occupant, or cwd changed")
+                return
+            status = snapshot.status.value
+            include_output = (
+                run_id in self._dirty_runs
+                or snapshot.revision != run["backend_revision"]
+                or status != str(run["status"] or "")
+            )
+            if include_output:
+                snapshot = await asyncio.to_thread(self.backend.get_run, handle, include_output=True)
+        except ExecutionNotFound, ExecutionTerminated:
+            self._missing(run)
             return
-        if not self._terminal_matches(run, terminal):
-            self._recover_terminal(run, "terminal provider/profile identity changed")
+        except ExecutionUnavailable, ExecutionBusy, ExecutionTimeout:
             return
-        if Path(directory).resolve() != Path(str(run["working_directory"])).resolve():
-            self._recover_terminal(run, "working directory changed")
+        except ExecutionError as exc:
+            self._recover_terminal(run, str(exc))
             return
-        digest = hashlib.sha256(output.encode()).hexdigest()
+        finally:
+            self._dirty_runs.discard(run_id)
+        output = snapshot.output if include_output else str(run["output_tail"])
+        digest = hashlib.sha256(output.encode()).hexdigest() if include_output else str(run["output_digest"] or "")
         now = utc_now()
         since = now if digest != run["output_digest"] else (run["digest_since"] or now)
-        status = str(terminal.get("status", "")).lower()
         tail = output[-128 * 1024 :]
+        status = snapshot.status.value
+        self.connection.execute(
+            "UPDATE terminal_runs SET backend_revision=?,updated_at=? WHERE id=?",
+            (snapshot.revision, now, run_id),
+        )
         self._record_terminal_status(run, status, digest, tail, since, now)
-        if status != "waiting_user_answer":
+        if status != ExecutionStatus.WAITING_USER_ANSWER.value:
             self.connection.execute(
                 "UPDATE blockers SET state='resolved',resolution='Provider resumed after human answer',updated_at=? "
                 "WHERE terminal_run_id=? AND kind='waiting_user_answer' AND state IN ('open','escalated') "
@@ -1025,16 +1062,16 @@ class Reconciler:
                 "AND ti.state='sent' AND ti.created_at>=blockers.created_at)",
                 (now, run_id, run_id),
             )
-        if status == "waiting_user_answer":
+        if status == ExecutionStatus.WAITING_USER_ANSWER.value:
             self._provider_prompt(run, tail)
-        elif status == "error":
-            self._recover_terminal(run, "provider terminal entered error state")
-        elif status in _COMPLETION_STATUSES:
+        elif status == ExecutionStatus.ERROR.value:
+            self._recover_terminal(run, "provider run entered error state")
+        elif status == ExecutionStatus.COMPLETED.value:
             if await self._completion_has_outcome(run):
                 await self._complete_terminal(run)
             elif datetime.now(UTC) - _parse(str(since)) >= timedelta(seconds=self.config.runtime.worker_grace_seconds):
                 self._missing_outcome(run)
-        elif status == "processing" and datetime.now(UTC) - _parse(str(since)) > timedelta(
+        elif run["digest_since"] and datetime.now(UTC) - _parse(str(run["digest_since"])) > timedelta(
             seconds=self.config.runtime.stall_seconds
         ):
             self._incident("stalled_terminal", "terminal", str(run_id), "Terminal output has not changed")
@@ -1129,192 +1166,148 @@ class Reconciler:
 
     async def _cleanup_terminal(self, run_id: int) -> None:
         async with self._profile_lock:
-            row = self.connection.execute("SELECT * FROM terminal_runs WHERE id=?", (run_id,)).fetchone()
+            row = self.connection.execute(
+                "SELECT tr.*,p.instance_id FROM terminal_runs tr JOIN project p ON p.id=1 WHERE tr.id=?",
+                (run_id,),
+            ).fetchone()
             if row is None or row["token_revoked_at"] is None:
                 return
-            terminal_id = str(row["terminal_id"]) if row["terminal_id"] else None
-            if terminal_id is None and str(row["profile_state"]) != "reserved":
+            handle: RunHandle | None = None
+            if row["backend_run_id"] and row["backend_terminal_id"]:
+                handle = RunHandle(
+                    str(row["execution_name"]),
+                    str(row["backend_run_id"]),
+                    str(row["backend_terminal_id"]),
+                )
+            else:
                 try:
-                    terminals = await asyncio.to_thread(self.client.list_terminals, str(row["session_name"]))
-                except CaoNotFound:
-                    terminals = []
-                except CaoUnavailable as exc:
+                    snapshot = await asyncio.to_thread(self.backend.find_run, str(row["execution_name"]))
+                except ExecutionUnavailable, ExecutionBusy, ExecutionTimeout:
+                    return
+                except ExecutionError as exc:
                     self._incident("terminal_cleanup_failed", "terminal", str(run_id), str(exc))
                     return
-                if len(terminals) != 1:
-                    self._incident(
-                        "terminal_cleanup_failed",
-                        "terminal",
-                        str(run_id),
-                        "CAO session has zero or multiple terminals; exact cleanup is unsafe",
-                    )
+                if snapshot is not None:
+                    if snapshot.cwd != Path(str(row["working_directory"])).resolve():
+                        self._incident(
+                            "terminal_cleanup_failed",
+                            "terminal",
+                            str(run_id),
+                            "backend run cwd changed; cleanup is unsafe",
+                        )
+                        return
+                    handle = snapshot.handle
+                    self._record_backend_handle(run_id, handle, snapshot.revision)
+            if handle is not None:
+                try:
+                    await asyncio.to_thread(self.backend.delete_run, handle)
+                except ExecutionUnavailable, ExecutionBusy, ExecutionTimeout:
                     return
-                value = terminals[0].get("id") or terminals[0].get("terminal_id")
-                if not isinstance(value, str) or not self._terminal_matches(row, terminals[0]):
-                    self._incident("terminal_cleanup_failed", "terminal", str(run_id), "terminal identity changed")
+                except ExecutionError as exc:
+                    self._incident("terminal_cleanup_failed", "terminal", str(run_id), str(exc))
                     return
-                terminal_id = value
-                self._record_terminal_id(run_id, terminal_id)
-            try:
-                await self._delete_session_locked(str(row["session_name"]))
-            except CaoUnavailable as exc:
-                self._incident("terminal_cleanup_failed", "terminal", str(run_id), str(exc))
-                return
-            except Exception as exc:
-                self._incident("terminal_cleanup_failed", "terminal", str(run_id), str(exc))
-                return
-            rows = list(
-                self.connection.execute(
-                    "SELECT kind,path,fragment_key,expected_sha256,expected_json_redacted,secret_fields_json "
-                    "FROM terminal_artifacts "
+            artifacts = [
+                dict(item)
+                for item in self.connection.execute(
+                    "SELECT kind,path,fragment_key,expected_sha256 AS sha256,expected_json_redacted,"
+                    "secret_fields_json FROM terminal_artifacts "
                     "WHERE terminal_run_id=? AND state IN ('staged','installed')",
                     (run_id,),
                 )
-            )
-            runtime_manifest = {
-                (str(item["kind"]), str(item["path"])): item
-                for item in rows
-                if str(item["kind"]).startswith("runtime_")
-            }
-            runtime_paths = list(self._runtime_paths(run_id, terminal_id)) if terminal_id else []
-            for kind, path in runtime_paths:
-                for manifest_kind, manifest_path in runtime_manifest:
-                    if manifest_kind == kind and Path(manifest_path).resolve() != path.resolve():
-                        raise ProfileError(f"runtime artifact path mismatch: {manifest_path}")
-            for kind, path in runtime_manifest:
-                if not any(
-                    kind == expected_kind and Path(path).resolve() == expected_path.resolve()
-                    for expected_kind, expected_path in runtime_paths
-                ):
-                    raise ProfileError(f"runtime artifact has no exact owned path: {path}")
-            project = self.connection.execute("SELECT instance_id FROM project WHERE id=1").fetchone()
-            if project is None:
-                raise ProfileError("Agents project identity is missing")
-            key = bytes.fromhex(read_private_secret(self.config.state_dir / "agent-auth-key"))
-            secret_values = {
-                "AGENTS_AGENT_TOKEN": derive_agent_token(
-                    key, str(project["instance_id"]), run_id, int(row["generation"])
-                )
-            }
-            profile_artifacts = [
-                {
-                    "kind": str(item["kind"]),
-                    "path": str(item["path"]),
-                    "sha256": str(item["expected_sha256"]),
-                    "fragment_key": item["fragment_key"],
-                    "expected_json_redacted": item["expected_json_redacted"],
-                    "secret_fields_json": item["secret_fields_json"],
-                }
-                for item in rows
-                if not str(item["kind"]).startswith("runtime_")
             ]
-            profile = str(row["profile_name"])
-            profile_path = self.config.state_dir / "profiles" / f"{profile}.md"
-            if not profile_artifacts and profile_path.is_file() and not profile_path.is_symlink():
-                profile_artifacts = [{"path": str(profile_path), "sha256": str(row["profile_sha256"])}]
-            cao = self.config.root / ".tools/bin/cao"
+            key = bytes.fromhex(read_private_secret(self.config.state_dir / "agent-auth-key"))
+            token = derive_agent_token(key, str(row["instance_id"]), run_id, int(row["generation"]))
             try:
-                if profile not in {"", "reserved"}:
-                    if cao.is_file():
-                        await asyncio.to_thread(
-                            remove_profile,
-                            cao,
-                            self.config.cao_home,
-                            profile,
-                            profile_path,
-                            profile_artifacts,
-                            self.config.state_dir / "profiles.lock",
-                            secret_values=secret_values,
-                        )
-                    else:
-                        self._discard_profile(
-                            type(
-                                "Profile",
-                                (),
-                                {"path": profile_path, "name": profile, "secret_values": secret_values},
-                            )(),
-                            profile_artifacts,
-                        )
-                for kind, path in runtime_paths:
-                    manifest = next(
-                        (
-                            item
-                            for (manifest_kind, manifest_path), item in runtime_manifest.items()
-                            if manifest_kind == kind and Path(manifest_path).resolve() == path.resolve()
-                        ),
-                        None,
-                    )
-                    if not path.exists():
-                        continue
-                    if manifest is not None:
-                        if not validate_manifest_artifact(
-                            path,
-                            str(manifest["expected_sha256"]),
-                            secret_fields_json=manifest["secret_fields_json"],
-                            secret_values=secret_values,
-                            require_secret_values=True,
-                        ):
-                            raise ProfileError(f"runtime artifact changed: {path}")
-                    elif path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o777 != 0o600:
-                        raise ProfileError(f"unsafe runtime artifact: {path}")
-                    path.unlink()
-                now = utc_now()
-                self.connection.execute("BEGIN IMMEDIATE")
-                try:
-                    self.connection.execute(
-                        "UPDATE actor_leases SET released_at=? WHERE terminal_run_id=? AND released_at IS NULL",
-                        (now, run_id),
-                    )
-                    self.connection.execute(
-                        "UPDATE terminal_artifacts SET state='removed',updated_at=? "
-                        "WHERE terminal_run_id=? AND state IN ('staged','installed')",
-                        (now, run_id),
-                    )
-                    self.connection.execute(
-                        "UPDATE terminal_runs SET state='ended',profile_state='removed',updated_at=? "
-                        "WHERE id=? AND state IN ('retained','ending','failed','ended')",
-                        (now, run_id),
-                    )
-                    self.connection.commit()
-                except BaseException:
-                    self.connection.rollback()
-                    raise
-            except (ProfileError, OSError) as exc:
+                await asyncio.to_thread(
+                    remove_profile,
+                    str(row["profile_name"]),
+                    self.config.state_dir / "profiles" / f"{row['profile_name']}.md",
+                    artifacts,
+                    self.config.state_dir / "profiles.lock",
+                    runtime_dir=self.config.state_dir / "runtime",
+                    secret_values={"AGENTS_AGENT_TOKEN": token},
+                )
+            except (OSError, ProfileError) as exc:
                 self._incident("profile_cleanup_failed", "terminal", str(run_id), str(exc))
+                return
+            now = utc_now()
+            self.connection.execute(
+                "UPDATE terminal_artifacts SET state='removed',updated_at=? "
+                "WHERE terminal_run_id=? AND state IN ('staged','installed')",
+                (now, run_id),
+            )
+            self.connection.execute(
+                "UPDATE actor_leases SET released_at=COALESCE(released_at,?) "
+                "WHERE terminal_run_id=? AND released_at IS NULL",
+                (now, run_id),
+            )
+            self.connection.execute(
+                "UPDATE terminal_runs SET profile_state='removed',state='ended',updated_at=? "
+                "WHERE id=? AND state IN ('retained','ending','failed','ended')",
+                (now, run_id),
+            )
+            self.connection.commit()
 
     async def _wake(self, delivery_id: int) -> None:
         row = self.connection.execute(
-            "SELECT d.attempts,tr.id AS terminal_run_id,tr.terminal_id "
+            "SELECT d.attempts,tr.id AS terminal_run_id,tr.execution_name,tr.backend_run_id,tr.backend_terminal_id "
             "FROM deliveries d "
             "JOIN terminal_runs tr ON tr.state='live' AND tr.token_revoked_at IS NULL "
-            "AND ("
-            "(d.terminal_run_id IS NOT NULL AND tr.id=d.terminal_run_id) "
+            "AND ((d.terminal_run_id IS NOT NULL AND tr.id=d.terminal_run_id) "
             "OR (d.terminal_run_id IS NULL AND tr.actor_slug=d.actor_slug "
-            "AND tr.purpose_kind='persistent' AND tr.purpose_id=d.actor_slug)"
-            ") "
-            "WHERE d.id=?",
+            "AND tr.purpose_kind='persistent' AND tr.purpose_id=d.actor_slug)) WHERE d.id=?",
             (delivery_id,),
         ).fetchone()
-        if row is None:
+        if row is None or not row["backend_run_id"] or not row["backend_terminal_id"]:
             return
         nonce = secrets.token_urlsafe(12)
         body = f"AGENTS_WAKE {delivery_id} {nonce}; call inbox, process messages in ID order, then ack_inbox"
         result = "accepted"
         error = None
-        cao_id = None
+        backend_id = None
+        delay = 300
+        handle = RunHandle(
+            str(row["execution_name"]),
+            str(row["backend_run_id"]),
+            str(row["backend_terminal_id"]),
+        )
         try:
-            cao_id = await asyncio.to_thread(
-                self.client.enqueue_wake, str(row["terminal_id"]), str(row["terminal_id"]), body
+            backend_id = await asyncio.to_thread(
+                self.backend.send_message,
+                handle,
+                str(row["terminal_run_id"]),
+                body,
             )
-            delay = 300
-        except CaoUnavailable as exc:
+        except (ExecutionUnavailable, ExecutionBusy) as exc:
             result = "failed"
             error = str(exc)
             delay = _RETRY[min(int(row["attempts"]), len(_RETRY) - 1)]
+        except ExecutionTimeout as exc:
+            result = "uncertain"
+            error = str(exc)
+            if exc.outcome_unknown:
+                live_run = self.connection.execute(
+                    "SELECT * FROM terminal_runs WHERE id=?",
+                    (row["terminal_run_id"],),
+                ).fetchone()
+                if live_run is not None:
+                    self._recover_terminal(
+                        live_run,
+                        f"wake outcome unknown: {exc}",
+                        terminal_state="ending",
+                        incident_kind="wake_delivery_uncertain",
+                    )
+            else:
+                delay = _RETRY[min(int(row["attempts"]), len(_RETRY) - 1)]
+        except ExecutionError as exc:
+            result = "failed"
+            error = str(exc)
+            self._incident("wake_delivery_failed", "delivery", str(delivery_id), str(exc))
         now = datetime.now(UTC)
         self.connection.execute(
-            "INSERT INTO wake_attempts(delivery_id,terminal_run_id,nonce,cao_message_id,result,error,created_at)VALUES(?,?,?,?,?,?,?)",
-            (delivery_id, row["terminal_run_id"], nonce, cao_id, result, error, utc_now()),
+            "INSERT INTO wake_attempts(delivery_id,terminal_run_id,nonce,backend_message_id,result,error,created_at)"
+            "VALUES(?,?,?,?,?,?,?)",
+            (delivery_id, row["terminal_run_id"], nonce, backend_id, result, error, utc_now()),
         )
         self.connection.execute(
             "UPDATE deliveries SET attempts=attempts+1,next_attempt_at=?,last_error=? WHERE id=?",
@@ -1325,30 +1318,45 @@ class Reconciler:
 
     async def _send_input(self, input_id: int) -> None:
         row = self.connection.execute(
-            "SELECT ti.*,tr.terminal_id FROM terminal_inputs ti JOIN terminal_runs tr ON tr.id=ti.terminal_run_id WHERE ti.id=?",
+            "SELECT ti.*,tr.execution_name,tr.backend_run_id,tr.backend_terminal_id "
+            "FROM terminal_inputs ti JOIN terminal_runs tr ON tr.id=ti.terminal_run_id WHERE ti.id=?",
             (input_id,),
         ).fetchone()
-        if row is None:
+        if row is None or not row["backend_run_id"] or not row["backend_terminal_id"]:
             return
         now = utc_now()
         self.connection.execute(
-            "UPDATE terminal_inputs SET state='sending',updated_at=? WHERE id=? AND state='pending'", (now, input_id)
+            "UPDATE terminal_inputs SET state='sending',updated_at=? WHERE id=? AND state='pending'",
+            (now, input_id),
+        )
+        handle = RunHandle(
+            str(row["execution_name"]),
+            str(row["backend_run_id"]),
+            str(row["backend_terminal_id"]),
         )
         try:
-            success = await asyncio.wait_for(
-                asyncio.to_thread(self.client.send_input, str(row["terminal_id"]), str(row["body"])), timeout=10
+            await asyncio.wait_for(
+                asyncio.to_thread(self.backend.send_input, handle, str(row["body"])),
+                timeout=10,
             )
-            state = "sent" if success else "failed"
-            error = None if success else "CAO rejected input"
+            state = "sent"
+            error = None
+        except (ExecutionUnavailable, ExecutionBusy) as exc:
+            state = "pending"
+            error = str(exc)
         except BaseException as exc:
             state = "uncertain"
             error = str(exc)
         self.connection.execute(
-            "UPDATE terminal_inputs SET state=?,error=?,updated_at=? WHERE id=?", (state, error, utc_now(), input_id)
+            "UPDATE terminal_inputs SET state=?,error=?,updated_at=? WHERE id=?",
+            (state, error, utc_now(), input_id),
         )
         if state == "uncertain":
             self._incident(
-                "terminal_input_uncertain", "terminal_input", str(input_id), "Terminal input outcome is uncertain"
+                "terminal_input_uncertain",
+                "terminal_input",
+                str(input_id),
+                "Terminal input outcome is uncertain",
             )
 
     def _provider_prompt(self, run: sqlite3.Row, tail: str) -> None:
@@ -1490,9 +1498,9 @@ class Reconciler:
     def _missing(self, run: sqlite3.Row) -> None:
         self._recover_terminal(
             run,
-            "Mapped CAO session disappeared",
+            "Mapped backend run disappeared",
             blocker_kind="missing_session",
-            blocker_reason="mapped CAO session disappeared",
+            blocker_reason="mapped backend run disappeared",
             incident_kind="missing_session",
         )
 

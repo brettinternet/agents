@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import shlex
 import shutil
 import sqlite3
@@ -13,10 +14,10 @@ import uvicorn
 
 from . import service
 from .auth import derive_agent_token, read_agent_auth_key
-from .cao_client import CaoClient
-from .config import AgentsConfig, load
+from .config import AgentsConfig, load, resolve_execution_session
 from .db import connect, migrate, utc_now
 from .git_worktree import GitError, branch_sha, git, reserve_execution, validate_project
+from .herdr_client import HerdrClient, herdr_executable, herdr_socket_path
 from .profiles import ensure_secret, validate_manifest_artifact, validate_templates
 from .reconciler import reserve_terminal
 from .store import Store
@@ -48,7 +49,7 @@ def _prepare(config: AgentsConfig) -> None:
 
 
 _PROVIDER_CLI = {
-    "opencode": ("opencode", "run `brew install anomalyco/tap/opencode`"),
+    "opencode": ("opencode", "install OpenCode and ensure `opencode` is on PATH"),
     "claude": ("claude", "install Claude Code and ensure `claude` is on PATH"),
     "mock": ("mock_cli", "ensure `mock_cli` is on PATH"),
 }
@@ -56,9 +57,17 @@ _PROVIDER_CLI = {
 
 def preflight(config: AgentsConfig) -> list[str]:
     errors: list[str] = []
-    executable, action = _PROVIDER_CLI[config.cao.provider]
+    executable, action = _PROVIDER_CLI[config.execution.provider]
     if shutil.which(executable) is None:
-        errors.append(f"CAO provider executable `{executable}` is missing; operator action: {action}")
+        errors.append(f"configured provider executable `{executable}` is missing; operator action: {action}")
+    if config.execution.backend != "herdr":
+        errors.append(f"unsupported execution backend `{config.execution.backend}`")
+    if config.execution.version != "0.8.2":
+        errors.append(f"Herdr version must be 0.8.2, got `{config.execution.version}`")
+    try:
+        herdr_executable()
+    except (OSError, RuntimeError, ValueError) as exc:
+        errors.append(f"Herdr executable is missing; operator action: install Herdr 0.8.2 ({exc})")
     for setting, placeholder in (("user.name", "Your Name"), ("user.email", "you@example.com")):
         try:
             value = git(config.project.path, "config", "--get", setting)
@@ -70,43 +79,56 @@ def preflight(config: AgentsConfig) -> list[str]:
     return errors
 
 
-def _path_shape(path: str) -> tuple[str, ...]:
-    return tuple(
-        "{}"
-        if len(segment) > 2
-        and segment.startswith("{")
-        and segment.endswith("}")
-        and "{" not in segment[1:-1]
-        and "}" not in segment[1:-1]
-        else segment
-        for segment in path.split("/")
+_HERDR_METHODS = {
+    "ping",
+    "session.snapshot",
+    "workspace.create",
+    "workspace.close",
+    "agent.start",
+    "pane.get",
+    "pane.read",
+    "agent.prompt",
+    "pane.send_input",
+    "events.subscribe",
+}
+
+
+def _schema_methods(value: object) -> set[str]:
+    if isinstance(value, str):
+        return {value} if value in _HERDR_METHODS else set()
+    methods: set[str] = set()
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if isinstance(key, str) and key in _HERDR_METHODS:
+                methods.add(key)
+            methods.update(_schema_methods(item))
+    elif isinstance(value, list):
+        for item in value:
+            methods.update(_schema_methods(item))
+    return methods
+
+
+def _missing_herdr_methods(document: Mapping[str, object]) -> list[str]:
+    return sorted(_HERDR_METHODS - _schema_methods(document))
+
+
+def install_integration(config: AgentsConfig) -> None:
+    if config.execution.provider == "mock":
+        return
+    session = resolve_execution_session(config)
+    if not session:
+        raise DoctorError("project identity is missing; initialize Agents before installing Herdr integration")
+    command, environment = service._herdr_command(config, session, "integration", "install", config.execution.provider)
+    result = subprocess.run(
+        command,
+        cwd=config.root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
     )
-
-
-def _missing_openapi_methods(document: Mapping[str, object]) -> list[str]:
-    value = document.get("paths", {})
-    paths = value if isinstance(value, Mapping) else {}
-    required = {
-        "/sessions": {"post"},
-        "/sessions/{session_name}": {"get", "delete"},
-        "/sessions/{session_name}/terminals": {"get"},
-        "/terminals/{terminal_id}": {"get"},
-        "/terminals/{terminal_id}/working-directory": {"get"},
-        "/terminals/{terminal_id}/input": {"post"},
-        "/terminals/{terminal_id}/output": {"get"},
-        "/terminals/{terminal_id}/inbox/messages": {"post"},
-    }
-    missing: list[str] = []
-    for required_path, methods in required.items():
-        available: set[str] = set()
-        shape = _path_shape(required_path)
-        for actual_path, item in paths.items():
-            if isinstance(actual_path, str) and _path_shape(actual_path) == shape and isinstance(item, Mapping):
-                available.update(key for key in item if isinstance(key, str))
-        absent = methods - available
-        if absent:
-            missing.append(f"{required_path} {','.join(sorted(absent))}")
-    return missing
+    if result.returncode:
+        raise DoctorError((result.stderr or result.stdout or "Herdr integration install failed").strip())
 
 
 def doctor(config: AgentsConfig, online: bool = True) -> list[str]:
@@ -125,20 +147,16 @@ def doctor(config: AgentsConfig, online: bool = True) -> list[str]:
         errors.append(f"git prerequisite failed: {exc}")
     if not config.state_dir.is_dir() or config.state_dir.stat().st_mode & 0o077:
         errors.append("unsafe .agents directory")
+    if config.herdr_config.exists() and (
+        config.herdr_config.is_symlink()
+        or not config.herdr_config.is_file()
+        or config.herdr_config.stat().st_mode & 0o077
+    ):
+        errors.append("unsafe Herdr config")
     try:
         validate_templates(config.root)
     except ValueError as exc:
         errors.append(str(exc))
-    cao = config.root / ".tools" / "bin" / "cao"
-    tmux = shutil.which("tmux")
-    if not cao.is_file():
-        errors.append("managed cao executable is missing")
-    else:
-        result = subprocess.run([str(cao), "--version"], capture_output=True, text=True, check=False)
-        if result.returncode or "2.4.1" not in result.stdout + result.stderr:
-            errors.append("CAO version is not 2.4.1")
-    if tmux is None:
-        errors.append("tmux is missing")
     if "workers=1" not in (config.root / "src/agents/web.py").read_text(encoding="utf-8"):
         errors.append("agentsd must run with exactly one Uvicorn worker")
     database = config.state_dir / "agents.db"
@@ -183,23 +201,78 @@ def doctor(config: AgentsConfig, online: bool = True) -> list[str]:
         finally:
             connection.close()
     if online:
-        client = CaoClient(config.cao.api_port)
-        if not client.health():
-            errors.append("CAO health check failed")
+        session = resolve_execution_session(config)
+        if not session:
+            errors.append("project identity is missing; Herdr session is unavailable")
         else:
+            client = HerdrClient(
+                herdr_socket_path(session, env=service._herdr_environment(config)),
+                expected_version=config.execution.version,
+            )
             try:
-                document = client.openapi()
-                missing = _missing_openapi_methods(document)
-                if missing:
-                    errors.append("CAO OpenAPI is missing required methods: " + ", ".join(missing))
-                encoded = str(document)
-                for field in ("session_name", "provider", "working_directory", "env_vars", "terminal_id", "message"):
-                    if field not in encoded:
-                        errors.append(f"CAO OpenAPI is missing required field: {field}")
-            except RuntimeError as exc:
-                errors.append(str(exc))
-        if service.status(config) != {"agentsd": True, "cao": True}:
-            errors.append("owned services are not both running")
+                try:
+                    health = client.health()
+                    if (
+                        not health.healthy
+                        or health.version != config.execution.version
+                        or health.protocol != 20
+                        or not health.supports_events
+                    ):
+                        errors.append(
+                            "Herdr health is incompatible: "
+                            f"version={health.version!r} protocol={health.protocol!r} "
+                            f"supports_events={health.supports_events!r} {health.message}".strip()
+                        )
+                except Exception as exc:
+                    errors.append(f"Herdr health check failed: {exc}")
+            finally:
+                client.close()
+            command, environment = service._herdr_command(config, session, "api", "schema", "--json")
+            schema = subprocess.run(
+                command,
+                cwd=config.root,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if schema.returncode:
+                errors.append((schema.stderr or schema.stdout or "Herdr schema command failed").strip())
+            else:
+                try:
+                    document = json.loads(schema.stdout)
+                except json.JSONDecodeError as exc:
+                    errors.append(f"Herdr schema is not valid JSON: {exc}")
+                else:
+                    if not isinstance(document, Mapping):
+                        errors.append("Herdr schema is not a JSON object")
+                    else:
+                        missing = _missing_herdr_methods(document)
+                        if missing:
+                            errors.append("Herdr schema is missing required methods: " + ", ".join(missing))
+            integration = {"opencode": "opencode", "claude": "claude"}.get(config.execution.provider)
+            if integration is not None:
+                command, environment = service._herdr_command(config, session, "integration", "status")
+                integration_status = subprocess.run(
+                    command,
+                    cwd=config.root,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                expected = f"{integration}: current "
+                if integration_status.returncode or not any(
+                    line.startswith(expected) for line in integration_status.stdout.splitlines()
+                ):
+                    detail = (
+                        integration_status.stderr
+                        or integration_status.stdout
+                        or f"{integration} integration is not installed"
+                    ).strip()
+                    errors.append(f"Herdr provider integration is not current: {detail}")
+        if service.status(config) != {"agentsd": True, "herdr": True}:
+            errors.append(f"owned services are not both running: {service.status(config)}")
     return errors
 
 
@@ -291,11 +364,13 @@ def _seed_development(connection: sqlite3.Connection, config: AgentsConfig) -> N
         raise RuntimeError("Agents project is not initialized")
     terminal = connection.execute(
         "INSERT INTO terminal_runs("
-        "session_name,profile_name,mcp_name,profile_sha256,provider,model,generation,actor_slug,purpose_kind,"
-        "purpose_id,working_directory,token_digest,terminal_id,profile_state,state,status,output_tail,created_at,updated_at"
-        ") VALUES('cao-agents-dev-w-prompt-explorer-1-g0001','agents-dev-r0000000001-g0001',"
+        "execution_name,profile_name,mcp_name,profile_sha256,provider,model,generation,actor_slug,purpose_kind,"
+        "purpose_id,working_directory,token_digest,backend_terminal_id,execution_backend,backend_run_id,agent_auth_id,"
+        "profile_state,state,status,output_tail,created_at,updated_at"
+        ") VALUES('agents-dev-w-prompt-explorer-1-g0001','agents-dev-r0000000001-g0001',"
         "'agents-dev-r0000000001-g0001','demo','mock','',1,'explorer','work',?,?,"
-        "'demo','demo-terminal','installed','live','waiting','Need human answer',?,?)",
+        "'demo','demo-terminal','herdr','agents-dev-w-prompt-explorer-1-g0001',"
+        "'agents-dev-r0000000001-g0001','installed','live','waiting','Need human answer',?,?)",
         (blocked["id"], str(project["canonical_path"]), now, now),
     ).lastrowid
     connection.execute(
@@ -372,7 +447,7 @@ def _seed_development(connection: sqlite3.Connection, config: AgentsConfig) -> N
                 working_directory=worktree,
             )
             connection.execute(
-                "UPDATE terminal_runs SET terminal_id='agents-approval',profile_state='installed',state='live',"
+                "UPDATE terminal_runs SET backend_terminal_id='agents-approval',profile_state='installed',state='live',"
                 "status='idle',updated_at=? WHERE id=?",
                 (now, run["id"]),
             )
@@ -404,8 +479,9 @@ def main(argv: list[str] | None = None) -> None:
         errors = preflight(config)
         if not errors:
             try:
+                install_integration(config)
                 service.start(config)
-            except service.ServiceError as exc:
+            except (DoctorError, service.ServiceError) as exc:
                 errors = [str(exc)]
             else:
                 errors = doctor(config)
@@ -431,10 +507,22 @@ def main(argv: list[str] | None = None) -> None:
         print(config.state_dir / "web-token")
         errors = []
     elif args.command == "sessions":
-        for row in CaoClient(config.cao.api_port).list_sessions():
-            name = str(row.get("name") or row.get("session_name") or "")
-            if name.startswith("cao-agents-"):
-                print(name)
+        session = resolve_execution_session(config)
+        if not session:
+            raise SystemExit("project identity is missing; initialize Agents before listing sessions")
+        client = HerdrClient(
+            herdr_socket_path(session, env=service._herdr_environment(config)),
+            expected_version=config.execution.version,
+        )
+        try:
+            snapshot = client.request("session.snapshot", {})
+            prefix = f"{session}-"
+            for workspace in service._workspaces(snapshot):
+                name = service._workspace_label(workspace)
+                if name.startswith(prefix):
+                    print(name)
+        finally:
+            client.close()
         errors = []
     elif args.command == "shutdown":
         service.shutdown(config)

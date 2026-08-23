@@ -111,9 +111,9 @@ def _human_mutation(
 def _agent(
     request: Request,
     authorization: Annotated[str | None, Header()] = None,
-    terminal_id: Annotated[str | None, Header(alias="X-CAO-Terminal-ID")] = None,
+    execution_id: Annotated[str | None, Header(alias="X-Agents-Execution-ID")] = None,
 ) -> AgentContext:
-    if not authorization or not authorization.startswith("Bearer ") or not terminal_id:
+    if not authorization or not authorization.startswith("Bearer ") or not execution_id:
         raise HTTPException(401, detail=error("unauthenticated", "agent credentials required"))
     connection: sqlite3.Connection = request.app.state.connection
     project = connection.execute("SELECT instance_id FROM project WHERE id=1").fetchone()
@@ -123,7 +123,7 @@ def _agent(
             key = read_agent_auth_key(request.app.state.config.state_dir / "agent-auth-key")
         return authenticate_agent(
             connection,
-            terminal_id,
+            execution_id,
             authorization.removeprefix("Bearer "),
             key,
             str(project[0]),

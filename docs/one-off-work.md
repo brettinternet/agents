@@ -1,9 +1,9 @@
 # One-off work
 
 Use the dashboard at `http://127.0.0.1:9890` to give agents one-off work. Run
-`task server:status` if the roster does not show live agents. Do not send raw
-input to CAO terminals; dashboard messages are durable and use the normal inbox,
-wake, and acknowledgement flow.
+`task server:status` if the roster does not show live agents. Dashboard messages
+are durable and use the normal inbox, wake, and acknowledgement flow over the
+owned Herdr workspace.
 
 ## Choose the delivery path
 
@@ -79,3 +79,19 @@ belongs to an ongoing conversation:
 
 Prefer a direct message when one actor owns the task. Prefer **New request** when
 the result must be tracked or committed.
+
+## Herdr session lifecycle
+
+Agents owns one local Herdr session named `agents-{project.instance_id}` and a
+mode-0600 Unix socket under Herdr's session directory. `task server:start`
+starts or reuses that session and starts `agentsd`; readiness is a socket `ping`
+plus the Agents health endpoint. `task server:stop` intentionally stops only
+`agentsd`, so live Herdr panes and provider processes remain available for a
+later `task server:start`.
+
+Use `task shutdown` for a destructive cleanup. It fences active runs and
+revokes their tokens, closes only workspaces with the exact project prefix,
+removes manifest-owned provider artifacts, stops the owned Herdr process, and
+deletes the now-empty named session. A full Herdr restart loses provider
+processes; Agents detects that loss and creates a new generation instead of
+resuming an old token.

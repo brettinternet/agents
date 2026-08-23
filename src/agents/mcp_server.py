@@ -16,10 +16,10 @@ mcp = FastMCP("Agents")
 
 def _headers() -> dict[str, str]:
     token = os.environ.get("AGENTS_AGENT_TOKEN", "")
-    terminal = os.environ.get("CAO_TERMINAL_ID", "")
-    if not token or not terminal:
+    execution_id = os.environ.get("AGENTS_EXECUTION_ID", "")
+    if not token or not execution_id:
         raise RuntimeError("Agents agent environment is incomplete")
-    return {"Authorization": f"Bearer {token}", "X-CAO-Terminal-ID": terminal}
+    return {"Authorization": f"Bearer {token}", "X-Agents-Execution-ID": execution_id}
 
 
 def _request(method: str, path: str, body: dict[str, Any] | None = None) -> Any:

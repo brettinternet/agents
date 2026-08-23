@@ -351,10 +351,27 @@ def _seed_development(connection: sqlite3.Connection, config: AgentsConfig) -> N
         ") VALUES(?,?,?,?,?,'open','manager',?,?)",
         (
             accepted["id"],
-            "Integration order",
-            "Which item lands first?",
-            '["Active","Accepted"]',
-            "Accepted",
+            "Publishing identity",
+            "Which public identity should publish this work?",
+            json.dumps(
+                [
+                    {
+                        "label": "Use a project-branded handle.",
+                        "input": {
+                            "label": "Exact public handle and model label",
+                            "placeholder": "@project — Model",
+                        },
+                    },
+                    {
+                        "label": "Use another identity.",
+                        "input": {
+                            "label": "Exact public handle and model label",
+                            "placeholder": "@identity — Model",
+                        },
+                    },
+                ]
+            ),
+            "Use a project-branded handle.",
             now,
             now,
         ),

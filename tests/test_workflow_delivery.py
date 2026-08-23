@@ -497,6 +497,62 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(decision["state"], "open")
 
+    def test_decision_options_support_required_custom_input_metadata(self):
+        decision = self.delivery.propose_decision(
+            "manager",
+            item_id=None,
+            title="Choose identity",
+            question="Which identity?",
+            options=[
+                "Use the default identity",
+                {
+                    "label": "Use another identity",
+                    "input": {
+                        "label": "Exact public handle and model label",
+                        "placeholder": "@handle — Model",
+                    },
+                },
+            ],
+            recommendation="Use the default identity",
+        )
+        row = self.connection.execute("SELECT options_json FROM decisions WHERE id=?", (decision["id"],)).fetchone()
+        self.assertEqual(
+            json.loads(row["options_json"]),
+            [
+                "Use the default identity",
+                {
+                    "label": "Use another identity",
+                    "input": {
+                        "label": "Exact public handle and model label",
+                        "placeholder": "@handle — Model",
+                    },
+                },
+            ],
+        )
+        selected_resolution = "Use another identity\n@example — Example Model"
+        self.delivery.resolve_decision(decision["id"], None, None, selected_resolution)
+        resolution = self.connection.execute(
+            "SELECT resolution FROM decisions WHERE id=?", (decision["id"],)
+        ).fetchone()
+        self.assertEqual(resolution["resolution"], selected_resolution)
+
+    def test_decision_options_reject_invalid_custom_input_metadata(self):
+        invalid_options = (
+            ["A", {"label": "Other", "input": {}}],
+            ["A", {"label": "A", "input": {"label": "Details"}}],
+            ["A", {"label": "Other", "input": {"label": "Details"}, "unexpected": True}],
+        )
+        for options in invalid_options:
+            with self.subTest(options=options), self.assertRaises(DomainError):
+                self.delivery.propose_decision(
+                    "manager",
+                    item_id=None,
+                    title="Choose",
+                    question="Which?",
+                    options=cast(Any, options),
+                    recommendation="A",
+                )
+
     def test_dispatch_failure_releases_capacity_and_removes_git_artifacts(self):
         item, _ = self.ready_item()
         from agents.git_worktree import reserve_execution as real_reserve

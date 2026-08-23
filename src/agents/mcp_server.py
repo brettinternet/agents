@@ -11,6 +11,8 @@ from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlsplit
 import httpx
 from fastmcp import FastMCP
 
+from .delivery import DecisionOption
+
 mcp = FastMCP("Agents")
 
 
@@ -399,7 +401,7 @@ def propose_decision(
     request_id: str,
     title: str,
     question: str,
-    options: list[str],
+    options: list[DecisionOption],
     recommendation: str,
     item_id: str | None = None,
     expected_version: int | None = None,

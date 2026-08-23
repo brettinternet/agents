@@ -518,17 +518,41 @@ function openDecision(row) {
   $("decision-recommendation").textContent = `Recommendation: ${row.recommendation}`;
   const options = $("decision-options");
   options.querySelectorAll(".decision-option").forEach((option) => option.remove());
-  for (const [index, value] of JSON.parse(row.options_json).entries()) {
-    const label = text("label", "", "decision-option"),
+  const syncInputs = () => {
+    for (const input of options.querySelectorAll("[data-decision-input]")) {
+      const selected = document.getElementById(input.dataset.radio).checked;
+      input.hidden = !selected;
+      input.disabled = !selected;
+      input.required = selected;
+    }
+  };
+  for (const [index, option] of JSON.parse(row.options_json).entries()) {
+    const definition = typeof option === "string" ? { label: option } : option,
+      label = text("label", "", "decision-option"),
       input = document.createElement("input");
     input.type = "radio";
+    input.id = `decision-option-${index}`;
     input.name = "resolution";
-    input.value = value;
+    input.value = definition.label;
     input.required = true;
     input.checked = index === 0;
-    label.append(input, text("span", value));
+    input.addEventListener("change", syncInputs);
+    label.append(input, text("span", definition.label));
+    if (definition.input) {
+      const customInput = document.createElement("textarea");
+      customInput.id = `decision-resolution-${index}`;
+      customInput.dataset.decisionInput = "";
+      customInput.dataset.radio = input.id;
+      customInput.setAttribute("aria-label", definition.input.label);
+      customInput.placeholder = definition.input.placeholder || "";
+      customInput.rows = 2;
+      customInput.addEventListener("input", () => customInput.setCustomValidity(""));
+      input.dataset.customInput = customInput.id;
+      label.append(text("span", definition.input.label, "decision-input-label"), customInput);
+    }
     options.append(label);
   }
+  syncInputs();
   $("decision-dialog").showModal();
 }
 function openIncidents() {
@@ -683,11 +707,22 @@ $("decision-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget,
     id = form.elements.decision_id.value,
-    item = form.elements.item_id.value;
+    item = form.elements.item_id.value,
+    selected = form.querySelector('input[name="resolution"]:checked'),
+    customInput = selected.dataset.customInput
+      ? document.getElementById(selected.dataset.customInput)
+      : null;
+  const customValue = customInput?.value.trim();
+  if (customInput && !customValue) {
+    customInput.setCustomValidity("Enter a value.");
+    customInput.reportValidity();
+    return;
+  }
+  if (customInput) customInput.setCustomValidity("");
   const body = {
     item_id: item || null,
     expected_version: item ? Number(form.elements.expected_version.value) : null,
-    resolution: form.elements.resolution.value,
+    resolution: customInput ? `${selected.value}\n${customValue}` : selected.value,
   };
   try {
     await api(`/api/v1/decisions/${id}/resolve`, { method: "POST", body, intent: true });

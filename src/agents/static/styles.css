@@ -378,6 +378,14 @@ dialog {
   width: auto;
   margin: 0.15rem 0 0;
 }
+.decision-input-label,
+.decision-option textarea {
+  grid-column: 2;
+}
+.decision-input-label {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
 dialog::backdrop {
   background: #17203388;
 }

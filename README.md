@@ -129,14 +129,14 @@ An agent actor can override the global choice or pool:
 
 ```toml
 [[actors]]
-slug = "elder"
+slug = "manager"
 kind = "agent"
 models = [
   { id = "openai/gpt-5", effort = "high" },
 ]
 
 [[actors]]
-slug = "explorer"
+slug = "researcher"
 kind = "agent"
 models = [
   { id = "openai/gpt-5-mini", effort = "medium" },

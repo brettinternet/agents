@@ -139,8 +139,8 @@ class ServiceTests(unittest.TestCase):
                         "type": "session_snapshot",
                         "snapshot": {
                             "workspaces": [
-                                {"workspace_id": "w1", "label": "agents-test-p-elder-g0001"},
-                                {"workspace_id": "foreign", "label": "other-project-p-elder"},
+                                {"workspace_id": "w1", "label": "agents-test-p-manager-g0001"},
+                                {"workspace_id": "foreign", "label": "other-project-p-manager"},
                             ],
                             "panes": [
                                 {"workspace_id": "w1", "cwd": "/tmp/project"},

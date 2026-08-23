@@ -41,26 +41,35 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
             {"slug": "human", "kind": "human", "persistent": True, "capacity": 1},
             {"slug": "system", "kind": "system", "persistent": True, "capacity": 1},
             {
-                "slug": "elder",
+                "slug": "manager",
                 "kind": "agent",
                 "reports_to": "human",
-                "profile_template": "elder",
+                "profile_template": "manager",
                 "persistent": True,
                 "capacity": 1,
             },
             {
-                "slug": "explorer",
+                "slug": "researcher",
                 "kind": "agent",
-                "reports_to": "elder",
-                "profile_template": "explorer",
+                "reports_to": "manager",
+                "profile_template": "researcher",
                 "specialty": "research",
+                "persistent": True,
+                "capacity": 3,
+            },
+            {
+                "slug": "executor",
+                "kind": "agent",
+                "reports_to": "manager",
+                "profile_template": "executor",
+                "specialty": "implementation",
                 "persistent": True,
                 "capacity": 3,
             },
             {
                 "slug": "writer",
                 "kind": "agent",
-                "reports_to": "elder",
+                "reports_to": "manager",
                 "profile_template": "writer",
                 "specialty": "publishing",
                 "persistent": True,
@@ -84,14 +93,19 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.connection.close()
         self.temp.cleanup()
 
-    def ready_item(self, gates: list[str] | None = None):
+    def ready_item(
+        self,
+        gates: list[str] | None = None,
+        specialty: str = "publishing",
+        responder: str = "writer",
+    ):
         created = self.workflow.create_work(
             "create", "human", parent_id=None, kind="story", title="Story", problem="P", outcome="O"
         )
-        started = self.workflow.start_refinement("start", "elder", created["id"], created["version"])
+        started = self.workflow.start_refinement("start", "manager", created["id"], created["version"])
         refined = self.workflow.refine(
             "refine",
-            "elder",
+            "manager",
             created["id"],
             started["version"],
             kind="story",
@@ -99,27 +113,37 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
             problem="P",
             outcome="O",
             priority="normal",
-            specialty="publishing",
+            specialty=specialty,
             criteria=["works"],
             dependencies=[],
             gates=gates or [],
         )
-        consult = self.delivery.request_consultation("elder", created["id"], refined["version"], "publishing", "review")
+        consult = self.delivery.request_consultation("manager", created["id"], refined["version"], specialty, "review")
         self.connection.execute(
-            "UPDATE consultations SET state='completed',responder='writer',response='good',updated_at=? WHERE id=?",
-            (utc_now(), consult["id"]),
+            "UPDATE consultations SET state='completed',responder=?,response='good',updated_at=? WHERE id=?",
+            (responder, utc_now(), consult["id"]),
         )
-        ready = self.workflow.mark_ready("ready", "elder", created["id"], refined["version"])
+        ready = self.workflow.mark_ready("ready", "manager", created["id"], refined["version"])
         return created["id"], ready["version"]
+
+    def test_implementation_work_dispatches_to_executor(self):
+        item, _ = self.ready_item(specialty="implementation", responder="executor")
+        dispatch = cast(dict[str, Any], self.delivery.dispatch_next())
+        assignment = self.connection.execute(
+            "SELECT actor_slug FROM assignments WHERE work_id=? AND state='open'",
+            (item,),
+        ).fetchone()
+        self.assertEqual(dispatch["actor"], "executor")
+        self.assertEqual(assignment["actor_slug"], "executor")
 
     def test_consultation_assignment_delivery_targets_reserved_terminal(self):
         created = self.workflow.create_work(
             "consult-create", "human", parent_id=None, kind="story", title="Consult", problem="P", outcome="O"
         )
-        started = self.workflow.start_refinement("consult-start", "elder", created["id"], created["version"])
+        started = self.workflow.start_refinement("consult-start", "manager", created["id"], created["version"])
         refined = self.workflow.refine(
             "consult-refine",
-            "elder",
+            "manager",
             created["id"],
             started["version"],
             kind="story",
@@ -133,7 +157,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
             gates=[],
         )
         consultation = self.delivery.request_consultation(
-            "elder", created["id"], refined["version"], "publishing", "review"
+            "manager", created["id"], refined["version"], "publishing", "review"
         )
         persistent = reserve_terminal(
             self.connection,
@@ -273,7 +297,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.connection.execute("UPDATE submissions SET state='accepted',updated_at=? WHERE id=?", (old, submission_id))
         self.connection.execute(
             "INSERT INTO reviews(submission_id,gate,actor_slug,worktree_path,verdict,created_at,updated_at) "
-            "VALUES(?,'research','explorer',?,'pass',?,?)",
+            "VALUES(?,'research','researcher',?,'pass',?,?)",
             (submission_id, str(reviewtree), old, old),
         )
         Reconciler(self.config, self.connection)._cleanup_expired()
@@ -314,15 +338,15 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         review_delivery = self.connection.execute(
             "SELECT d.actor_slug,d.terminal_run_id,d.state FROM deliveries d "
             "JOIN messages m ON m.id=d.message_id WHERE m.body=?",
-            ("RESEARCH review assigned to @explorer.",),
+            ("RESEARCH review assigned to @researcher.",),
         ).fetchone()
         self.assertIsNotNone(review_delivery)
         self.assertEqual(
             (review_delivery["actor_slug"], review_delivery["terminal_run_id"], review_delivery["state"]),
-            ("explorer", research_review["terminal_run_id"], "pending"),
+            ("researcher", research_review["terminal_run_id"], "pending"),
         )
         reviewed = self.delivery.submit_review(
-            "explorer",
+            "researcher",
             item,
             submission["submission_id"],
             submission["version"],
@@ -403,7 +427,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         )
 
         reviewed = self.delivery.submit_review(
-            "explorer",
+            "researcher",
             item,
             submission["submission_id"],
             submission["version"],
@@ -469,7 +493,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
                 "writer", item, version + 1, dispatch["base_sha"], "bad", dispatch["terminal_run_id"]
             )
         decision = self.delivery.propose_decision(
-            "elder", item_id=item, title="Choose", question="Which?", options=["A", "B"], recommendation="A"
+            "manager", item_id=item, title="Choose", question="Which?", options=["A", "B"], recommendation="A"
         )
         self.assertEqual(decision["state"], "open")
 

@@ -39,19 +39,27 @@ class DatabaseTests(unittest.TestCase):
             (
                 {"slug": "human", "kind": "human", "persistent": True, "capacity": 1},
                 {"slug": "system", "kind": "system", "persistent": True, "capacity": 1},
-                {"slug": "elder", "kind": "agent", "reports_to": "human", "persistent": True, "capacity": 1},
+                {"slug": "manager", "kind": "agent", "reports_to": "human", "persistent": True, "capacity": 1},
                 {
-                    "slug": "explorer",
+                    "slug": "researcher",
                     "kind": "agent",
-                    "reports_to": "elder",
+                    "reports_to": "manager",
                     "specialty": "research",
+                    "persistent": True,
+                    "capacity": 3,
+                },
+                {
+                    "slug": "executor",
+                    "kind": "agent",
+                    "reports_to": "manager",
+                    "specialty": "implementation",
                     "persistent": True,
                     "capacity": 3,
                 },
                 {
                     "slug": "writer",
                     "kind": "agent",
-                    "reports_to": "elder",
+                    "reports_to": "manager",
                     "specialty": "publishing",
                     "persistent": True,
                     "capacity": 1,
@@ -96,7 +104,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.connection.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
         self.assertEqual(
             [row[0] for row in self.connection.execute("SELECT version FROM schema_migrations ORDER BY version")],
-            [1, 2, 3, 4, 5, 6, 7, 8, 9],
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
         )
         terminal_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(terminal_runs)")}
         self.assertTrue(
@@ -159,6 +167,53 @@ class DatabaseTests(unittest.TestCase):
             [row[0] for row in other.execute("SELECT version FROM schema_migrations ORDER BY version")],
             [1, 2, 3, 4],
         )
+        other.close()
+
+    def test_role_migration_renames_actors_and_accepts_implementation_work(self) -> None:
+        migrations = self.root / "role-upgrade-migrations"
+        migrations.mkdir()
+        source = Path(__file__).parents[1] / "src/agents/migrations"
+        for path in sorted(source.glob("*.sql")):
+            if int(path.name[:3]) <= 9:
+                shutil.copy(path, migrations / path.name)
+        other = connect(self.root / "role-upgrade.db")
+        migrate(other, migrations)
+        now = utc_now()
+        actors = (
+            ("human", "human", None, None, None),
+            ("system", "system", None, None, None),
+            ("elder", "agent", "human", "elder", None),
+            ("explorer", "agent", "elder", "explorer", "research"),
+            ("writer", "agent", "elder", "writer", "publishing"),
+        )
+        other.executemany(
+            "INSERT INTO actors(slug,kind,reports_to,profile_template,specialty,persistent,capacity,created_at,updated_at)"
+            " VALUES(?,?,?,?,?,1,1,?,?)",
+            ((*actor, now, now) for actor in actors),
+        )
+        other.execute(
+            "INSERT INTO work_items(id,seq,kind,title,problem,outcome,status,priority,specialty,created_at,updated_at)"
+            " VALUES('AGENT-0001',1,'task','Existing','Problem','Outcome','refining','normal','research',?,?)",
+            (now, now),
+        )
+        shutil.copy(source / "010_roles_and_implementation.sql", migrations / "010_roles_and_implementation.sql")
+        migrate(other, migrations)
+        self.assertEqual(
+            [
+                tuple(row)
+                for row in other.execute("SELECT slug,reports_to FROM actors WHERE kind='agent' ORDER BY slug")
+            ],
+            [("manager", "human"), ("researcher", "manager"), ("writer", "manager")],
+        )
+        other.execute("UPDATE work_items SET specialty='implementation' WHERE id='AGENT-0001'")
+        other.execute(
+            "INSERT INTO consultations(work_id,specialty,question,requester,state,created_at,updated_at)"
+            " VALUES('AGENT-0001','implementation','How?','manager','queued',?,?)",
+            (now, now),
+        )
+        other.execute("INSERT INTO review_requirements(work_id,gate) VALUES('AGENT-0001','implementation')")
+        self.assertEqual(other.execute("PRAGMA foreign_key_check").fetchall(), [])
+        self.assertEqual(other.execute("PRAGMA foreign_keys").fetchone()[0], 1)
         other.close()
 
     def test_execution_backend_migration_backfills_historical_identity(self) -> None:

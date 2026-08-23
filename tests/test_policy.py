@@ -14,17 +14,17 @@ from agents.workflow import Workflow
 
 class PolicyTests(unittest.TestCase):
     def test_authority_matrix_rejects_impersonation(self) -> None:
-        authorize_transition("elder", "intake", "refining")
+        authorize_transition("manager", "intake", "refining")
         authorize_transition("system:dispatcher", "ready", "in_progress")
-        authorize_transition("explorer", "in_progress", "verifying", assigned_actor="explorer")
+        authorize_transition("researcher", "in_progress", "verifying", assigned_actor="researcher")
         authorize_transition("human", "awaiting_approval", "accepted")
         authorize_transition("system:reconciler", "accepted", "delivered")
         with self.assertRaises(DomainError):
-            authorize_transition("elder", "awaiting_approval", "accepted")
+            authorize_transition("manager", "awaiting_approval", "accepted")
         with self.assertRaises(DomainError):
-            authorize_transition("writer", "in_progress", "verifying", assigned_actor="explorer")
+            authorize_transition("writer", "in_progress", "verifying", assigned_actor="researcher")
         with self.assertRaises(DomainError):
-            authorize_reopen("elder", "in_progress", True)
+            authorize_reopen("manager", "in_progress", True)
 
     def test_scope_bounds_and_mandatory_values(self) -> None:
         validate_scope(
@@ -90,7 +90,7 @@ class WorkflowTests(unittest.TestCase):
                 {"slug": "human", "kind": "human", "persistent": True, "capacity": 1},
                 {"slug": "system", "kind": "system", "persistent": True, "capacity": 1},
                 {
-                    "slug": "elder",
+                    "slug": "manager",
                     "kind": "agent",
                     "reports_to": "human",
                     "specialty": "",
@@ -98,9 +98,9 @@ class WorkflowTests(unittest.TestCase):
                     "capacity": 1,
                 },
                 {
-                    "slug": "explorer",
+                    "slug": "researcher",
                     "kind": "agent",
-                    "reports_to": "elder",
+                    "reports_to": "manager",
                     "specialty": "research",
                     "persistent": True,
                     "capacity": 1,
@@ -108,7 +108,7 @@ class WorkflowTests(unittest.TestCase):
                 {
                     "slug": "writer",
                     "kind": "agent",
-                    "reports_to": "elder",
+                    "reports_to": "manager",
                     "specialty": "publishing",
                     "persistent": True,
                     "capacity": 1,
@@ -124,9 +124,9 @@ class WorkflowTests(unittest.TestCase):
 
     def _create_refining(self, request: str, title: str) -> tuple[str, int]:
         created = self.workflow.create_work(
-            request, "elder", parent_id=None, kind="story", title=title, problem="Problem", outcome="Outcome"
+            request, "manager", parent_id=None, kind="story", title=title, problem="Problem", outcome="Outcome"
         )
-        started = self.workflow.start_refinement(request + "-start", "elder", created["id"], created["version"])
+        started = self.workflow.start_refinement(request + "-start", "manager", created["id"], created["version"])
         return created["id"], started["version"]
 
     def test_work_ids_versions_replay_and_events_are_atomic(self) -> None:
@@ -149,7 +149,7 @@ class WorkflowTests(unittest.TestCase):
         item_id, version = self._create_refining("ready", "Ready")
         refined = self.workflow.refine(
             "ready-refine",
-            "elder",
+            "manager",
             item_id,
             version,
             kind="story",
@@ -163,13 +163,13 @@ class WorkflowTests(unittest.TestCase):
             gates=["coordination"],
         )
         with self.assertRaises(DomainError):
-            self.workflow.mark_ready("ready-early", "elder", item_id, refined["version"])
+            self.workflow.mark_ready("ready-early", "manager", item_id, refined["version"])
         now = utc_now()
         self.connection.execute(
             "INSERT INTO consultations(work_id,specialty,question,requester,state,response,version,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
-            (item_id, "research", "Review", "elder", "completed", "Looks good", 1, now, now),
+            (item_id, "research", "Review", "manager", "completed", "Looks good", 1, now, now),
         )
-        ready = self.workflow.mark_ready("ready-final", "elder", item_id, refined["version"])
+        ready = self.workflow.mark_ready("ready-final", "manager", item_id, refined["version"])
         self.assertEqual(ready["status"], "ready")
         self.assertEqual(
             {
@@ -181,7 +181,7 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaises(DomainError):
             self.workflow.refine(
                 "ready-change",
-                "elder",
+                "manager",
                 item_id,
                 ready["version"],
                 kind="story",
@@ -200,7 +200,7 @@ class WorkflowTests(unittest.TestCase):
         second, second_version = self._create_refining("b", "B")
         self.workflow.refine(
             "a-refine",
-            "elder",
+            "manager",
             first,
             first_version,
             kind="story",
@@ -216,7 +216,7 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaises(DomainError):
             self.workflow.refine(
                 "b-refine",
-                "elder",
+                "manager",
                 second,
                 second_version,
                 kind="story",

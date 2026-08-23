@@ -42,7 +42,7 @@ class SchedulerTests(unittest.TestCase):
                 {"slug": "human", "kind": "human", "persistent": True, "capacity": 1},
                 {"slug": "system", "kind": "system", "persistent": True, "capacity": 1},
                 {
-                    "slug": "explorer",
+                    "slug": "researcher",
                     "kind": "agent",
                     "persistent": True,
                     "specialty": "research",
@@ -61,7 +61,7 @@ class SchedulerTests(unittest.TestCase):
             slug="daily-scout",
             cron="0 9 * * *",
             timezone="UTC",
-            to="@explorer",
+            to="@researcher",
             message="Explore and commit a public-safe memory.",
         )
         scheduler = Scheduler(replace(self.config, schedules=(schedule,)), self.connection)
@@ -85,7 +85,7 @@ class SchedulerTests(unittest.TestCase):
             slug="hourly-scout",
             every_seconds=3600,
             timezone="UTC",
-            to="@explorer",
+            to="@researcher",
             message="Check for meaningful changes.",
         )
         scheduler = Scheduler(replace(self.config, schedules=(schedule,)), self.connection)

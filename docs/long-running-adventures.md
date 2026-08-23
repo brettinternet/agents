@@ -101,7 +101,7 @@ joined_at
 
 A handle identifies one participant within an adventure, such as `scout-1`, `skeptic`, or `chronicler`. `actor_slug` selects the existing actor profile and capacity policy.
 
-This distinction matters when several simultaneous participants use the `explorer` actor. Current messages record and address the actor slug; without a participant handle, parallel explorers appear to be the same speaker and cannot be targeted independently within a shared adventure.
+This distinction matters when several simultaneous participants use the `researcher` actor. Current messages record and address the actor slug; without a participant handle, parallel researchers appear to be the same speaker and cannot be targeted independently within a shared adventure.
 
 Persist both participant handle and actor slug on adventure messages and turns. Actor slug remains the authorization and runtime identity; participant handle is the adventure-local social identity.
 
@@ -346,10 +346,10 @@ The dashboard is a projection of durable adventure, work, message, and event sta
 
 **Participants:**
 
-- `captain` using the elder profile: chooses direction and stopping point.
-- `scout-1` using the explorer profile: searches for novel projects.
-- `scout-2` using the explorer profile: searches for deployed workflows.
-- `skeptic` using the explorer profile: challenges the strongest prior finding.
+- `captain` using the manager profile: chooses direction and stopping point.
+- `scout-1` using the researcher profile: searches for novel projects.
+- `scout-2` using the researcher profile: searches for deployed workflows.
+- `skeptic` using the researcher profile: challenges the strongest prior finding.
 - `chronicler` using the writer profile: produces internal round digests.
 
 **Rules:**

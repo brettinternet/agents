@@ -10,7 +10,7 @@ from .policy import DomainError, validate_page, validate_text
 
 MENTION = re.compile(r"(?<![A-Za-z0-9_.-])@([a-z0-9-]+)")
 CHANNELS = ("#general", "#findings", "#publishing", "#coordination", "#incidents")
-WORK_MEMBERS = ("human", "elder", "explorer", "writer")
+WORK_MEMBERS = ("human", "manager", "researcher", "executor", "writer")
 
 
 def seed_conversations(connection: sqlite3.Connection) -> None:
@@ -22,18 +22,18 @@ def seed_conversations(connection: sqlite3.Connection) -> None:
         )
     actors = {str(row[0]) for row in connection.execute("SELECT slug FROM actors")}
     channel_members = {
-        "#general": {"human", "system", "elder", "explorer", "writer"},
-        "#findings": {"human", "system", "elder", "explorer"},
-        "#publishing": {"human", "system", "elder", "writer"},
-        "#coordination": {"human", "system", "elder"},
-        "#incidents": {"human", "system", "elder"},
+        "#general": {"human", "system", "manager", "researcher", "executor", "writer"},
+        "#findings": {"human", "system", "manager", "researcher"},
+        "#publishing": {"human", "system", "manager", "writer"},
+        "#coordination": {"human", "system", "manager"},
+        "#incidents": {"human", "system", "manager"},
     }
     channel_notifications = {
-        "#general": {"elder", "explorer", "writer"},
-        "#findings": {"elder", "explorer"},
-        "#publishing": {"elder", "writer"},
-        "#coordination": {"elder"},
-        "#incidents": {"elder"},
+        "#general": {"manager", "researcher", "executor", "writer"},
+        "#findings": {"manager", "researcher"},
+        "#publishing": {"manager", "writer"},
+        "#coordination": {"manager"},
+        "#incidents": {"manager"},
     }
     for address in CHANNELS:
         cid = connection.execute("SELECT id FROM conversations WHERE address=?", (address,)).fetchone()[0]

@@ -88,7 +88,7 @@ models=[
     def test_actor_model_choices_override_global_choices(self) -> None:
         configured = CONFIG.replace("provider='mock'", "provider='opencode'\nmodel='openai/gpt-5-mini'").replace(
             "slug='human'",
-            """slug='elder'
+            """slug='manager'
 kind='agent'
 models=[
   {id='openai/gpt-5', effort='high'},
@@ -100,19 +100,19 @@ models=[
             path.write_text(configured)
             config = load(path, {})
             self.assertEqual(
-                [(choice.id, choice.effort) for choice in config.models_for("elder")],
+                [(choice.id, choice.effort) for choice in config.models_for("manager")],
                 [("openai/gpt-5", "high"), ("anthropic/claude-sonnet-4-6", "")],
             )
             self.assertEqual(config.models_for("unknown")[0].id, "openai/gpt-5-mini")
 
     def test_environment_model_overrides_actor_choices(self) -> None:
-        configured = CONFIG.replace("slug='human'", "slug='elder'\nkind='agent'\nmodels=[{id='actor/model'}]")
+        configured = CONFIG.replace("slug='human'", "slug='manager'\nkind='agent'\nmodels=[{id='actor/model'}]")
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "agents.toml"
             path.write_text(configured)
             config = load(path, {"AGENTS_MODEL": "override/model"})
-            self.assertEqual(config.models_for("elder"), config.execution.models)
-            self.assertEqual(config.models_for("elder")[0].id, "override/model")
+            self.assertEqual(config.models_for("manager"), config.execution.models)
+            self.assertEqual(config.models_for("manager")[0].id, "override/model")
 
     def test_rejects_actor_choices_for_non_agents(self) -> None:
         configured = CONFIG.replace("slug='human'", "slug='human'\nmodels=[{id='mock/model'}]")
@@ -123,11 +123,11 @@ models=[
                 load(path, {})
 
     def test_rejects_invalid_actor_model_pool(self) -> None:
-        configured = CONFIG.replace("slug='human'", "slug='elder'\nkind='agent'\nmodels=[]")
+        configured = CONFIG.replace("slug='human'", "slug='manager'\nkind='agent'\nmodels=[]")
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "agents.toml"
             path.write_text(configured)
-            with self.assertRaisesRegex(ConfigError, "actor elder.models must be a nonempty"):
+            with self.assertRaisesRegex(ConfigError, "actor manager.models must be a nonempty"):
                 load(path, {})
 
     def test_environment_model_and_effort_override_toml_choices(self) -> None:
@@ -209,14 +209,14 @@ models=[
     def test_loads_cron_and_interval_schedules(self) -> None:
         configured = CONFIG.replace(
             "slug='human'",
-            """slug='explorer'
+            """slug='researcher'
 kind='agent'
 persistent=true
 [[schedules]]
 slug='daily-scout'
 cron='0 9 * * *'
 timezone='America/Los_Angeles'
-to='@explorer'
+to='@researcher'
 message='Explore and commit a public-safe memory.'
 [[schedules]]
 slug='hourly-scout'
@@ -241,17 +241,17 @@ outcome='Commit a dated public-safe memory with sources and recommendations.'"""
             self.assertEqual(schedules[2].work.kind if schedules[2].work else None, "spike")
 
     def test_rejects_invalid_schedule_configuration(self) -> None:
-        base = CONFIG.replace("slug='human'", "slug='explorer'\nkind='agent'\npersistent=true")
+        base = CONFIG.replace("slug='human'", "slug='researcher'\nkind='agent'\npersistent=true")
         invalid = (
-            "slug='bad'\nto='@explorer'\nmessage='x'",
-            "slug='bad'\ncron='bad'\nto='@explorer'\nmessage='x'",
+            "slug='bad'\nto='@researcher'\nmessage='x'",
+            "slug='bad'\ncron='bad'\nto='@researcher'\nmessage='x'",
             "slug='bad'\nevery='1h'\nto='@missing'\nmessage='x'",
-            "slug='bad'\nevery='1h'\ntimezone='Mars/Olympus'\nto='@explorer'\nmessage='x'",
-            "slug='bad'\nevery='1h'\nto='@explorer'\nmessage='x'\noverlap='queue'",
-            "slug='bad'\nevery='1h'\nto='@explorer'\nmessage='x'\nwork={kind='spike',title='x',problem='x',outcome='x'}",
+            "slug='bad'\nevery='1h'\ntimezone='Mars/Olympus'\nto='@researcher'\nmessage='x'",
+            "slug='bad'\nevery='1h'\nto='@researcher'\nmessage='x'\noverlap='queue'",
+            "slug='bad'\nevery='1h'\nto='@researcher'\nmessage='x'\nwork={kind='spike',title='x',problem='x',outcome='x'}",
             "slug='bad'\nevery='1h'\nwork={kind='invalid',title='x',problem='x',outcome='x'}",
-            "slug='bad'\nevery='366d'\nto='@explorer'\nmessage='x'",
-            "slug='bad'\ncron=0\nevery='1h'\nto='@explorer'\nmessage='x'",
+            "slug='bad'\nevery='366d'\nto='@researcher'\nmessage='x'",
+            "slug='bad'\ncron=0\nevery='1h'\nto='@researcher'\nmessage='x'",
         )
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "agents.toml"

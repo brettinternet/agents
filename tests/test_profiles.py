@@ -38,7 +38,7 @@ class ProfileTests(unittest.TestCase):
         return materialize_profile(
             root,
             state,
-            template="elder",
+            template="manager",
             instance="deadbeef",
             run_id=run_id,
             generation=1,
@@ -60,14 +60,14 @@ class ProfileTests(unittest.TestCase):
             root.mkdir()
             package = Path(d) / "installed_package"
             package.mkdir()
-            for name in ("elder", "explorer", "writer"):
+            for name in ("manager", "researcher", "executor", "writer"):
                 (package / f"{name}.md").write_bytes((repository / "agents" / f"{name}.md").read_bytes())
             with patch.object(profiles_module, "__file__", str(package / "profiles.py")):
                 validate_templates(root)
                 materialized = materialize_profile(
                     root,
                     Path(d) / "state",
-                    template="elder",
+                    template="manager",
                     instance="deadbeef",
                     run_id=1,
                     generation=1,
@@ -77,7 +77,7 @@ class ProfileTests(unittest.TestCase):
                     token="secret-token",
                     api_url="http://127.0.0.1:9890",
                 )
-            self.assertIn("You are the elder", materialized.path.read_text())
+            self.assertIn("You are the manager", materialized.path.read_text())
 
     def test_unsupported_provider_is_rejected(self):
         with (
@@ -104,12 +104,12 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(mcp_name("deadbeef", 10, 1), "agents-deadbeef-r0000000010-g0001")
         self.assertFalse(mcp_name("deadbeef", 10, 1).startswith(mcp_name("deadbeef", 1, 1)))
         self.assertEqual(
-            execution_name("deadbeef", "persistent", "elder", "elder", 1),
-            "agents-deadbeef-p-elder-g0001",
+            execution_name("deadbeef", "persistent", "manager", "manager", 1),
+            "agents-deadbeef-p-manager-g0001",
         )
         self.assertEqual(
-            execution_name("deadbeef", "work", "42", "explorer", 2),
-            "agents-deadbeef-w-42-explorer-g0002",
+            execution_name("deadbeef", "work", "42", "researcher", 2),
+            "agents-deadbeef-w-42-researcher-g0002",
         )
 
     def test_materialization_clamps_tools_env_and_permissions(self):

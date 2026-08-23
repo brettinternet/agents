@@ -41,18 +41,18 @@ class WebAuthTests(unittest.TestCase):
                 {"slug": "human", "kind": "human", "persistent": True, "capacity": 1},
                 {"slug": "system", "kind": "system", "persistent": True, "capacity": 1},
                 {
-                    "slug": "elder",
+                    "slug": "manager",
                     "kind": "agent",
                     "reports_to": "human",
-                    "profile_template": "elder",
+                    "profile_template": "manager",
                     "persistent": True,
                     "capacity": 1,
                 },
                 {
-                    "slug": "explorer",
+                    "slug": "researcher",
                     "kind": "agent",
-                    "reports_to": "elder",
-                    "profile_template": "explorer",
+                    "reports_to": "manager",
+                    "profile_template": "researcher",
                     "specialty": "research",
                     "persistent": True,
                     "capacity": 3,
@@ -60,7 +60,7 @@ class WebAuthTests(unittest.TestCase):
                 {
                     "slug": "writer",
                     "kind": "agent",
-                    "reports_to": "elder",
+                    "reports_to": "manager",
                     "profile_template": "writer",
                     "specialty": "publishing",
                     "persistent": True,
@@ -90,7 +90,7 @@ class WebAuthTests(unittest.TestCase):
                 "mock",
                 "model",
                 1,
-                "explorer",
+                "researcher",
                 purpose_kind,
                 purpose_id,
                 ".",
@@ -203,21 +203,21 @@ class WebAuthTests(unittest.TestCase):
         self.assertEqual(self.client.get("/docs").status_code, 404)
 
     def test_agent_inbox_routes_use_terminal_context(self):
-        persistent_run_id = self._terminal_run("persistent", "explorer", "explorer-persistent")
-        work_run_id = self._terminal_run("work", "AGENT-0001", "explorer-work")
-        targeted = Messaging(self.connection).post("web-targeted", "human", "@explorer", "work assignment")
+        persistent_run_id = self._terminal_run("persistent", "researcher", "researcher-persistent")
+        work_run_id = self._terminal_run("work", "AGENT-0001", "researcher-work")
+        targeted = Messaging(self.connection).post("web-targeted", "human", "@researcher", "work assignment")
         self.connection.execute(
-            "UPDATE deliveries SET terminal_run_id=? WHERE message_id=? AND actor_slug='explorer'",
+            "UPDATE deliveries SET terminal_run_id=? WHERE message_id=? AND actor_slug='researcher'",
             (work_run_id, targeted["id"]),
         )
         self.connection.commit()
-        generic = Messaging(self.connection).post("web-generic", "human", "@explorer", "persistent notice")
+        generic = Messaging(self.connection).post("web-generic", "human", "@researcher", "persistent notice")
 
         def authenticate(_, execution_id, *__):
             if execution_id == "persistent-execution":
-                return AgentContext(persistent_run_id, "explorer", "persistent", "explorer", True)
+                return AgentContext(persistent_run_id, "researcher", "persistent", "researcher", True)
             if execution_id == "work-execution":
-                return AgentContext(work_run_id, "explorer", "work", "AGENT-0001", False)
+                return AgentContext(work_run_id, "researcher", "work", "AGENT-0001", False)
             raise AssertionError(f"unexpected execution {execution_id}")
 
         def headers(execution_id: str) -> dict[str, str]:
@@ -264,16 +264,16 @@ class WebAuthTests(unittest.TestCase):
 
     def test_snapshot_roster_exposes_terminal_purpose(self):
         self.client.post("/auth/login", data={"token": "w" * 64}, headers={"Origin": "http://testserver"})
-        self._terminal_run("work", "W-18", "explorer-work-18")
+        self._terminal_run("work", "W-18", "researcher-work-18")
         data = self.client.get("/api/v1/snapshot").json()["data"]
-        explorer = next(row for row in data["roster"] if row["slug"] == "explorer")
-        self.assertEqual(explorer["terminal_purpose_kind"], "work")
-        self.assertEqual(explorer["terminal_purpose_id"], "W-18")
-        self.assertEqual(explorer["terminal_run_id"], 1)
-        elder = next(row for row in data["roster"] if row["slug"] == "elder")
-        self.assertIsNone(elder["terminal_run_id"])
-        self.assertIsNone(elder["terminal_purpose_kind"])
-        self.assertIsNone(elder["terminal_purpose_id"])
+        researcher = next(row for row in data["roster"] if row["slug"] == "researcher")
+        self.assertEqual(researcher["terminal_purpose_kind"], "work")
+        self.assertEqual(researcher["terminal_purpose_id"], "W-18")
+        self.assertEqual(researcher["terminal_run_id"], 1)
+        manager = next(row for row in data["roster"] if row["slug"] == "manager")
+        self.assertIsNone(manager["terminal_run_id"])
+        self.assertIsNone(manager["terminal_purpose_kind"])
+        self.assertIsNone(manager["terminal_purpose_id"])
 
     def test_dashboard_assets_and_work_evidence_contract(self):
         self.client.post("/auth/login", data={"token": "w" * 64}, headers={"Origin": "http://testserver"})
@@ -328,7 +328,7 @@ class WebAuthTests(unittest.TestCase):
             "INSERT INTO terminal_runs(execution_name,profile_name,mcp_name,profile_sha256,provider,model,"
             "generation,actor_slug,purpose_kind,purpose_id,working_directory,token_digest,backend_terminal_id,"
             "agent_auth_id,profile_state,state,created_at,updated_at) VALUES("
-            "'session','profile','mcp','sha','mock','model',1,'elder','persistent','elder','.',"
+            "'session','profile','mcp','sha','mock','model',1,'manager','persistent','manager','.',"
             "'digest','terminal','profile','installed','live',?,?)",
             (now, now),
         ).lastrowid
@@ -336,7 +336,7 @@ class WebAuthTests(unittest.TestCase):
         self.connection.execute(
             "INSERT INTO blockers(target_kind,target_id,terminal_run_id,kind,reason,requested_role,"
             "actor_slug,state,created_at,updated_at) VALUES("
-            "'persistent','elder',?,'waiting_user_answer','Question','human','elder','open',?,?)",
+            "'persistent','manager',?,'waiting_user_answer','Question','human','manager','open',?,?)",
             (terminal_id, now, now),
         )
         self.connection.commit()

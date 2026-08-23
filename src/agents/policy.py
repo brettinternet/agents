@@ -5,9 +5,9 @@ from typing import Any
 
 WORK_KINDS = frozenset({"story", "bug", "task", "spike"})
 PRIORITIES = ("urgent", "high", "normal", "low")
-IMPLEMENTATION_SPECIALTIES = frozenset({"research", "publishing"})
+IMPLEMENTATION_SPECIALTIES = frozenset({"implementation", "research", "publishing"})
 CONSULTATION_SPECIALTIES = IMPLEMENTATION_SPECIALTIES | {"coordination"}
-REVIEW_GATES = frozenset({"research", "publishing", "coordination"})
+REVIEW_GATES = IMPLEMENTATION_SPECIALTIES | {"coordination"}
 TERMINAL_STATES = frozenset({"delivered", "cancelled"})
 WORK_STATES = frozenset(
     {
@@ -93,7 +93,7 @@ def authorize_transition(actor: str, source: str, target: str, *, assigned_actor
         raise DomainError("invalid_state", "invalid work transition")
     allowed = False
     if (source, target) == ("intake", "refining") or (source, target) == ("refining", "ready"):
-        allowed = actor in {"human", "elder"}
+        allowed = actor in {"human", "manager"}
     elif (source, target) == ("ready", "in_progress"):
         allowed = actor == "system:dispatcher"
     elif (source, target) == ("in_progress", "verifying"):
@@ -110,24 +110,24 @@ def authorize_transition(actor: str, source: str, target: str, *, assigned_actor
     elif (source, target) == ("accepted", "delivered"):
         allowed = actor == "system:reconciler"
     elif target == "blocked":
-        allowed = actor in {"human", "elder", "system:reconciler", assigned_actor}
+        allowed = actor in {"human", "manager", "system:reconciler", assigned_actor}
     elif source == "blocked":
-        allowed = actor in {"human", "elder"}
+        allowed = actor in {"human", "manager"}
     elif target == "cancelled":
-        allowed = actor == "human" or (actor == "elder" and source in {"intake", "refining", "ready"})
+        allowed = actor == "human" or (actor == "manager" and source in {"intake", "refining", "ready"})
     if not allowed:
         raise DomainError("unauthorized", f"{actor} cannot transition {source} to {target}")
 
 
 def authorize_scope_mutation(actor: str, state: str) -> None:
-    if actor not in {"human", "elder"}:
-        raise DomainError("unauthorized", "only the human or elder may refine scope")
+    if actor not in {"human", "manager"}:
+        raise DomainError("unauthorized", "only the human or manager may refine scope")
     if state != "refining":
         raise DomainError("scope_frozen", "scope may be changed only while refining")
 
 
 def authorize_reopen(actor: str, state: str, has_execution: bool) -> None:
-    if state == "ready" and not has_execution and actor in {"human", "elder"}:
+    if state == "ready" and not has_execution and actor in {"human", "manager"}:
         return
     if state in {"in_progress", "verifying", "awaiting_approval", "accepted", "blocked"} and actor == "human":
         return

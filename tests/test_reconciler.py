@@ -149,19 +149,19 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
             {"slug": "human", "kind": "human", "persistent": True, "capacity": 1},
             {"slug": "system", "kind": "system", "persistent": True, "capacity": 1},
             {
-                "slug": "elder",
+                "slug": "manager",
                 "kind": "agent",
                 "reports_to": "human",
-                "profile_template": "elder",
+                "profile_template": "manager",
                 "specialty": "",
                 "persistent": True,
                 "capacity": 1,
             },
             {
-                "slug": "explorer",
+                "slug": "researcher",
                 "kind": "agent",
-                "reports_to": "elder",
-                "profile_template": "explorer",
+                "reports_to": "manager",
+                "profile_template": "researcher",
                 "specialty": "research",
                 "persistent": True,
                 "capacity": 3,
@@ -169,7 +169,7 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
             {
                 "slug": "writer",
                 "kind": "agent",
-                "reports_to": "elder",
+                "reports_to": "manager",
                 "profile_template": "writer",
                 "specialty": "publishing",
                 "persistent": True,
@@ -204,9 +204,9 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         return reserve_terminal(
             self.connection,
             self.config,
-            actor="elder",
+            actor="manager",
             purpose_kind="persistent",
-            purpose_id="elder",
+            purpose_id="manager",
             working_directory=self.config.project.path,
             budget_exempt=True,
         )
@@ -271,7 +271,7 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         run = reserve_terminal(
             self.connection,
             self.config,
-            actor="explorer",
+            actor="researcher",
             purpose_kind="work",
             purpose_id=item_id,
             working_directory=self.root / f".worktrees/{item_id}-1",
@@ -280,7 +280,7 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         self.connection.execute(
             "INSERT INTO assignments(work_id,execution_id,actor_slug,terminal_run_id,state,created_at,updated_at)"
             "VALUES(?,?,? ,?,'open',?,?)",
-            (item_id, execution, "explorer", run["id"], now, now),
+            (item_id, execution, "researcher", run["id"], now, now),
         )
         self._make_live_fake_terminal(run, status)
         return item_id, run
@@ -317,7 +317,7 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         run = reserve_terminal(
             self.connection,
             self.config,
-            actor="explorer",
+            actor="researcher",
             purpose_kind="review",
             purpose_id=f"{submission}-research",
             working_directory=self.root / f".worktrees/review/{submission}-research",
@@ -325,7 +325,7 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.connection.execute(
             "INSERT INTO reviews(submission_id,gate,actor_slug,terminal_run_id,worktree_path,verdict,created_at,updated_at)"
-            "VALUES(?,'research','explorer',?,?,'pending',?,?)",
+            "VALUES(?,'research','researcher',?,?,'pending',?,?)",
             (
                 submission,
                 run["id"],
@@ -346,12 +346,12 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             {(row["actor_slug"], row["purpose_kind"], row["purpose_id"]) for row in runs},
             {
-                ("elder", "persistent", "elder"),
-                ("explorer", "persistent", "explorer"),
+                ("manager", "persistent", "manager"),
+                ("researcher", "persistent", "researcher"),
                 ("writer", "persistent", "writer"),
             },
         )
-        for actor in ("elder", "explorer", "writer"):
+        for actor in ("manager", "researcher", "writer"):
             self.assertEqual(
                 self.connection.execute(
                     "SELECT COUNT(*) FROM actor_leases WHERE actor_slug=? AND released_at IS NULL", (actor,)
@@ -383,7 +383,7 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
             )
         reserved = bootstrap_persistent_agents(self.connection, self.config)
         replacement = self.connection.execute(
-            "SELECT generation,state FROM terminal_runs WHERE id IN ({}) AND actor_slug='elder'".format(
+            "SELECT generation,state FROM terminal_runs WHERE id IN ({}) AND actor_slug='manager'".format(
                 ",".join("?" for _ in reserved)
             ),
             tuple(reserved),
@@ -412,7 +412,7 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
             )
         reserved = bootstrap_persistent_agents(self.connection, self.config)
         replacement = self.connection.execute(
-            "SELECT generation,state FROM terminal_runs WHERE id IN ({}) AND actor_slug='elder'".format(
+            "SELECT generation,state FROM terminal_runs WHERE id IN ({}) AND actor_slug='manager'".format(
                 ",".join("?" for _ in reserved)
             ),
             tuple(reserved),
@@ -443,7 +443,7 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         reserved = bootstrap_persistent_agents(self.connection, self.config)
         self.assertFalse(
             self.connection.execute(
-                "SELECT 1 FROM terminal_runs WHERE id IN ({}) AND actor_slug='elder'".format(
+                "SELECT 1 FROM terminal_runs WHERE id IN ({}) AND actor_slug='manager'".format(
                     ",".join("?" for _ in reserved)
                 ),
                 tuple(reserved),
@@ -543,7 +543,7 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
                 "mock_cli",
                 (ModelChoice("mock/global"),),
             ),
-            actor_models=(("elder", actor_models),),
+            actor_models=(("manager", actor_models),),
         )
         self.reconciler = Reconciler(self.config, self.connection, self.fake)
         with patch("agents.reconciler.secrets.choice", return_value=selected) as choose:
@@ -598,7 +598,7 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         ).lastrowid
         delivery = self.connection.execute(
             "INSERT INTO deliveries(message_id,actor_slug,terminal_run_id,state,attempts,next_attempt_at)"
-            "VALUES(?,'elder',NULL,'pending',0,?)",
+            "VALUES(?,'manager',NULL,'pending',0,?)",
             (message, utc_now()),
         ).lastrowid
         self.assertIsNotNone(delivery)
@@ -620,7 +620,7 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         ).lastrowid
         delivery = self.connection.execute(
             "INSERT INTO deliveries(message_id,actor_slug,terminal_run_id,state,attempts,next_attempt_at)"
-            "VALUES(?,'elder',NULL,'pending',0,?)",
+            "VALUES(?,'manager',NULL,'pending',0,?)",
             (message, utc_now()),
         ).lastrowid
         with patch.object(
@@ -650,7 +650,7 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         ).fetchall()
         self.assertEqual(len(events), 1)
         event = events[0]
-        self.assertEqual(event["actor_slug"], "explorer")
+        self.assertEqual(event["actor_slug"], "researcher")
         self.assertEqual(event["entity_kind"], "terminal")
         self.assertEqual(
             json.loads(event["metadata_json"]),
@@ -792,7 +792,7 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         self.connection.execute(
             "UPDATE terminal_runs SET state='live',profile_state='installed',backend_run_id=?,"
             "backend_terminal_id=?,updated_at=? WHERE id=?",
-            (f"workspace-{participant['id']}", "elder-persistent", utc_now(), participant["id"]),
+            (f"workspace-{participant['id']}", "manager-persistent", utc_now(), participant["id"]),
         )
         participant_message = self.connection.execute(
             "INSERT INTO messages(conversation_id,sender_slug,body,urgency,created_at)"
@@ -801,7 +801,7 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         ).lastrowid
         participant_delivery = self.connection.execute(
             "INSERT INTO deliveries(message_id,actor_slug,terminal_run_id,state,attempts,next_attempt_at)"
-            "VALUES(?,'elder',NULL,'pending',0,?)",
+            "VALUES(?,'manager',NULL,'pending',0,?)",
             (participant_message, utc_now()),
         ).lastrowid
         self.assertIsNotNone(participant_delivery)
@@ -811,7 +811,7 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
             ).fetchone()[0]
         )
         await self.reconciler._wake(cast(int, participant_delivery))
-        self.assertEqual(self.fake.wake_targets, ["writer-work", "elder-persistent"])
+        self.assertEqual(self.fake.wake_targets, ["writer-work", "manager-persistent"])
         participant_wake = self.connection.execute(
             "SELECT terminal_run_id,result FROM wake_attempts WHERE delivery_id=?",
             (participant_delivery,),
@@ -843,9 +843,9 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
             reserve_terminal(
                 self.connection,
                 self.config,
-                actor="elder",
+                actor="manager",
                 purpose_kind="persistent",
-                purpose_id="elder",
+                purpose_id="manager",
                 working_directory=self.config.project.path,
                 budget_exempt=True,
             )
@@ -872,7 +872,7 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         old = reserve(
             self.connection,
             self.config,
-            actor="explorer",
+            actor="researcher",
             purpose_kind="work",
             purpose_id=item_id,
             working_directory=self.config.project.path,
@@ -898,7 +898,7 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         replacement = reserve(
             self.connection,
             self.config,
-            actor="explorer",
+            actor="researcher",
             purpose_kind="work",
             purpose_id=item_id,
             working_directory=self.config.project.path,
@@ -1156,7 +1156,7 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         run = reserve_terminal(
             self.connection,
             self.config,
-            actor="explorer",
+            actor="researcher",
             purpose_kind="work",
             purpose_id=item_id,
             working_directory=self.root / ".worktrees/work/missing-1",
@@ -1170,7 +1170,7 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         self.connection.execute(
             "INSERT INTO assignments(work_id,execution_id,actor_slug,terminal_run_id,state,created_at,updated_at)"
             "VALUES(?,?,? ,?,'open',?,?)",
-            (item_id, execution, "explorer", run["id"], now, now),
+            (item_id, execution, "researcher", run["id"], now, now),
         )
 
         await self.reconciler._poll(run["id"])
@@ -1259,7 +1259,7 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         run = reserve_terminal(
             self.connection,
             self.config,
-            actor="explorer",
+            actor="researcher",
             purpose_kind="review",
             purpose_id=f"{submission}-research",
             working_directory=reviewtree,
@@ -1272,7 +1272,7 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.connection.execute(
             "INSERT INTO reviews(submission_id,gate,actor_slug,terminal_run_id,worktree_path,verdict,created_at,updated_at)"
-            "VALUES(?,'research','explorer',?,?,'pending',?,?)",
+            "VALUES(?,'research','researcher',?,?,'pending',?,?)",
             (submission, run["id"], str(reviewtree), now, now),
         )
 
@@ -1317,7 +1317,7 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         )
         assert submission is not None
         reviewed = Delivery(self.config, self.connection).submit_review(
-            "explorer",
+            "researcher",
             item_id,
             submission,
             current_version,
@@ -1429,7 +1429,7 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         replacement = bootstrap_persistent_agents(self.connection, self.config)
         self.assertIn(
             self.connection.execute(
-                "SELECT id FROM terminal_runs WHERE actor_slug='elder' AND purpose_kind='persistent' "
+                "SELECT id FROM terminal_runs WHERE actor_slug='manager' AND purpose_kind='persistent' "
                 "AND generation=2 AND state='reserved'"
             ).fetchone()["id"],
             replacement,
@@ -1467,7 +1467,7 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         replacement = bootstrap_persistent_agents(self.connection, self.config)
         self.assertIn(
             self.connection.execute(
-                "SELECT id FROM terminal_runs WHERE actor_slug='elder' AND purpose_kind='persistent' "
+                "SELECT id FROM terminal_runs WHERE actor_slug='manager' AND purpose_kind='persistent' "
                 "AND generation=2 AND state='reserved'"
             ).fetchone()["id"],
             replacement,

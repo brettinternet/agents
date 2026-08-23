@@ -18,8 +18,9 @@ class ProfileError(ValueError):
 
 
 _REQUIRED = {
-    "elder",
-    "explorer",
+    "manager",
+    "researcher",
+    "executor",
     "writer",
 }
 PROVIDER_CAPABILITIES = {
@@ -127,7 +128,7 @@ def purpose_tools(purpose_kind: str, specialty: str | None = None) -> tuple[str,
         return ("fs_*", "execute_bash")
     if purpose_kind == "persistent":
         return ()
-    if purpose_kind == "review" and specialty in {"research", "publishing"}:
+    if purpose_kind == "review" and specialty in {"implementation", "research", "publishing"}:
         return ("fs_read", "fs_list", "execute_bash")
     return ("fs_read", "fs_list")
 

@@ -251,7 +251,7 @@ def _assert_evidence(config: AgentsConfig, item_id: str) -> dict[str, Any]:
     if (
         len(reviews) != 1
         or reviews[0]["gate"] != "research"
-        or reviews[0]["actor_slug"] != "explorer"
+        or reviews[0]["actor_slug"] != "researcher"
         or reviews[0]["verdict"] != "pass"
     ):
         raise SmokeFailure("evidence", f"research evidence missing: {reviews}")
@@ -299,6 +299,9 @@ def run() -> None:
         )
         with _isolated_environment(config_path, home, xdg):
             config = _prepare_runtime(runtime, config_path)
+            persistent_agent_count = sum(
+                1 for actor in config.actors if actor["kind"] == "agent" and actor.get("persistent")
+            )
             _stage("isolated project and state prepared", str(project))
             client = None
             web = None
@@ -323,7 +326,7 @@ def run() -> None:
                                 config, "SELECT id FROM terminal_runs WHERE purpose_kind='persistent' AND state='live'"
                             )
                         )
-                        == 3
+                        == persistent_agent_count
                     ),
                 )
                 retained = _db_rows(
@@ -360,7 +363,7 @@ def run() -> None:
                                 "AND generation>1",
                             )
                         )
-                        == 3
+                        == persistent_agent_count
                     ),
                 )
                 client = web
@@ -388,12 +391,12 @@ def run() -> None:
                     "/api/v1/messages",
                     {
                         "to": "#publishing",
-                        "body": "@elder Please refine Smoke delivery for the deterministic smoke.",
+                        "body": "@manager Please refine Smoke delivery for the deterministic smoke.",
                     },
-                    "elder wake",
+                    "manager wake",
                 )
                 _wait(
-                    "elder refinement started",
+                    "manager refinement started",
                     lambda: (
                         (_db_row(config, "SELECT status FROM work_items WHERE id=?", (item_id,)) or {}).get("status")
                         == "refining"
@@ -460,7 +463,7 @@ def run() -> None:
                             config,
                             "SELECT 1 FROM reviews r JOIN submissions s ON s.id=r.submission_id "
                             "JOIN executions e ON e.id=s.execution_id "
-                            "WHERE e.work_id=? AND r.gate='research' AND r.actor_slug='explorer' AND r.verdict='pass'",
+                            "WHERE e.work_id=? AND r.gate='research' AND r.actor_slug='researcher' AND r.verdict='pass'",
                             (item_id,),
                         )
                     ),

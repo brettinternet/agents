@@ -109,7 +109,7 @@ class Delivery:
     ) -> dict[str, Any]:
         work = Store(self.connection).get_work(item_id)
         self._version(work, expected_version)
-        if actor not in {"human", "elder"}:
+        if actor not in {"human", "manager"}:
             raise DomainError("unauthorized", "actor cannot request consultation")
         if specialty not in CONSULTATION_SPECIALTIES:
             raise DomainError("validation_failed", "invalid consultation specialty")
@@ -121,11 +121,11 @@ class Delivery:
         )
         return {"id": cursor.lastrowid, "version": 1, "state": "queued"}
 
-    def _elder_available(self) -> bool:
+    def _manager_available(self) -> bool:
         return (
             self.connection.execute(
-                "SELECT 1 FROM consultations WHERE responder='elder' AND state='assigned' "
-                "UNION ALL SELECT 1 FROM reviews WHERE actor_slug='elder' AND verdict='pending' LIMIT 1"
+                "SELECT 1 FROM consultations WHERE responder='manager' AND state='assigned' "
+                "UNION ALL SELECT 1 FROM reviews WHERE actor_slug='manager' AND verdict='pending' LIMIT 1"
             ).fetchone()
             is None
         )
@@ -167,10 +167,10 @@ class Delivery:
         actor = None
         terminal_run_id: int
         if specialty == "coordination":
-            if not self._elder_available():
+            if not self._manager_available():
                 return None
             actor = self.connection.execute(
-                "SELECT slug FROM actors WHERE slug='elder' AND kind='agent' AND persistent=1"
+                "SELECT slug FROM actors WHERE slug='manager' AND kind='agent' AND persistent=1"
             ).fetchone()
             if actor is None:
                 return None
@@ -313,7 +313,7 @@ class Delivery:
     def propose_decision(
         self, actor: str, *, item_id: str | None, title: str, question: str, options: list[str], recommendation: str
     ) -> dict[str, Any]:
-        if actor not in {"elder", "human"}:
+        if actor not in {"manager", "human"}:
             raise DomainError("unauthorized", "actor cannot propose decisions")
         validate_title(title)
         validate_text(question, "decision question")
@@ -756,13 +756,13 @@ class Delivery:
         reviewtree: Path | None = None
         try:
             if gate == "coordination":
-                if not self._elder_available():
+                if not self._manager_available():
                     self.connection.execute("RELEASE SAVEPOINT assign_review")
                     return False
                 actor = self.connection.execute(
-                    "SELECT slug FROM actors WHERE slug='elder' AND kind='agent' AND persistent=1"
+                    "SELECT slug FROM actors WHERE slug='manager' AND kind='agent' AND persistent=1"
                 ).fetchone()
-                persistent = self._persistent_terminal("elder") if actor is not None else None
+                persistent = self._persistent_terminal("manager") if actor is not None else None
                 if actor is None or persistent is None:
                     self.connection.execute("RELEASE SAVEPOINT assign_review")
                     return False
@@ -1109,7 +1109,7 @@ class Delivery:
         )
 
     def resolve_blocker(self, actor: str, blocker_id: int, resolution: str, action: str) -> dict[str, Any]:
-        if actor not in {"human", "elder"}:
+        if actor not in {"human", "manager"}:
             raise DomainError("unauthorized", "actor cannot resolve blockers")
         blocker = self.connection.execute(
             "SELECT * FROM blockers WHERE id=? AND state IN('open','escalated')", (blocker_id,)

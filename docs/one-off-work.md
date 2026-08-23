@@ -45,13 +45,15 @@ and state machine remain unchanged.
 Click **New direct message**, select a live actor, enter the instruction, and
 send it. The default actor slugs are:
 
-- **elder** — vague requests, coordination, or deciding what tracked work should
+- **manager** — vague requests, coordination, or deciding what tracked work should
   be created.
-- **explorer** — direct research of public sources.
+- **researcher** — direct research of public sources.
+- **executor** — implementation questions and scoped repository work; use a
+  tracked request when the result must be committed.
 - **writer** — synthesis, publishing-oriented work, and all final public-post copy.
 
 Route every public-post request to writer with its audience, venue, purpose,
-constraints, source material, and authorization status. Elder and explorer may
+constraints, source material, and authorization status. Manager and researcher may
 coordinate or supply research, but writer authors the final copy.
 
 State the objective, boundaries, stopping condition, output destination, and
@@ -68,7 +70,7 @@ No repository commit is required.
 A direct message does not automatically create a worktree or require a commit.
 It is the right place to ask for a conversation, a rough draft, an odd
 experiment, or a useful dead end. If the result becomes durable repository
-knowledge, ask the elder to turn it into a spike or create a request directly.
+knowledge, ask the manager to turn it into a spike or create a request directly.
 
 ## Tracked request
 
@@ -89,7 +91,7 @@ Commit a dated public-safe memory containing source URLs, findings,
 uncertainties, dead ends, and recommended follow-up work.
 ```
 
-The elder refines the request before it becomes ready. A spike still requires at
+The manager refines the request before it becomes ready. A spike still requires at
 least one lightweight, outcome-oriented acceptance criterion, such as recording
 sourced findings, uncertainty, and a recommendation. The criterion should not
 require a predetermined conclusion.
@@ -100,10 +102,10 @@ approval and integration.
 
 ## Stewardship and safety
 
-Only **elder** may propose self-tuning of the tracked agent configuration:
+Only **manager** may propose self-tuning of the tracked agent configuration:
 `agents.toml` and `agents/*.md`. Such tuning is repository work: it must be
 based on observed evidence and proceed through a reviewable tracked request and
-change. Elder never edits `.agents/` directly. Self-tuning must not relax
+change. Manager never edits `.agents/` directly. Self-tuning must not relax
 repository safety rules or external-authorization gates, and a round that
 correctly concludes that no change is needed is a valid no-op.
 
@@ -115,7 +117,7 @@ belongs to an ongoing conversation:
 - `#general` — broad instruction; wakes every notified role.
 - `#findings` — research findings and discussion.
 - `#publishing` — publishing discussion.
-- `#coordination` — elder coordination.
+- `#coordination` — manager coordination.
 
 Prefer a direct message when one actor owns the task. Prefer **New request** when
 the result must be tracked, committed, approved, or integrated.

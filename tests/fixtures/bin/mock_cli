@@ -81,7 +81,7 @@ def _post_message(to: str, body: str, key: str) -> None:
     _request("POST", "/agent/v1/messages", {"request_id": key, "to": to, "body": body})
 
 
-def _elder_step(force_ready: bool = False) -> list[str]:
+def _manager_step(force_ready: bool = False) -> list[str]:
     actions: list[str] = []
     items = _backlog()
     item = next((row for row in items if row.get("title") == "Smoke delivery"), None)
@@ -163,7 +163,7 @@ def _consultation_step(assignment: dict[str, Any]) -> list[str]:
     )
     if code in (200, 409):
         _post_message(
-            "@elder",
+            "@manager",
             "Publishing consultation completed for the smoke delivery.",
             _request_id("consultation", consultation_id, "notify"),
         )
@@ -251,8 +251,8 @@ def _handle_wake() -> str:
         actions.extend(_consultation_step(assignment))
         actions.extend(_work_step(assignment))
         actions.extend(_review_step(assignment))
-        if assignment.get("purpose_kind") == "persistent" and assignment.get("purpose_id") == "elder":
-            actions.extend(_elder_step(force_ready=True))
+        if assignment.get("purpose_kind") == "persistent" and assignment.get("purpose_id") == "manager":
+            actions.extend(_manager_step(force_ready=True))
     if isinstance(inbox, list) and inbox:
         ids = [int(row["id"]) for row in inbox if isinstance(row, dict) and str(row.get("id", "")).isdigit()]
         if ids:

@@ -83,18 +83,28 @@ def migrate(connection: sqlite3.Connection, migrations_dir: Path | None = None) 
             if applied[version] != digest:
                 raise MigrationError(f"migration checksum drift: {path.name}")
             continue
+        foreign_keys_off = sql.startswith("-- migrate: foreign-keys-off")
         try:
+            if foreign_keys_off:
+                connection.execute("PRAGMA foreign_keys=OFF")
             connection.execute("BEGIN IMMEDIATE")
             for statement in _sql_statements(sql):
                 connection.execute(statement)
+            if foreign_keys_off:
+                violations = list(connection.execute("PRAGMA foreign_key_check"))
+                if violations:
+                    raise MigrationError(f"migration violates foreign keys: {path.name}")
             connection.execute(
                 "INSERT INTO schema_migrations(version,sha256,applied_at) VALUES (?,?,?)",
                 (version, digest, utc_now()),
             )
             connection.commit()
-        except sqlite3.Error:
+        except Exception:
             connection.rollback()
             raise
+        finally:
+            if foreign_keys_off:
+                connection.execute("PRAGMA foreign_keys=ON")
 
 
 def initialize_project(connection: sqlite3.Connection, config: AgentsConfig) -> sqlite3.Row:

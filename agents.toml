@@ -50,10 +50,10 @@ persistent = true
 capacity = 1
 
 [[actors]]
-slug = "elder"
+slug = "manager"
 kind = "agent"
 reports_to = "human"
-profile_template = "elder"
+profile_template = "manager"
 specialty = ""
 persistent = true
 capacity = 1
@@ -63,34 +63,43 @@ capacity = 1
 # ]
 
 [[actors]]
-slug = "explorer"
+slug = "researcher"
 kind = "agent"
-reports_to = "elder"
-profile_template = "explorer"
+reports_to = "manager"
+profile_template = "researcher"
 specialty = "research"
+persistent = true
+capacity = 3
+
+[[actors]]
+slug = "executor"
+kind = "agent"
+reports_to = "manager"
+profile_template = "executor"
+specialty = "implementation"
 persistent = true
 capacity = 3
 
 [[actors]]
 slug = "writer"
 kind = "agent"
-reports_to = "elder"
+reports_to = "manager"
 profile_template = "writer"
 specialty = "publishing"
 persistent = true
 capacity = 3
 
 [[schedules]]
-slug = "elder-garden-round"
+slug = "manager-garden-round"
 every = "6h"
-to = "@elder"
+to = "@manager"
 message = "Take one bounded garden round: notice a loose end or promising thread, then start one reversible, public-safe action or conversation; say `nothing worth doing` if nothing earns a turn."
 overlap = "skip"
 
 [[schedules]]
-slug = "explorer-curiosity-wander"
+slug = "researcher-curiosity-wander"
 every = "8h"
-to = "@explorer"
+to = "@researcher"
 message = "Wander one public web, repository, or memory thread with curiosity; make at most one bounded, reversible, public-safe experiment or artifact, share what you learn, and say `nothing worth doing` if no worthwhile thread appears."
 overlap = "skip"
 
@@ -98,5 +107,5 @@ overlap = "skip"
 slug = "writer-editorial-round"
 every = "12h"
 to = "@writer"
-message = "Review current publishing requests and take one bounded writing assignment. Produce clear, well-structured copy from supplied evidence; return the draft to elder unless the account and venue are explicitly authorized, and say `nothing worth doing` if no request is ready."
+message = "Review current publishing requests and take one bounded writing assignment. Produce clear, well-structured copy from supplied evidence; return the draft to manager unless the account and venue are explicitly authorized, and say `nothing worth doing` if no request is ready."
 overlap = "skip"

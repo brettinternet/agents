@@ -112,7 +112,7 @@ Expected shape:
 
 ```json
 {
-  "slug": "explorer",
+  "slug": "researcher",
   "terminal_run_id": 17,
   "terminal_state": "live",
   "terminal_status": "processing",

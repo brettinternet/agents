@@ -305,7 +305,7 @@ def _seed_development(connection: sqlite3.Connection, config: AgentsConfig) -> N
         kind="bug",
         title="Provider needs input",
         problem="The provider requested clarification.",
-        outcome="The elder resolves the blocker.",
+        outcome="The manager resolves the blocker.",
     )
     approval = workflow.create_work(
         "dev-approval",
@@ -337,8 +337,8 @@ def _seed_development(connection: sqlite3.Connection, config: AgentsConfig) -> N
             active["id"],
             "research",
             "Which exploration path?",
-            "elder",
-            "explorer",
+            "manager",
+            "researcher",
             "completed",
             "Use the existing store.",
             now,
@@ -348,7 +348,7 @@ def _seed_development(connection: sqlite3.Connection, config: AgentsConfig) -> N
     connection.execute(
         "INSERT INTO decisions("
         "work_id,title,question,options_json,recommendation,state,proposed_by,created_at,updated_at"
-        ") VALUES(?,?,?,?,?,'open','elder',?,?)",
+        ") VALUES(?,?,?,?,?,'open','manager',?,?)",
         (
             accepted["id"],
             "Integration order",
@@ -367,15 +367,15 @@ def _seed_development(connection: sqlite3.Connection, config: AgentsConfig) -> N
         "execution_name,profile_name,mcp_name,profile_sha256,provider,model,generation,actor_slug,purpose_kind,"
         "purpose_id,working_directory,token_digest,backend_terminal_id,execution_backend,backend_run_id,agent_auth_id,"
         "profile_state,state,status,output_tail,created_at,updated_at"
-        ") VALUES('agents-dev-w-prompt-explorer-1-g0001','agents-dev-r0000000001-g0001',"
-        "'agents-dev-r0000000001-g0001','demo','mock','',1,'explorer','work',?,?,"
-        "'demo','demo-terminal','herdr','agents-dev-w-prompt-explorer-1-g0001',"
+        ") VALUES('agents-dev-w-prompt-researcher-1-g0001','agents-dev-r0000000001-g0001',"
+        "'agents-dev-r0000000001-g0001','demo','mock','',1,'researcher','work',?,?,"
+        "'demo','demo-terminal','herdr','agents-dev-w-prompt-researcher-1-g0001',"
         "'agents-dev-r0000000001-g0001','installed','live','waiting','Need human answer',?,?)",
         (blocked["id"], str(project["canonical_path"]), now, now),
     ).lastrowid
     connection.execute(
         "INSERT INTO actor_leases(actor_slug,purpose_kind,purpose_id,terminal_run_id,acquired_at)"
-        "VALUES('explorer','work',?,?,?)",
+        "VALUES('researcher','work',?,?,?)",
         (blocked["id"], terminal, now),
     )
     connection.execute(
@@ -429,7 +429,7 @@ def _seed_development(connection: sqlite3.Connection, config: AgentsConfig) -> N
         )
         connection.execute(
             "INSERT INTO reviews(submission_id,gate,actor_slug,worktree_path,verdict,body,created_at,updated_at)"
-            "VALUES(?,'research','explorer',?,'pass','Verified immutable submission',?,?)",
+            "VALUES(?,'research','researcher',?,'pass','Verified immutable submission',?,?)",
             (submission, str(worktree), now, now),
         )
         connection.execute(

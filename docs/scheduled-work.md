@@ -19,11 +19,11 @@ source links.
 
 The default garden has three recurring message rounds:
 
-| Round                                                       | Cadence and recipient   | What it invites                                                                                                                                                                                                                                                                  |
-| ----------------------------------------------------------- | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Elder garden round** (`elder-garden-round`)               | Every 6h to `@elder`    | Notice a loose end or promising thread, start one bounded reversible public-safe action or conversation, and say `nothing worth doing` when there is no worthwhile move.                                                                                                         |
-| **Explorer curiosity wander** (`explorer-curiosity-wander`) | Every 8h to `@explorer` | Wander one public web, repository, or memory thread; take at most one bounded reversible public-safe experiment or artifact; share the learning, or say `nothing worth doing`.                                                                                                   |
-| **Writer editorial round** (`writer-editorial-round`)       | Every 12h to `@writer`  | Review current publishing requests and take one bounded writing assignment. Writer produces clear, well-structured copy from supplied evidence and returns it to elder unless the account and venue are explicitly authorized. Say `nothing worth doing` if no request is ready. |
+| Round                                                           | Cadence and recipient     | What it invites                                                                                                                                                                                                                                                                    |
+| --------------------------------------------------------------- | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Manager garden round** (`manager-garden-round`)               | Every 6h to `@manager`    | Notice a loose end or promising thread, start one bounded reversible public-safe action or conversation, and say `nothing worth doing` when there is no worthwhile move.                                                                                                           |
+| **Researcher curiosity wander** (`researcher-curiosity-wander`) | Every 8h to `@researcher` | Wander one public web, repository, or memory thread; take at most one bounded reversible public-safe experiment or artifact; share the learning, or say `nothing worth doing`.                                                                                                     |
+| **Writer editorial round** (`writer-editorial-round`)           | Every 12h to `@writer`    | Review current publishing requests and take one bounded writing assignment. Writer produces clear, well-structured copy from supplied evidence and returns it to manager unless the account and venue are explicitly authorized. Say `nothing worth doing` if no request is ready. |
 
 All three use `overlap = "skip"` and are message schedules, not
 `[schedules.work]` entries. A round may end with no action; no-op rounds are
@@ -38,7 +38,7 @@ A message schedule wakes a persistent actor or posts to an internal channel:
 [[schedules]]
 slug = "hourly-monitor"
 every = "1h"
-to = "@explorer"
+to = "@researcher"
 message = "Check the specified public sources and report only meaningful changes to #findings."
 overlap = "skip"
 ```
@@ -54,7 +54,7 @@ durable statuses.
 
 Use a work schedule only when each occurrence should produce a committed
 artifact, requires approval or integration, or depends on the durable workflow.
-It creates a fresh intake item; the elder then refines it through the normal
+It creates a fresh intake item; the manager then refines it through the normal
 tracked-work lifecycle. Do not use a tracked schedule just to make an
 experiment, draft, or wandering round feel official.
 
@@ -78,10 +78,10 @@ outcome = "Commit a dated public-safe memory with source URLs, uncertainty, and 
 
 ## Stewardship and safety
 
-Only **elder** may propose self-tuning of tracked `agents.toml` or
+Only **manager** may propose self-tuning of tracked `agents.toml` or
 `agents/*.md`. A proposal must be grounded in observed evidence and carried as
 reviewable tracked repository work. It must never mutate `.agents/`, relax
-safety rules, or weaken external-authorization gates. Elder may recommend no
+safety rules, or weaken external-authorization gates. Manager may recommend no
 change, and a no-op round is a successful outcome.
 
 ## Occurrence behavior

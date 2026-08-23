@@ -20,6 +20,7 @@ tasks:
     desc: Show available Agents tasks
     silent: true
     cmd: task --list
+
   init:
     desc: Install dependencies, configure hooks, initialize Agents, and start the services
     cmds:
@@ -30,70 +31,93 @@ tasks:
       - task: secrets:check
       - lefthook install
       - "{{.ENV_RUN}} {{.PYTHON}} -m agents.cli init"
+  start:
+    desc: Start or reuse the local Herdr and Agents services
+    cmd: task server:start
+
   env:init:
     desc: Create and validate the local environment
     cmds:
       - task: env:create
       - task: env:check
+
   env:create:
     internal: true
     cmd: touch .env.local
     status:
       - test -f .env.local
+
   env:check:
     desc: Validate and resolve the Varlock environment
     cmd: mise exec varlock -- varlock load -p .env.schema -p .env.local --show-all
+
   env:encrypt:
     desc: Encrypt one value for use in .env.local
     cmd: mise exec varlock -- varlock encrypt
+
   env:run:
     desc: Run a command with scoped Varlock environment values
     cmd: "{{.ENV_RUN}} {{.CLI_ARGS}}"
+
   env:lock:
     desc: Lock the Varlock local encryption session
     cmd: mise exec varlock -- varlock lock
+
   secrets:init:
     desc: Initialize or validate the agent-managed encrypted secret store
     cmd: "{{.SECRETS_CLI}} init"
   secrets:check:
     desc: Validate the agent-managed encrypted secret store
     cmd: "{{.SECRETS_CLI}} check"
+
   secrets:list:
     desc: List agent-managed secret names
     cmd: "{{.SECRETS_CLI}} list"
+
   secrets:set:
     desc: Set an agent-managed secret from stdin
     cmd: "{{.SECRETS_CLI}} set {{.CLI_ARGS}}"
+
   secrets:unset:
     desc: Remove an agent-managed secret
     cmd: "{{.SECRETS_CLI}} unset {{.CLI_ARGS}}"
+
   secrets:reveal:
     desc: Reveal one agent-managed secret without a newline
     cmd: "{{.SECRETS_CLI}} reveal {{.CLI_ARGS}}"
+
   secrets:run:
     desc: Run a command with agent-managed secrets through Varlock
     cmd: "{{.SECRETS_CLI}} run {{.CLI_ARGS}}"
+
   migrate:
     desc: Apply Agents SQLite migrations
     cmd: "{{.ENV_RUN}} {{.PYTHON}} -m agents.cli migrate"
+
   doctor:
     desc: Check local Agents prerequisites and service ownership
     cmd: "{{.ENV_RUN}} {{.PYTHON}} -m agents.cli doctor"
+
   server:start:
     desc: Start or reuse the local Herdr and Agents services
     cmd: "{{.ENV_RUN}} {{.PYTHON}} -m agents.cli service start"
+
   server:stop:
     desc: Stop Agents while retaining the owned Herdr session
     cmd: "{{.ENV_RUN}} {{.PYTHON}} -m agents.cli service stop"
+
   server:status:
     desc: Show owned service status
     cmd: "{{.ENV_RUN}} {{.PYTHON}} -m agents.cli service status"
+
   dashboard:
     desc: Print the web-token file path
     cmd: "{{.ENV_RUN}} {{.PYTHON}} -m agents.cli dashboard"
+
   sessions:
     desc: List Agents-owned sessions
     cmd: "{{.ENV_RUN}} {{.PYTHON}} -m agents.cli sessions"
+
   check:
     desc: Run formatting, lint, and type checks
     cmds:
@@ -101,25 +125,31 @@ tasks:
       - ruff format --check src/agents tests
       - ruff check src/agents tests
       - pyright src/agents tests
+
   check:staged:
     desc: Run checks against staged files
     aliases: [check-staged]
     cmd: lefthook run pre-commit
+
   fix:
     desc: Format and autofix project files
     cmds:
       - prettier --write --ignore-unknown .
       - ruff format src/agents tests
       - ruff check --fix src/agents tests
+
   test:
     desc: Run the unittest suite
     cmd: '{{.PYTHON}} -m unittest discover -s tests -p "test_*.py"'
+
   smoke:
     desc: Run the isolated direct Herdr mock-provider delivery smoke
     cmd: "{{.PYTHON}} -m tests.smoke_e2e --backend herdr"
+
   dev:mock:
     desc: Seed and serve a mock development instance
     cmd: "AGENTS_PROVIDER=mock {{.ENV_RUN}} {{.PYTHON}} -m agents.cli dev-mock"
+
   shutdown:
     desc: Revoke/delete mapped workspaces, remove artifacts, and stop Herdr
     cmd: "{{.ENV_RUN}} {{.PYTHON}} -m agents.cli shutdown"

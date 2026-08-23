@@ -135,6 +135,7 @@ class WebAuthTests(unittest.TestCase):
         response = self.client.get("/login")
         self.assertIn("default-src 'self'", response.headers["content-security-policy"])
         self.assertEqual(response.headers["x-content-type-options"], "nosniff")
+        self.assertEqual(response.headers["referrer-policy"], "same-origin")
 
     def test_json_errors_and_idempotency_are_stable(self):
         self.client.post("/auth/login", data={"token": "w" * 64}, headers={"Origin": "http://testserver"})

@@ -228,7 +228,7 @@ def create_app(config: AgentsConfig | None = None, connection: sqlite3.Connectio
         response = await call_next(request)
         response.headers["Content-Security-Policy"] = CSP
         response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Referrer-Policy"] = "same-origin"
         return response
 
     @app.get("/health")

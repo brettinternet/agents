@@ -102,15 +102,18 @@ class HerdrClientTests(unittest.TestCase):
             if self.root.joinpath("herdr.sock").exists():
                 self.root.joinpath("herdr.sock").unlink()
 
-    def test_maps_blocked_prompt_and_mutating_disconnect(self) -> None:
-        def blocked(request: dict) -> bytes:
-            return (
-                json.dumps({"id": request["id"], "error": {"code": "agent_blocked", "message": "wait"}}) + "\n"
-            ).encode()
+    def test_maps_transient_agent_errors_and_mutating_disconnect(self) -> None:
+        for code in ("agent_blocked", "agent_pane_busy"):
+            with self.subTest(code=code):
 
-        with UnixResponder(self.root, blocked) as path, self.assertRaises(ExecutionBusy):
-            HerdrClient(path).request("agent.prompt", {"target": "pane", "text": "wake"})
-        self.root.joinpath("herdr.sock").unlink()
+                def blocked(request: dict, code: str = code) -> bytes:
+                    return (
+                        json.dumps({"id": request["id"], "error": {"code": code, "message": "wait"}}) + "\n"
+                    ).encode()
+
+                with UnixResponder(self.root, blocked) as path, self.assertRaises(ExecutionBusy):
+                    HerdrClient(path).request("agent.start", {"name": "worker", "pane_id": "w1:p1"})
+                self.root.joinpath("herdr.sock").unlink()
         with UnixResponder(self.root, lambda _: None) as path, self.assertRaises(ExecutionTimeout) as raised:
             HerdrClient(path).request("workspace.create", {"cwd": "/tmp"})
         self.assertTrue(raised.exception.outcome_unknown)
@@ -232,6 +235,7 @@ class HerdrClientTests(unittest.TestCase):
         class FakeClient:
             def __init__(self) -> None:
                 self.snapshots = 0
+                self.expected_after = 3
 
             def snapshot(self) -> dict[str, Any]:
                 self.snapshots += 1
@@ -246,10 +250,14 @@ class HerdrClientTests(unittest.TestCase):
                         {"pane_id": "p1", "workspace_id": "w1", "cwd": "/tmp", "revision": 2},
                         {"pane_id": "p2", "workspace_id": "w2", "cwd": "/tmp", "revision": 1},
                     ],
-                    "agents": [
-                        {"pane_id": "p1", "name": "worker", "agent": "opencode", "agent_status": "idle"},
-                        {"pane_id": "p2", "name": "other", "agent": "opencode", "agent_status": "idle"},
-                    ],
+                    "agents": (
+                        []
+                        if self.snapshots < self.expected_after
+                        else [
+                            {"pane_id": "p1", "name": "worker", "agent": "opencode", "agent_status": "idle"},
+                            {"pane_id": "p2", "name": "other", "agent": "opencode", "agent_status": "idle"},
+                        ]
+                    ),
                 }
 
             def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -274,8 +282,19 @@ class HerdrClientTests(unittest.TestCase):
                 raise AssertionError(method)
 
         spec = RunSpec("agents-test", 1, 1, Path("/tmp"), "worker", "opencode", ("opencode",), (), "opencode")
-        run = HerdrBackend(cast(Any, FakeClient()), provider_id="opencode_cli").create_run(spec)
+        with patch("agents.herdr_client.time.sleep") as sleep:
+            run = HerdrBackend(cast(Any, FakeClient()), provider_id="opencode_cli").create_run(spec)
+        sleep.assert_called_once_with(0.05)
         self.assertEqual(run.handle, RunHandle("agents-test", "w1", "p1"))
+        stale = FakeClient()
+        stale.expected_after = 999
+        with (
+            patch("agents.herdr_client.time.sleep") as sleep,
+            self.assertRaises(ExecutionConflict) as raised,
+        ):
+            HerdrBackend(cast(Any, stale), provider_id="opencode_cli").create_run(spec)
+        self.assertEqual(raised.exception.code, "agent_start_mismatch")
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.05, 0.15, 0.3])
 
     def test_create_run_rejects_missing_authoritative_workspace_ids(self) -> None:
         class FakeClient:

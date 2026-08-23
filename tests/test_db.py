@@ -96,7 +96,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.connection.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
         self.assertEqual(
             [row[0] for row in self.connection.execute("SELECT version FROM schema_migrations ORDER BY version")],
-            [1, 2, 3, 4, 5, 6],
+            [1, 2, 3, 4, 5, 6, 7],
         )
         terminal_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(terminal_runs)")}
         self.assertTrue(
@@ -238,7 +238,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertIsNone(reserved["agent_auth_id"])
         other.close()
 
-    def test_stale_cao_failure_migration_resolves_persistent_cutover_state(self) -> None:
+    def test_cutover_failure_migrations_resolve_persistent_state(self) -> None:
         migrations = self.root / "stale-cao-migrations"
         migrations.mkdir()
         source = Path(__file__).parents[1] / "src/agents/migrations"
@@ -256,6 +256,10 @@ class DatabaseTests(unittest.TestCase):
         other.execute(
             "INSERT INTO actors(slug,kind,persistent,capacity,created_at,updated_at) VALUES(?,?,?,?,?,?)",
             ("worker", "agent", 1, 1, now, now),
+        )
+        other.execute(
+            "INSERT INTO actors(slug,kind,persistent,capacity,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+            ("other", "agent", 1, 1, now, now),
         )
         run_id = other.execute(
             "INSERT INTO terminal_runs("
@@ -282,6 +286,32 @@ class DatabaseTests(unittest.TestCase):
                 now,
             ),
         ).lastrowid
+        herdr_run_id = other.execute(
+            "INSERT INTO terminal_runs("
+            "execution_name,profile_name,mcp_name,profile_sha256,provider,model,generation,actor_slug,"
+            "purpose_kind,purpose_id,working_directory,token_digest,profile_state,state,error,created_at,updated_at"
+            ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "agents-deadbeef-p-other-g0002",
+                "profile-2",
+                "mcp-2",
+                "sha-2",
+                "opencode_cli",
+                "",
+                2,
+                "other",
+                "persistent",
+                "other",
+                "/new",
+                "digest-2",
+                "installed",
+                "failed",
+                "agent_pane_busy: agent target pane w1:p1 is not an available shell",
+                now,
+                now,
+            ),
+        ).lastrowid
+        self.assertIsNotNone(herdr_run_id)
         self.assertIsNotNone(run_id)
         other.execute(
             "INSERT INTO blockers(target_kind,target_id,terminal_run_id,kind,reason,requested_role,"
@@ -290,17 +320,53 @@ class DatabaseTests(unittest.TestCase):
             (run_id, now, now),
         )
         other.execute(
+            "INSERT INTO blockers(target_kind,target_id,terminal_run_id,kind,reason,requested_role,"
+            "actor_slug,state,created_at,updated_at) VALUES('persistent','other',?,'terminal_failure',"
+            "'pane busy','human','other','open',?,?)",
+            (herdr_run_id, now, now),
+        )
+        other.execute(
+            "INSERT INTO blockers(target_kind,target_id,terminal_run_id,kind,reason,requested_role,"
+            "actor_slug,state,created_at,updated_at) VALUES('work','unrelated',?,'terminal_failure',"
+            "'pane busy','human','other','open',?,?)",
+            (herdr_run_id, now, now),
+        )
+        other.execute(
             "INSERT INTO incidents(kind,entity_kind,entity_id,severity,state,summary,details_json,created_at,updated_at)"
             " VALUES('terminal_failed','terminal',?,'error','open','wrong directory','{}',?,?)",
             (str(run_id), now, now),
         )
+        other.execute(
+            "INSERT INTO incidents(kind,entity_kind,entity_id,severity,state,summary,details_json,created_at,updated_at)"
+            " VALUES('terminal_failed','terminal',?,'error','open','pane busy','{}',?,?)",
+            (str(herdr_run_id), now, now),
+        )
+        other.execute(
+            "INSERT INTO incidents(kind,entity_kind,entity_id,severity,state,summary,details_json,created_at,updated_at)"
+            " VALUES('terminal_failed','delivery','unrelated','error','open','pane busy','{}',?,?)",
+            (now, now),
+        )
         shutil.copy(source / "006_resolve_stale_cao_failures.sql", migrations / "006_resolve_stale_cao_failures.sql")
+        shutil.copy(
+            source / "007_resolve_transient_herdr_launches.sql",
+            migrations / "007_resolve_transient_herdr_launches.sql",
+        )
         migrate(other, migrations)
-        self.assertEqual(other.execute("SELECT state FROM blockers").fetchone()[0], "resolved")
-        self.assertEqual(other.execute("SELECT state FROM incidents").fetchone()[0], "resolved")
+        self.assertEqual(
+            dict(other.execute("SELECT state,COUNT(*) FROM blockers GROUP BY state")),
+            {"open": 1, "resolved": 2},
+        )
+        self.assertEqual(
+            dict(other.execute("SELECT state,COUNT(*) FROM incidents GROUP BY state")),
+            {"open": 1, "resolved": 2},
+        )
+        self.assertEqual(
+            other.execute("SELECT error FROM terminal_runs WHERE id=?", (herdr_run_id,)).fetchone()[0],
+            "transient Herdr cutover: agent_pane_busy: agent target pane w1:p1 is not an available shell",
+        )
         self.assertEqual(
             [row[0] for row in other.execute("SELECT version FROM schema_migrations ORDER BY version")],
-            [1, 2, 3, 4, 5, 6],
+            [1, 2, 3, 4, 5, 6, 7],
         )
         other.close()
 
@@ -315,6 +381,7 @@ class DatabaseTests(unittest.TestCase):
             "004_general_channel.sql",
             "005_execution_backend.sql",
             "006_resolve_stale_cao_failures.sql",
+            "007_resolve_transient_herdr_launches.sql",
         ):
             shutil.copy(source / name, migrations / name)
         other = connect(self.root / "other.db")

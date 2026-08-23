@@ -189,12 +189,13 @@ def bootstrap_persistent_agents(connection: sqlite3.Connection, config: AgentsCo
             continue
         attempts = connection.execute(
             "SELECT COUNT(*) total,"
-            "COUNT(*) FILTER (WHERE error IS NULL OR error NOT LIKE "
-            "'CAO terminal working directory mismatch:%') relevant "
+            "COUNT(*) FILTER (WHERE error IS NULL OR ("
+            "error NOT LIKE 'CAO terminal working directory mismatch:%' "
+            "AND error NOT LIKE 'transient Herdr cutover:%')) relevant "
             "FROM terminal_runs WHERE actor_slug=? AND purpose_kind='persistent'",
             (actor,),
         ).fetchone()
-        if attempts["relevant"] >= 3 or attempts["total"] >= 6:
+        if attempts["relevant"] >= 3 or attempts["total"] >= 12:
             continue
         run = reserve_terminal(
             connection,

@@ -9,6 +9,7 @@ import shutil
 import socket
 import stat
 import threading
+import time
 import uuid
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
@@ -82,7 +83,7 @@ def _error(code: str, message: str, *, mutating: bool = False) -> ExecutionError
     normalized = code.lower()
     if normalized in {"not_found", "workspace_not_found", "pane_not_found", "agent_not_found"}:
         return ExecutionNotFound(code, message)
-    if normalized in {"agent_blocked", "agent_not_ready", "busy", "pane_busy"}:
+    if normalized in {"agent_blocked", "agent_not_ready", "agent_pane_busy", "busy", "pane_busy"}:
         return ExecutionBusy(code, message)
     if normalized in {"unauthorized", "forbidden"}:
         return ExecutionUnauthorized(code, message)
@@ -406,9 +407,17 @@ class HerdrBackend:
             if agent["workspace_id"] != run.handle.run_id or agent["pane_id"] != run.handle.terminal_id:
                 raise ExecutionConflict("agent_start_mismatch", "Herdr started an unexpected workspace occupant")
         adopted = self.get_run(run.handle)
-        if adopted.cwd != spec.cwd.resolve() or (not spec.mock and not self._matches_spec(adopted, spec)):
-            raise ExecutionConflict("agent_start_mismatch", "Herdr started an unexpected workspace occupant")
-        return adopted
+        if spec.mock:
+            if adopted.cwd != spec.cwd.resolve():
+                raise ExecutionConflict("agent_start_mismatch", "Herdr started an unexpected workspace occupant")
+            return adopted
+        for delay in (0.0, 0.05, 0.15, 0.3):
+            if delay:
+                time.sleep(delay)
+                adopted = self.get_run(run.handle)
+            if self._matches_spec(adopted, spec):
+                return adopted
+        raise ExecutionConflict("agent_start_mismatch", "Herdr started an unexpected workspace occupant")
 
     def create_run(self, spec: RunSpec) -> RunSnapshot:
         existing = self.find_run(spec.name)

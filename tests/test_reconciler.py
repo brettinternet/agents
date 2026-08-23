@@ -18,6 +18,7 @@ from agents.db import connect, migrate, utc_now
 from agents.delivery import Delivery
 from agents.execution import (
     BackendHealth,
+    ExecutionBusy,
     ExecutionConflict,
     ExecutionNotFound,
     ExecutionStatus,
@@ -389,8 +390,37 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         ).fetchone()
         self.assertEqual(tuple(replacement), (4, "reserved"))
 
+    def test_bootstrap_retries_after_transient_herdr_cutover_failures(self):
+        errors = (
+            "transient Herdr cutover: agent_pane_busy: agent target pane w1:p1 is not an available shell",
+            "transient Herdr cutover: backend run identity, occupant, or cwd mismatch",
+        )
+        for index in range(6):
+            run = self.reserve()
+            now = utc_now()
+            self.connection.execute(
+                "UPDATE terminal_runs SET state='failed',error=?,token_revoked_at=?,updated_at=? WHERE id=?",
+                (errors[index % len(errors)], now, now, run["id"]),
+            )
+            self.connection.execute(
+                "UPDATE launch_attempts SET state='failed',updated_at=? WHERE terminal_run_id=?",
+                (now, run["id"]),
+            )
+            self.connection.execute(
+                "UPDATE actor_leases SET released_at=? WHERE terminal_run_id=?",
+                (now, run["id"]),
+            )
+        reserved = bootstrap_persistent_agents(self.connection, self.config)
+        replacement = self.connection.execute(
+            "SELECT generation,state FROM terminal_runs WHERE id IN ({}) AND actor_slug='elder'".format(
+                ",".join("?" for _ in reserved)
+            ),
+            tuple(reserved),
+        ).fetchone()
+        self.assertEqual(tuple(replacement), (7, "reserved"))
+
     def test_bootstrap_bounds_repeated_stale_directory_failures(self):
-        for _ in range(6):
+        for _ in range(12):
             run = self.reserve()
             now = utc_now()
             self.connection.execute(
@@ -471,6 +501,34 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
         )
+
+    async def test_transient_agent_pane_busy_preserves_launch_for_retry(self):
+        run = self.reserve()
+        with (
+            patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "xdg")}),
+            patch.object(
+                self.fake,
+                "create_run",
+                side_effect=ExecutionBusy(
+                    "agent_pane_busy",
+                    "agent target pane w1:p1 is not an available shell",
+                ),
+            ),
+        ):
+            await self.reconciler._launch(run["id"])
+        saved = self.connection.execute(
+            "SELECT state,error FROM terminal_runs WHERE id=?",
+            (run["id"],),
+        ).fetchone()
+        attempt = self.connection.execute(
+            "SELECT state,error FROM launch_attempts WHERE terminal_run_id=?",
+            (run["id"],),
+        ).fetchone()
+        self.assertEqual(saved["state"], "reserved")
+        self.assertIsNone(saved["error"])
+        self.assertEqual(attempt["state"], "reserved")
+        self.assertIn("agent_pane_busy", attempt["error"])
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM blockers").fetchone()[0], 0)
 
     async def test_actor_model_choice_is_selected_once_and_persisted(self):
         selected = ModelChoice("mock/actor-second")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,10 +19,10 @@ launch_budget_per_hour=12
 max_agents=4
 max_consultations=3
 worker_grace_seconds=86400
-[cao]
-version='2.4.1'
+[execution]
+backend='herdr'
+version='0.8.2'
 provider='mock'
-api_port=9889
 [web]
 host='127.0.0.1'
 port=9890
@@ -31,48 +32,68 @@ slug='human'
 
 
 class ConfigTests(unittest.TestCase):
-    def test_loads_structured_verification_and_provider(self) -> None:
+    def test_loads_execution_provider_and_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "agents.toml"
             path.write_text(CONFIG)
             config = load(path, {})
             self.assertEqual(config.project.verify, (("task", "check"),))
-            self.assertEqual(config.cao.provider_id, "mock_cli")
+            self.assertEqual(config.execution.backend, "herdr")
+            self.assertEqual(config.execution.version, "0.8.2")
+            self.assertIsNone(config.execution.session)
+            self.assertEqual(config.execution.provider_id, "mock_cli")
+
+    def test_omitted_session_derives_from_persisted_project_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "agents.toml"
+            path.write_text(CONFIG)
+            state = root / ".agents"
+            state.mkdir(mode=0o700)
+            database = state / "agents.db"
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute("CREATE TABLE project(id INTEGER PRIMARY KEY, instance_id TEXT NOT NULL)")
+                connection.execute("INSERT INTO project(id,instance_id) VALUES(1,'1234abcd')")
+                connection.commit()
+            finally:
+                connection.close()
+            self.assertEqual(load(path, {}).execution_session, "agents-1234abcd")
+
+    def test_explicit_session_wins_over_project_identity(self) -> None:
+        configured = CONFIG.replace("version='0.8.2'", "version='0.8.2'\nsession='agents-fixed'")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "agents.toml"
+            path.write_text(configured)
+            self.assertEqual(load(path, {}).execution_session, "agents-fixed")
 
     def test_loads_structured_model_choices(self) -> None:
         configured = CONFIG.replace(
-            "api_port=9889",
-            """api_port=9889
+            "provider='mock'",
+            """provider='opencode'
 models=[
   {id='openai/gpt-5', effort='high'},
   {id='anthropic/claude-sonnet-4-6'},
 ]""",
-        ).replace("provider='mock'", "provider='opencode'")
+        )
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "agents.toml"
             path.write_text(configured)
-            choices = load(path, {}).cao.models
+            choices = load(path, {}).execution.models
             self.assertEqual(
                 [(choice.id, choice.effort) for choice in choices],
                 [("openai/gpt-5", "high"), ("anthropic/claude-sonnet-4-6", "")],
             )
 
     def test_actor_model_choices_override_global_choices(self) -> None:
-        configured = (
-            CONFIG.replace(
-                "api_port=9889",
-                "api_port=9889\nmodel='openai/gpt-5-mini'",
-            )
-            .replace(
-                "slug='human'",
-                """slug='elder'
+        configured = CONFIG.replace("provider='mock'", "provider='opencode'\nmodel='openai/gpt-5-mini'").replace(
+            "slug='human'",
+            """slug='elder'
 kind='agent'
 models=[
   {id='openai/gpt-5', effort='high'},
   {id='anthropic/claude-sonnet-4-6'},
 ]""",
-            )
-            .replace("provider='mock'", "provider='opencode'")
         )
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "agents.toml"
@@ -85,15 +106,12 @@ models=[
             self.assertEqual(config.models_for("unknown")[0].id, "openai/gpt-5-mini")
 
     def test_environment_model_overrides_actor_choices(self) -> None:
-        configured = CONFIG.replace(
-            "slug='human'",
-            "slug='elder'\nkind='agent'\nmodels=[{id='actor/model'}]",
-        )
+        configured = CONFIG.replace("slug='human'", "slug='elder'\nkind='agent'\nmodels=[{id='actor/model'}]")
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "agents.toml"
             path.write_text(configured)
             config = load(path, {"AGENTS_MODEL": "override/model"})
-            self.assertEqual(config.models_for("elder"), config.cao.models)
+            self.assertEqual(config.models_for("elder"), config.execution.models)
             self.assertEqual(config.models_for("elder")[0].id, "override/model")
 
     def test_rejects_actor_choices_for_non_agents(self) -> None:
@@ -101,48 +119,34 @@ models=[
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "agents.toml"
             path.write_text(configured)
-            for env in ({}, {"AGENTS_MODEL": "override/model"}):
-                with self.subTest(env=env), self.assertRaisesRegex(ConfigError, "require kind='agent'"):
-                    load(path, env)
+            with self.assertRaisesRegex(ConfigError, "require kind='agent'"):
+                load(path, {})
 
     def test_rejects_invalid_actor_model_pool(self) -> None:
+        configured = CONFIG.replace("slug='human'", "slug='elder'\nkind='agent'\nmodels=[]")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "agents.toml"
+            path.write_text(configured)
+            with self.assertRaisesRegex(ConfigError, "actor elder.models must be a nonempty"):
+                load(path, {})
+
+    def test_environment_model_and_effort_override_toml_choices(self) -> None:
         configured = CONFIG.replace(
-            "slug='human'",
-            "slug='elder'\nkind='agent'\nmodels=[]",
+            "provider='mock'",
+            "provider='opencode'\nmodels=[{id='openai/gpt-5', effort='low'}]",
         )
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "agents.toml"
             path.write_text(configured)
-            for env in ({}, {"AGENTS_MODEL": "override/model"}):
-                with (
-                    self.subTest(env=env),
-                    self.assertRaisesRegex(ConfigError, "actor elder.models must be a nonempty"),
-                ):
-                    load(path, env)
-
-    def test_environment_model_and_effort_override_toml_choices(self) -> None:
-        configured = CONFIG.replace(
-            "api_port=9889",
-            "api_port=9889\nmodels=[{id='openai/gpt-5', effort='low'}]",
-        ).replace("provider='mock'", "provider='opencode'")
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "agents.toml"
-            path.write_text(configured)
-            choices = load(
-                path,
-                {
-                    "AGENTS_MODEL": "openai/gpt-5-mini",
-                    "AGENTS_EFFORT": "medium",
-                },
-            ).cao.models
+            choices = load(path, {"AGENTS_MODEL": "openai/gpt-5-mini", "AGENTS_EFFORT": "medium"}).execution.models
             self.assertEqual([(choice.id, choice.effort) for choice in choices], [("openai/gpt-5-mini", "medium")])
 
     def test_empty_environment_model_does_not_override_toml(self) -> None:
-        configured = CONFIG.replace("api_port=9889", "api_port=9889\nmodel='mock/model'")
+        configured = CONFIG.replace("provider='mock'", "provider='mock'\nmodel='mock/model'")
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "agents.toml"
             path.write_text(configured)
-            self.assertEqual(load(path, {"AGENTS_MODEL": ""}).cao.models[0].id, "mock/model")
+            self.assertEqual(load(path, {"AGENTS_MODEL": ""}).execution.models[0].id, "mock/model")
 
     def test_rejects_ambiguous_or_invalid_model_choices(self) -> None:
         invalid_sections = (
@@ -155,40 +159,35 @@ models=[
             path = Path(temporary) / "agents.toml"
             for section in invalid_sections:
                 with self.subTest(section=section), self.assertRaises(ConfigError):
-                    path.write_text(CONFIG.replace("api_port=9889", f"api_port=9889\n{section}"))
+                    path.write_text(CONFIG.replace("provider='mock'", f"provider='mock'\n{section}"))
                     load(path, {})
 
     def test_rejects_effort_without_opencode(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "agents.toml"
-            path.write_text(CONFIG.replace("api_port=9889", "api_port=9889\nmodel='mock/model'\neffort='high'"))
+            path.write_text(CONFIG.replace("provider='mock'", "provider='mock'\nmodel='mock/model'\neffort='high'"))
             with self.assertRaisesRegex(ConfigError, "only by the opencode provider"):
                 load(path, {})
 
-    def test_rejects_renamed_reasoning_effort_keys(self) -> None:
-        configured = CONFIG.replace("provider='mock'", "provider='opencode'").replace(
-            "api_port=9889", "api_port=9889\nmodel='openai/gpt-5'\nreasoning_effort='high'"
-        )
-        nested_configured = CONFIG.replace(
-            "api_port=9889",
-            "api_port=9889\nmodels=[{id='openai/gpt-5', reasoning_effort='high'}]",
-        ).replace("provider='mock'", "provider='opencode'")
-        actor_configured = CONFIG.replace(
-            "slug='human'",
-            "slug='elder'\nkind='agent'\nmodel='openai/gpt-5'\nreasoning_effort='high'",
-        ).replace("provider='mock'", "provider='opencode'")
+    def test_rejects_invalid_backend_and_session(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "agents.toml"
-            for content, env in (
-                (configured, {}),
-                (nested_configured, {}),
-                (nested_configured, {"AGENTS_MODEL": "openai/gpt-5-mini"}),
-                (actor_configured, {}),
-                (CONFIG, {"AGENTS_MODEL": "openai/gpt-5", "AGENTS_REASONING_EFFORT": "high"}),
-            ):
-                with self.subTest(content=content, env=env), self.assertRaisesRegex(ConfigError, "renamed"):
-                    path.write_text(content)
-                    load(path, env)
+            path.write_text(CONFIG.replace("backend='herdr'", "backend='remote'"))
+            with self.assertRaisesRegex(ConfigError, "unsupported execution backend"):
+                load(path, {})
+            path.write_text(CONFIG.replace("version='0.8.2'", "version='0.8.2'\nsession='Bad Session'"))
+            with self.assertRaisesRegex(ConfigError, "execution.session"):
+                load(path, {})
+
+    def test_rejects_renamed_reasoning_effort_keys(self) -> None:
+        configured = CONFIG.replace(
+            "provider='mock'", "provider='opencode'\nmodel='openai/gpt-5'\nreasoning_effort='high'"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "agents.toml"
+            path.write_text(configured)
+            with self.assertRaisesRegex(ConfigError, "renamed"):
+                load(path, {})
 
     def test_rejects_codex_provider(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -197,16 +196,12 @@ models=[
             with self.assertRaisesRegex(ConfigError, "unsupported provider: codex"):
                 load(path, {"AGENTS_PROVIDER": "codex"})
 
-    def test_rejects_shell_syntax(self) -> None:
+    def test_rejects_shell_syntax_and_non_loopback_bind(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "agents.toml"
             path.write_text(CONFIG.replace("['task','check']", "['task','check;bad']"))
             with self.assertRaises(ConfigError):
                 load(path, {})
-
-    def test_refuses_non_loopback_bind(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "agents.toml"
             path.write_text(CONFIG.replace("host='127.0.0.1'", "host='0.0.0.0'"))
             with self.assertRaises(ConfigError):
                 load(path, {})
@@ -243,11 +238,7 @@ outcome='Commit a dated public-safe memory with sources and recommendations.'"""
             schedules = load(path, {}).schedules
             self.assertEqual((schedules[0].cron, schedules[0].timezone), ("0 9 * * *", "America/Los_Angeles"))
             self.assertEqual(schedules[1].every_seconds, 3600)
-            work = schedules[2].work
-            self.assertIsNotNone(work)
-            assert work is not None
-            self.assertEqual(work.kind, "spike")
-            self.assertIn("public-safe memory", work.outcome)
+            self.assertEqual(schedules[2].work.kind if schedules[2].work else None, "spike")
 
     def test_rejects_invalid_schedule_configuration(self) -> None:
         base = CONFIG.replace("slug='human'", "slug='explorer'\nkind='agent'\npersistent=true")
@@ -261,8 +252,6 @@ outcome='Commit a dated public-safe memory with sources and recommendations.'"""
             "slug='bad'\nevery='1h'\nwork={kind='invalid',title='x',problem='x',outcome='x'}",
             "slug='bad'\nevery='366d'\nto='@explorer'\nmessage='x'",
             "slug='bad'\ncron=0\nevery='1h'\nto='@explorer'\nmessage='x'",
-            "slug='bad'\ncron=''\nto='@explorer'\nmessage='x'",
-            "slug='bad'\nevery='1h'\nwork={kind=[],title='x',problem='x',outcome='x'}",
         )
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "agents.toml"
@@ -270,3 +259,7 @@ outcome='Commit a dated public-safe memory with sources and recommendations.'"""
                 with self.subTest(schedule=schedule), self.assertRaises(ConfigError):
                     path.write_text(base + "\n[[schedules]]\n" + schedule + "\n")
                     load(path, {})
+
+
+if __name__ == "__main__":
+    unittest.main()

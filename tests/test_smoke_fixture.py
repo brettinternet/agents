@@ -12,7 +12,7 @@ from tests.smoke_e2e import FIXTURE_BIN, ROOT, _config_file, _isolated_environme
 
 
 class SmokeFixtureTests(unittest.TestCase):
-    def test_mock_provider_keeps_cao_markers_without_credentials(self) -> None:
+    def test_mock_provider_runs_without_credentials(self) -> None:
         provider = FIXTURE_BIN / "mock_cli"
         result = subprocess.run(
             [str(provider), "--delay-ms", "0"],
@@ -23,18 +23,17 @@ class SmokeFixtureTests(unittest.TestCase):
             timeout=5,
             check=True,
         )
-        self.assertIn("mock_cli 2.4.1", result.stdout)
+        self.assertIn("mock_cli direct", result.stdout)
         self.assertIn("❯", result.stdout)
         self.assertIn("> MOCK:", result.stdout)
 
     def test_smoke_config_is_mock_and_structured(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "agents.toml"
-            _config_file(ROOT / "agents.toml", path, 29889, 29890)
+            _config_file(ROOT / "agents.toml", path, 29890)
             config = load(path, env={"AGENTS_PROVIDER": "mock"})
-            self.assertEqual(config.cao.provider_id, "mock_cli")
+            self.assertEqual(config.execution.provider_id, "mock_cli")
             self.assertEqual(config.project.verify, (("git", "status", "--porcelain"),))
-            self.assertEqual(config.cao.api_port, 29889)
             self.assertEqual(config.web.port, 29890)
 
     def test_isolated_environment_discards_inherited_agent_overrides(self) -> None:
@@ -44,7 +43,7 @@ class SmokeFixtureTests(unittest.TestCase):
             "AGENTS_MODEL",
             "AGENTS_EFFORT",
             "AGENTS_REASONING_EFFORT",
-            "AGENTS_CAO_PORT",
+            "AGENTS_EXECUTION_ID",
             "AGENTS_WEB_PORT",
             "AGENTS_WEB_TOKEN",
             "AGENTS_AGENT_TOKEN",
@@ -56,7 +55,7 @@ class SmokeFixtureTests(unittest.TestCase):
             "AGENTS_MODEL": "inherited-model",
             "AGENTS_EFFORT": "inherited-effort",
             "AGENTS_REASONING_EFFORT": "inherited-reasoning",
-            "AGENTS_CAO_PORT": "1",
+            "AGENTS_EXECUTION_ID": "inherited-execution",
             "AGENTS_WEB_PORT": "2",
             "AGENTS_WEB_TOKEN": "inherited-web-token",
             "AGENTS_AGENT_TOKEN": "inherited-agent-token",

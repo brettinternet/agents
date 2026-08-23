@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agents.config import AgentsConfig, CaoConfig, ModelChoice, ProjectConfig, RuntimeConfig, WebConfig
+from agents.config import AgentsConfig, ExecutionConfig, ModelChoice, ProjectConfig, RuntimeConfig, WebConfig
 from agents.db import MutationConflict, connect, migrate, utc_now
 from agents.messages import Messages, Messaging
 from agents.policy import DomainError
@@ -61,7 +61,7 @@ class MessageTests(unittest.TestCase):
                 max_consultations=3,
                 worker_grace_seconds=86400,
             ),
-            CaoConfig("2.4.1", "mock", "mock_cli", 9889, (ModelChoice(""),)),
+            ExecutionConfig("herdr", "0.8.2", None, "mock", "mock_cli", (ModelChoice(""),)),
             WebConfig("127.0.0.1", 9890),
             actors,
         )
@@ -72,15 +72,15 @@ class MessageTests(unittest.TestCase):
         self.connection.close()
         self.temp.cleanup()
 
-    def _terminal_run(self, purpose_kind: str, purpose_id: str, session_name: str, actor: str = "explorer") -> int:
+    def _terminal_run(self, purpose_kind: str, purpose_id: str, execution_name: str, actor: str = "explorer") -> int:
         now = utc_now()
         run_id = self.connection.execute(
             "INSERT INTO terminal_runs("
-            "session_name,profile_name,mcp_name,profile_sha256,provider,model,generation,"
+            "execution_name,profile_name,mcp_name,profile_sha256,provider,model,generation,"
             "actor_slug,purpose_kind,purpose_id,working_directory,token_digest,profile_state,state,created_at,updated_at"
             ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
-                session_name,
+                execution_name,
                 "profile",
                 "mcp",
                 "sha",
@@ -283,7 +283,8 @@ class MessageTests(unittest.TestCase):
         self._ensure_runner()
         terminal_run_id = self._terminal_run("work", "AGENT-DM", "runner-dm", actor="runner")
         self.connection.execute(
-            "UPDATE terminal_runs SET terminal_id=? WHERE id=?", ("runner-terminal", terminal_run_id)
+            "UPDATE terminal_runs SET backend_terminal_id=?,agent_auth_id=? WHERE id=?",
+            ("runner-terminal", "runner-auth", terminal_run_id),
         )
 
         posted = self.messaging.post("dm-runner", "human", "@runner", "hello runner")

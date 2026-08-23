@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import sqlite3
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -18,11 +19,11 @@ _ALLOWED_ENV = {
     "AGENTS_PROVIDER",
     "AGENTS_MODEL",
     "AGENTS_EFFORT",
-    "AGENTS_CAO_PORT",
     "AGENTS_WEB_PORT",
     "AGENTS_WEB_TOKEN",
 }
 _MODEL_ID = re.compile(r"^[A-Za-z0-9._:/-]{1,128}$")
+
 _EFFORT = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
 _SCHEDULE_SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _SCHEDULE_DURATION = re.compile(r"^([1-9][0-9]*)([mhd])$")
@@ -58,11 +59,12 @@ class ModelChoice:
 
 
 @dataclass(frozen=True)
-class CaoConfig:
+class ExecutionConfig:
+    backend: str
     version: str
+    session: str | None
     provider: str
     provider_id: str
-    api_port: int
     models: tuple[ModelChoice, ...]
 
 
@@ -98,7 +100,7 @@ class AgentsConfig:
     root: Path
     project: ProjectConfig
     runtime: RuntimeConfig
-    cao: CaoConfig
+    execution: ExecutionConfig
     web: WebConfig
     actors: tuple[dict[str, Any], ...]
     schedules: tuple[ScheduleConfig, ...] = ()
@@ -108,15 +110,41 @@ class AgentsConfig:
         for slug, models in self.actor_models:
             if slug == actor_slug:
                 return models
-        return self.cao.models
+        return self.execution.models
 
     @property
     def state_dir(self) -> Path:
         return self.root / ".agents"
 
     @property
-    def cao_home(self) -> Path:
-        return self.root / ".cao"
+    def db_path(self) -> Path:
+        return self.state_dir / "agents.db"
+
+    @property
+    def herdr_config(self) -> Path:
+        return self.state_dir / "herdr.toml"
+
+    @property
+    def execution_session(self) -> str | None:
+        return resolve_execution_session(self)
+
+
+def resolve_execution_session(config: AgentsConfig, connection: sqlite3.Connection | None = None) -> str | None:
+    """Return the configured session or derive it from the persisted project identity."""
+    configured = config.execution.session
+    if configured:
+        return configured
+    if connection is not None:
+        row = connection.execute("SELECT instance_id FROM project WHERE id=1").fetchone()
+        return f"agents-{row[0]}" if row is not None and row[0] else None
+    if not config.db_path.is_file():
+        return None
+    try:
+        with sqlite3.connect(config.db_path) as local:
+            row = local.execute("SELECT instance_id FROM project WHERE id=1").fetchone()
+    except sqlite3.Error:
+        return None
+    return f"agents-{row[0]}" if row is not None and row[0] else None
 
 
 def _integer(value: object, name: str, minimum: int = 1, maximum: int | None = None) -> int:
@@ -152,9 +180,9 @@ def _verify(value: object) -> tuple[tuple[str, ...], ...]:
 
 def _model_choice(model: object, effort: object = "") -> ModelChoice:
     if not isinstance(model, str) or not _MODEL_ID.fullmatch(model):
-        raise ConfigError("cao model IDs must match ^[A-Za-z0-9._:/-]{1,128}$")
+        raise ConfigError("execution model IDs must match ^[A-Za-z0-9._:/-]{1,128}$")
     if not isinstance(effort, str) or (effort and not _EFFORT.fullmatch(effort)):
-        raise ConfigError("cao effort must match ^[A-Za-z0-9._-]{1,32}$")
+        raise ConfigError("execution effort must match ^[A-Za-z0-9._-]{1,32}$")
     return ModelChoice(model, effort)
 
 
@@ -162,7 +190,7 @@ def _models(
     section: dict[str, Any],
     values: Mapping[str, str],
     provider: str,
-    name: str = "cao",
+    name: str = "execution",
 ) -> tuple[ModelChoice, ...]:
     if "AGENTS_REASONING_EFFORT" in values:
         raise ConfigError("AGENTS_REASONING_EFFORT was renamed to AGENTS_EFFORT")
@@ -327,24 +355,35 @@ def load(path: Path | None = None, env: dict[str, str] | None = None) -> AgentsC
     root = source.parent
     project_raw = raw.get("project")
     runtime_raw = raw.get("runtime")
-    cao_raw = raw.get("cao")
+    execution_raw = raw.get("execution")
     web_raw = raw.get("web")
     actors = raw.get("actors")
     if (
         not isinstance(project_raw, dict)
         or not isinstance(runtime_raw, dict)
-        or not isinstance(cao_raw, dict)
+        or not isinstance(execution_raw, dict)
         or not isinstance(web_raw, dict)
         or not isinstance(actors, list)
     ):
         raise ConfigError("agents.toml is missing required sections")
-    provider = values.get("AGENTS_PROVIDER", str(cao_raw.get("provider", "")))
+    backend = str(execution_raw.get("backend", "herdr"))
+    if backend != "herdr":
+        raise ConfigError(f"unsupported execution backend: {backend}")
+    version = execution_raw.get("version", "0.8.2")
+    if not isinstance(version, str) or not version:
+        raise ConfigError("execution.version must be a nonempty string")
+    session_value = execution_raw.get("session")
+    if session_value == "":
+        session_value = None
+    if session_value is not None and (
+        not isinstance(session_value, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", session_value)
+    ):
+        raise ConfigError("execution.session must be a Herdr session name")
+    provider = values.get("AGENTS_PROVIDER", str(execution_raw.get("provider", "")))
     if provider not in _PROVIDER_MAP:
         raise ConfigError(f"unsupported provider: {provider}")
-    cao_port_value: object = values["AGENTS_CAO_PORT"] if "AGENTS_CAO_PORT" in values else cao_raw.get("api_port", 0)
     web_port_value: object = values["AGENTS_WEB_PORT"] if "AGENTS_WEB_PORT" in values else web_raw.get("port", 0)
     try:
-        cao_port = _integer(int(cast(str | int, cao_port_value)), "cao.api_port", maximum=65535)
         web_port = _integer(int(cast(str | int, web_port_value)), "web.port", maximum=65535)
     except (TypeError, ValueError) as exc:
         raise ConfigError("configured ports must be integers") from exc
@@ -376,14 +415,15 @@ def load(path: Path | None = None, env: dict[str, str] | None = None) -> AgentsC
                     "max_consultations",
                     "worker_grace_seconds",
                 )
-            )
+            ),
         ),
-        cao=CaoConfig(
-            str(cao_raw.get("version", "")),
-            provider,
-            _PROVIDER_MAP[provider],
-            cao_port,
-            _models(cao_raw, values, provider),
+        execution=ExecutionConfig(
+            backend=backend,
+            version=version,
+            session=session_value,
+            provider=provider,
+            provider_id=_PROVIDER_MAP[provider],
+            models=_models(execution_raw, values, provider),
         ),
         web=WebConfig(host, web_port),
         actors=actor_rows,

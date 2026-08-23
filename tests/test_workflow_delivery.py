@@ -9,9 +9,10 @@ from pathlib import Path
 from typing import Any, cast
 from unittest.mock import patch
 
-from agents.config import AgentsConfig, CaoConfig, ModelChoice, ProjectConfig, RuntimeConfig, WebConfig
+from agents.config import AgentsConfig, ExecutionConfig, ModelChoice, ProjectConfig, RuntimeConfig, WebConfig
 from agents.db import connect, migrate, utc_now
 from agents.delivery import Delivery
+from agents.execution import RunHandle
 from agents.git_worktree import branch_sha, head_sha
 from agents.policy import DomainError
 from agents.reconciler import Reconciler, reserve_terminal
@@ -71,7 +72,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.root,
             ProjectConfig("test", repo, "main", (("python3", "-c", "print('ok')"),)),
             RuntimeConfig(5, 1800, 12, 4, 3, 86400),
-            CaoConfig("2.4.1", "mock", "mock_cli", 9889, (ModelChoice(""),)),
+            ExecutionConfig("herdr", "0.8.2", None, "mock", "mock_cli", (ModelChoice(""),)),
             WebConfig("127.0.0.1", 9890),
             actors,
         )
@@ -145,8 +146,9 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         )
         now = utc_now()
         self.connection.execute(
-            "UPDATE terminal_runs SET state='live',profile_state='installed',terminal_id=?,updated_at=? WHERE id=?",
-            ("yapper-persistent", now, persistent["id"]),
+            "UPDATE terminal_runs SET state='live',profile_state='installed',backend_run_id=?,"
+            "backend_terminal_id=?,updated_at=? WHERE id=?",
+            (str(persistent["execution_name"]), "yapper-persistent", now, persistent["id"]),
         )
 
         assigned = self.delivery.dispatch_consultation_next()
@@ -357,8 +359,9 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         )
         now = utc_now()
         self.connection.execute(
-            "UPDATE terminal_runs SET state='live',profile_state='installed',terminal_id=?,updated_at=? WHERE id=?",
-            ("yapper-persistent", now, persistent["id"]),
+            "UPDATE terminal_runs SET state='live',profile_state='installed',backend_run_id=?,"
+            "backend_terminal_id=?,updated_at=? WHERE id=?",
+            (str(persistent["execution_name"]), "yapper-persistent", now, persistent["id"]),
         )
         dispatch = self.delivery.dispatch_next()
         self.assertIsNotNone(dispatch)
@@ -527,15 +530,13 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         )
 
     def test_restart_blocker_deletes_old_terminal_and_dispatches_new_generation(self):
-        from agents.cao_client import CaoNotFound
-
         item, _ = self.ready_item()
         dispatch = cast(dict[str, Any], self.delivery.dispatch_next())
         old_run_id = int(dispatch["terminal_run_id"])
         old = self.connection.execute("SELECT * FROM terminal_runs WHERE id=?", (old_run_id,)).fetchone()
         self.connection.execute(
-            "UPDATE terminal_runs SET state='live',terminal_id=?,updated_at=? WHERE id=?",
-            ("old-terminal", utc_now(), old_run_id),
+            "UPDATE terminal_runs SET state='live',backend_run_id=?,backend_terminal_id=?,updated_at=? WHERE id=?",
+            (str(old["execution_name"]), "old-terminal", utc_now(), old_run_id),
         )
         self.connection.execute(
             "UPDATE launch_attempts SET state='succeeded',counted=1,updated_at=? WHERE terminal_run_id=?",
@@ -554,25 +555,20 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         ).fetchone()
         self.assertIsNotNone(blocker)
 
-        class FakeCao:
-            def __init__(self, name: str):
-                self.sessions = {name}
-                self.deleted: list[str] = []
+        class FakeBackend:
+            def __init__(self):
+                self.deleted: list[RunHandle] = []
 
-            def get_session(self, name: str) -> dict[str, str]:
-                if name not in self.sessions:
-                    raise CaoNotFound(name)
-                return {"name": name}
+            def delete_run(self, handle: RunHandle) -> None:
+                self.deleted.append(handle)
 
-            def delete_session(self, name: str) -> None:
-                self.sessions.discard(name)
-                self.deleted.append(name)
-
-        fake = FakeCao(str(old["session_name"]))
-        delivery = Delivery(self.config, self.connection, client=fake)
+        fake = FakeBackend()
+        delivery = Delivery(self.config, self.connection, backend=cast(Any, fake))
         result = delivery.resolve_blocker("human", int(blocker["id"]), "replace", "restart")
         self.assertEqual(result["state"], "resolved")
-        self.assertIn(str(old["session_name"]), fake.deleted)
+        self.assertEqual(
+            fake.deleted, [RunHandle(str(old["execution_name"]), str(old["execution_name"]), "old-terminal")]
+        )
         self.assertEqual(
             self.connection.execute(
                 "SELECT state,token_revoked_at FROM terminal_runs WHERE id=?", (old_run_id,)
@@ -590,4 +586,4 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         ).fetchone()
         self.assertIsNotNone(replacement)
         self.assertEqual(replacement["generation"], 2)
-        self.assertIn("-w-1-2-yapper-g0002", replacement["session_name"])
+        self.assertIn("-w-1-2-yapper-g0002", replacement["execution_name"])

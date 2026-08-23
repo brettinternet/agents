@@ -30,7 +30,7 @@ class McpBoundaryTests(unittest.TestCase):
                 {
                     "AGENTS_API_URL": "https://example.com",
                     "AGENTS_AGENT_TOKEN": "secret",
-                    "CAO_TERMINAL_ID": "terminal",
+                    "AGENTS_EXECUTION_ID": "execution",
                 },
                 clear=True,
             ),
@@ -38,7 +38,7 @@ class McpBoundaryTests(unittest.TestCase):
         ):
             mcp_server.backlog_get("AGENT-0001")
 
-    def test_sends_bearer_terminal_and_bounded_json(self):
+    def test_sends_bearer_execution_id_and_bounded_json(self):
         response = httpx.Response(
             200,
             json={"ok": True, "data": {"id": "AGENT-0001"}},
@@ -50,7 +50,7 @@ class McpBoundaryTests(unittest.TestCase):
                 {
                     "AGENTS_API_URL": "http://127.0.0.1:9890",
                     "AGENTS_AGENT_TOKEN": "secret",
-                    "CAO_TERMINAL_ID": "terminal",
+                    "AGENTS_EXECUTION_ID": "execution",
                 },
                 clear=True,
             ),
@@ -60,7 +60,7 @@ class McpBoundaryTests(unittest.TestCase):
             self.assertEqual(data["id"], "AGENT-0001")
             headers = request.call_args.kwargs["headers"]
             self.assertEqual(headers["Authorization"], "Bearer secret")
-            self.assertEqual(headers["X-CAO-Terminal-ID"], "terminal")
+            self.assertEqual(headers["X-Agents-Execution-ID"], "execution")
             self.assertNotIn("secret", str(request.call_args.kwargs["json"]))
 
     def test_query_parameters_are_encoded_and_cursor_is_forwarded(self):
@@ -75,7 +75,7 @@ class McpBoundaryTests(unittest.TestCase):
                 {
                     "AGENTS_API_URL": "http://127.0.0.1:9890",
                     "AGENTS_AGENT_TOKEN": "secret",
-                    "CAO_TERMINAL_ID": "terminal",
+                    "AGENTS_EXECUTION_ID": "execution",
                 },
                 clear=True,
             ),
@@ -94,7 +94,7 @@ class McpBoundaryTests(unittest.TestCase):
             {
                 "AGENTS_API_URL": "http://127.0.0.1:9890",
                 "AGENTS_AGENT_TOKEN": "secret",
-                "CAO_TERMINAL_ID": "terminal",
+                "AGENTS_EXECUTION_ID": "execution",
             },
             clear=True,
         ):

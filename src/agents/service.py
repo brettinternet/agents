@@ -10,10 +10,11 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Mapping
 from pathlib import Path
 from typing import IO, Any
 
-from .config import AgentsConfig
+from .config import AgentsConfig, resolve_execution_session
 
 
 class ServiceError(RuntimeError):
@@ -21,15 +22,81 @@ class ServiceError(RuntimeError):
 
 
 _LOCK_HANDLE: IO[str] | None = None
-
 _EXPLICIT_RESTART = "run `task server:stop` and then `task server:start` explicitly"
+_HERDR_CONFIG = "[session]\nresume_agents_on_restore = false\n\n[experimental]\npane_history = false\n"
 
 
-def _terminal_matches(row: Any, terminal: dict[str, Any]) -> bool:
-    identity = terminal.get("session_name", terminal.get("tmux_session", terminal.get("name")))
-    provider = terminal.get("provider", terminal.get("provider_id"))
-    profile = terminal.get("profile", terminal.get("profile_name", terminal.get("agent_profile")))
-    return identity == row["session_name"] and provider == row["provider"] and profile == row["profile_name"]
+def _herdr_symbols() -> tuple[Any, Any, Any]:
+    from .herdr_client import HerdrClient, herdr_executable, herdr_socket_path
+
+    return HerdrClient, herdr_executable, herdr_socket_path
+
+
+def _session(config: AgentsConfig) -> str:
+    value = resolve_execution_session(config)
+    if not value:
+        raise ServiceError("Agents project identity is missing; initialize the database before starting services")
+    return value
+
+
+def _herdr_environment(config: AgentsConfig) -> dict[str, str]:
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "AGENTS_CONFIG": str(config.source),
+            "HERDR_CONFIG_PATH": str(config.herdr_config),
+        }
+    )
+    return environment
+
+
+def _write_herdr_config(config: AgentsConfig) -> None:
+    state = config.state_dir
+    state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if state.is_symlink() or not state.is_dir() or state.stat().st_mode & 0o077:
+        raise ServiceError(".agents must have mode 0700")
+    path = config.herdr_config
+    if path.exists() and (path.is_symlink() or not path.is_file()):
+        raise ServiceError(f"unsafe Herdr config path: {path}")
+    path.write_text(_HERDR_CONFIG, encoding="utf-8")
+    path.chmod(0o600)
+
+
+def _herdr_client(config: AgentsConfig, session: str) -> Any:
+    HerdrClient, _, herdr_socket_path = _herdr_symbols()
+    environment = _herdr_environment(config)
+    return HerdrClient(herdr_socket_path(session, env=environment), expected_version=config.execution.version)
+
+
+def _herdr_health(config: AgentsConfig, session: str) -> bool:
+    client = _herdr_client(config, session)
+    try:
+        health = client.health()
+        if isinstance(health, Mapping):
+            return bool(
+                health.get("healthy")
+                and health.get("version") == config.execution.version
+                and health.get("protocol") == 20
+                and health.get("supports_events")
+            )
+        return bool(
+            health.healthy
+            and health.version == config.execution.version
+            and health.protocol == 20
+            and health.supports_events
+        )
+    except Exception:
+        return False
+    finally:
+        client.close()
+
+
+def _web_health_ready(url: str) -> bool:
+    try:
+        with urllib.request.urlopen(url, timeout=2) as response:
+            return 200 <= response.status < 300
+    except urllib.error.URLError, TimeoutError, OSError:
+        return False
 
 
 def _port_free(host: str, port: int) -> bool:
@@ -41,14 +108,6 @@ def _port_free(host: str, port: int) -> bool:
             return True
         except OSError:
             return False
-
-
-def _health_ready(url: str) -> bool:
-    try:
-        with urllib.request.urlopen(url, timeout=2) as response:
-            return 200 <= response.status < 300
-    except urllib.error.URLError, TimeoutError, OSError:
-        return False
 
 
 def _process_started(pid: int) -> str:
@@ -118,13 +177,61 @@ def acquire_daemon_lock(state_dir: Path) -> IO[str]:
     return handle
 
 
+def _herdr_command(config: AgentsConfig, session: str, *arguments: str) -> tuple[list[str], dict[str, str]]:
+    _, herdr_executable, _ = _herdr_symbols()
+    try:
+        executable = herdr_executable()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ServiceError(f"required Herdr executable is not installed: {exc}") from exc
+    return [str(executable), "--session", session, *arguments], _herdr_environment(config)
+
+
+def _launch_process(
+    config: AgentsConfig,
+    name: str,
+    executable: Path,
+    arguments: list[str],
+    environment: dict[str, str],
+) -> subprocess.Popen[bytes]:
+    log = (config.state_dir / f"{name}.log").open("ab", buffering=0)
+    try:
+        process = subprocess.Popen(
+            [str(executable), *arguments],
+            cwd=config.root,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except BaseException:
+        log.close()
+        raise
+    _record(config.state_dir / f"{name}.pid", process, executable)
+    return process
+
+
+def _stop_started_process(config: AgentsConfig, name: str, process: subprocess.Popen[bytes]) -> None:
+    """Stop a process launched by this call, tolerating an exit before readiness."""
+    if process.poll() is None:
+        _stop_named(config, name)
+        return
+    path = config.state_dir / f"{name}.pid"
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except OSError, ValueError, json.JSONDecodeError:
+        return
+    if record.get("pid") == process.pid:
+        path.unlink(missing_ok=True)
+
+
 def start(config: AgentsConfig) -> None:
     state = config.state_dir
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     if state.stat().st_mode & 0o077:
         raise ServiceError(".agents must have mode 0700")
-    names = ("agentsd", "cao")
-    paths = {name: state / f"{name}.pid" for name in names}
+    session = _session(config)
+    paths = {name: state / f"{name}.pid" for name in ("agentsd", "herdr")}
     try:
         owned = {name: _owned(path) for name, path in paths.items()}
     except ServiceError as exc:
@@ -132,154 +239,284 @@ def start(config: AgentsConfig) -> None:
     stale = [name for name, path in paths.items() if (path.exists() or path.is_symlink()) and owned[name] is None]
     if stale:
         raise ServiceError(f"stale service ownership record for {', '.join(stale)}; {_EXPLICIT_RESTART}")
-    running = [name for name, process in owned.items() if process is not None]
-    if len(running) == len(names):
-        if _health_ready(f"http://127.0.0.1:{config.cao.api_port}/health") and _health_ready(
-            f"http://{config.web.host}:{config.web.port}/health"
-        ):
-            return
-        raise ServiceError(f"owned services are running but unhealthy; {_EXPLICIT_RESTART}")
-    if running:
-        raise ServiceError(f"incomplete owned service set ({', '.join(running)} running); {_EXPLICIT_RESTART}")
-    if not _port_free("127.0.0.1", config.cao.api_port) or not _port_free(config.web.host, config.web.port):
-        raise ServiceError(
-            "configured listener is already owned by another process; stop the conflicting process or change the "
-            "configured ports, then rerun `task init`"
-        )
-    cao = config.root / ".tools" / "bin" / "cao-server"
-    agentsd = config.root / ".venv" / "bin" / "agentsd"
-    if not cao.is_file() or not os.access(cao, os.X_OK) or not agentsd.is_file() or not os.access(agentsd, os.X_OK):
-        raise ServiceError("required managed executables are not installed")
-    config.cao_home.mkdir(parents=True, exist_ok=True, mode=0o700)
-    env = os.environ.copy()
-    env.update(
-        {
-            "CAO_HOME_DIR": str(config.cao_home),
-            "CAO_API_PORT": str(config.cao.api_port),
-            "AGENTS_CONFIG": str(config.source),
-        }
-    )
-    cao_env = env | {"CAO_API_HOST": "127.0.0.1"}
-    cao_log = (state / "cao.log").open("ab", buffering=0)
-    web_log = (state / "agentsd.log").open("ab", buffering=0)
-    cao_process = subprocess.Popen(
-        [str(cao), "--port", str(config.cao.api_port), "--terminal", "tmux"],
-        cwd=config.root,
-        env=cao_env,
-        stdin=subprocess.DEVNULL,
-        stdout=cao_log,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
-    _record(state / "cao.pid", cao_process, cao)
-    web_process = subprocess.Popen(
-        [str(agentsd)],
-        cwd=config.root,
-        env=env,
-        stdin=subprocess.DEVNULL,
-        stdout=web_log,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
-    _record(state / "agentsd.pid", web_process, agentsd)
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
-        if cao_process.poll() is not None or web_process.poll() is not None:
-            stop(config)
-            raise ServiceError("a service exited before readiness")
-        cao_ready = not _port_free("127.0.0.1", config.cao.api_port) and _health_ready(
-            f"http://127.0.0.1:{config.cao.api_port}/health"
-        )
-        web_ready = not _port_free(config.web.host, config.web.port) and _health_ready(
-            f"http://{config.web.host}:{config.web.port}/health"
-        )
-        if cao_ready and web_ready:
-            return
-        time.sleep(0.25)
-    stop(config)
+
+    herdr_owned = owned["herdr"] is not None
+    agentsd_owned = owned["agentsd"] is not None
+    herdr_ready = herdr_owned and _herdr_health(config, session)
+    web_ready = agentsd_owned and _web_health_ready(f"http://{config.web.host}:{config.web.port}/health")
+    if herdr_owned and not herdr_ready:
+        raise ServiceError(f"owned Herdr is running but unhealthy; {_EXPLICIT_RESTART}")
+    if agentsd_owned and not herdr_owned:
+        raise ServiceError(f"Agents is running without its owned Herdr session; {_EXPLICIT_RESTART}")
+    if herdr_ready and agentsd_owned and not web_ready:
+        raise ServiceError(f"owned Agents service is running but unhealthy; {_EXPLICIT_RESTART}")
+    if herdr_ready and web_ready:
+        return
+
+    _write_herdr_config(config)
+    herdr_process: subprocess.Popen[bytes] | None = None
+    agentsd_process: subprocess.Popen[bytes] | None = None
+    try:
+        if not herdr_ready:
+            command, environment = _herdr_command(config, session, "server")
+            herdr_process = _launch_process(config, "herdr", Path(command[0]), command[1:], environment)
+        if not agentsd_owned:
+            agentsd = config.root / ".venv" / "bin" / "agentsd"
+            if not agentsd.is_file() or not os.access(agentsd, os.X_OK):
+                raise ServiceError("required managed executable is not installed: agentsd")
+            agentsd_process = _launch_process(config, "agentsd", agentsd, [], _herdr_environment(config))
+
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if herdr_process is not None and herdr_process.poll() is not None:
+                raise ServiceError("Herdr exited before readiness")
+            if agentsd_process is not None and agentsd_process.poll() is not None:
+                raise ServiceError("agentsd exited before readiness")
+            if _herdr_health(config, session) and _web_health_ready(
+                f"http://{config.web.host}:{config.web.port}/health"
+            ):
+                return
+            time.sleep(0.25)
+    except BaseException:
+        if agentsd_process is not None:
+            _stop_started_process(config, "agentsd", agentsd_process)
+        if herdr_process is not None:
+            _stop_started_process(config, "herdr", herdr_process)
+        raise
+    if agentsd_process is not None:
+        _stop_started_process(config, "agentsd", agentsd_process)
+    if herdr_process is not None:
+        _stop_started_process(config, "herdr", herdr_process)
     raise ServiceError("services did not become ready within 30 seconds")
 
 
-def _stop_named(config: AgentsConfig, name: str) -> None:
+def _stop_named(config: AgentsConfig, name: str, *, remove_record: bool = True) -> Path | None:
     path = config.state_dir / f"{name}.pid"
+    if not path.exists() and not path.is_symlink():
+        return None
     owned = _owned(path)
-    if owned:
-        pid, _ = owned
+    if owned is None:
+        raise ServiceError(f"cannot stop unowned {name} process; {_EXPLICIT_RESTART}")
+    pid, _ = owned
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except PermissionError:
+        os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
         try:
-            os.killpg(pid, signal.SIGTERM)
+            os.kill(pid, 0)
+        except OSError:
+            break
+        time.sleep(0.1)
+    else:
+        try:
+            os.killpg(pid, signal.SIGKILL)
         except PermissionError:
-            os.kill(pid, signal.SIGTERM)
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            try:
-                os.kill(pid, 0)
-            except OSError:
-                break
-            time.sleep(0.1)
-        else:
-            try:
-                os.killpg(pid, signal.SIGKILL)
-            except PermissionError:
-                os.kill(pid, signal.SIGKILL)
-    path.unlink(missing_ok=True)
+            os.kill(pid, signal.SIGKILL)
+    if remove_record:
+        path.unlink(missing_ok=True)
+    return path
 
 
 def stop_agents(config: AgentsConfig) -> None:
-    """Stop agentsd and its reconciler while preserving CAO and state."""
+    """Stop agentsd while deliberately retaining the owned Herdr session."""
     _stop_named(config, "agentsd")
 
 
-def stop_cao(config: AgentsConfig) -> None:
-    """Stop the CAO service after Agents-owned session cleanup."""
-    _stop_named(config, "cao")
+def stop_herdr(config: AgentsConfig) -> None:
+    """Stop the owned Herdr server without deleting its persisted session."""
+    _stop_named(config, "herdr")
 
 
 def stop(config: AgentsConfig) -> None:
     stop_agents(config)
-    stop_cao(config)
+
+
+def _workspaces(snapshot: Any) -> list[Mapping[str, Any]]:
+    if not isinstance(snapshot, Mapping):
+        return []
+    payload = snapshot.get("snapshot")
+    if not isinstance(payload, Mapping):
+        return []
+    value = payload.get("workspaces")
+    return [entry for entry in value if isinstance(entry, Mapping)] if isinstance(value, list) else []
+
+
+def _workspace_label(workspace: Mapping[str, Any]) -> str:
+    value = workspace.get("label")
+    return value if isinstance(value, str) else ""
+
+
+def _workspace_id(workspace: Mapping[str, Any]) -> str | None:
+    value = workspace.get("workspace_id")
+    return value if isinstance(value, str) and value else None
+
+
+def _workspace_cwd(workspace: Mapping[str, Any], snapshot: Mapping[str, Any]) -> str | None:
+    workspace_id = _workspace_id(workspace)
+    panes = snapshot.get("panes")
+    if workspace_id is not None and isinstance(panes, list):
+        for pane in panes:
+            if isinstance(pane, Mapping) and pane.get("workspace_id") == workspace_id:
+                value = pane.get("cwd")
+                if isinstance(value, str):
+                    return value
+    worktree = workspace.get("worktree")
+    if isinstance(worktree, Mapping):
+        value = worktree.get("checkout_path")
+        if isinstance(value, str):
+            return value
+    return None
+
+
+def _close_mapped_workspaces(client: Any, prefix: str, expected_cwds: set[str]) -> list[str]:
+    expected_cwds = {str(Path(cwd).resolve()) for cwd in expected_cwds}
+    failures: list[str] = []
+    try:
+        response = client.request("session.snapshot", {})
+    except Exception as exc:
+        return [f"session snapshot: {exc}"]
+    snapshot = response.get("snapshot") if isinstance(response, Mapping) else None
+    if not isinstance(snapshot, Mapping):
+        return ["session snapshot: malformed response"]
+    matches = [workspace for workspace in _workspaces(response) if _workspace_label(workspace).startswith(prefix)]
+    for workspace in matches:
+        label = _workspace_label(workspace)
+        workspace_id = _workspace_id(workspace)
+        cwd = _workspace_cwd(workspace, snapshot)
+        if workspace_id is None:
+            failures.append(f"{label}: workspace identity unavailable")
+            continue
+        if cwd is None or (expected_cwds and str(Path(cwd).resolve()) not in expected_cwds):
+            failures.append(f"{label}: workspace cwd does not match Agents state")
+            continue
+        try:
+            client.request("workspace.close", {"workspace_id": workspace_id})
+        except Exception as exc:
+            failures.append(f"{label}: workspace close: {exc}")
+    try:
+        remaining = [
+            workspace
+            for workspace in _workspaces(client.request("session.snapshot", {}))
+            if _workspace_label(workspace).startswith(prefix)
+        ]
+    except Exception as exc:
+        failures.append(f"session snapshot after close: {exc}")
+    else:
+        failures.extend(f"{_workspace_label(workspace)}: workspace still exists" for workspace in remaining)
+    return failures
+
+
+def _delete_session(config: AgentsConfig, session: str) -> None:
+    command, environment = _herdr_command(config, session, "session", "delete", session)
+    result = subprocess.run(command, cwd=config.root, env=environment, capture_output=True, text=True, check=False)
+    if result.returncode:
+        detail = (result.stderr or result.stdout or "session delete failed").strip()
+        raise ServiceError(detail)
+
+
+def _cleanup_profiles(config: AgentsConfig, connection: Any, rows: list[Any], project: Any) -> list[str]:
+    """Remove manifest-owned provider artifacts after external workspaces are gone."""
+    from .auth import derive_agent_token, read_private_secret
+    from .profiles import remove_profile
+
+    key = bytes.fromhex(read_private_secret(config.state_dir / "agent-auth-key"))
+    failures: list[str] = []
+    for row in rows:
+        profile = str(row["profile_name"])
+        if profile in {"", "reserved"}:
+            continue
+        artifacts = [
+            {
+                "kind": str(item["kind"]),
+                "path": str(item["path"]),
+                "sha256": str(item["expected_sha256"]),
+                "fragment_key": item["fragment_key"],
+                "expected_json_redacted": item["expected_json_redacted"],
+                "secret_fields_json": item["secret_fields_json"],
+            }
+            for item in connection.execute(
+                "SELECT kind,path,fragment_key,expected_sha256,expected_json_redacted,secret_fields_json "
+                "FROM terminal_artifacts WHERE terminal_run_id=? AND state IN ('staged','installed')",
+                (row["id"],),
+            )
+        ]
+        profile_path = config.state_dir / "profiles" / f"{profile}.md"
+        if not artifacts and profile_path.is_file() and not profile_path.is_symlink():
+            artifacts = [{"path": str(profile_path), "sha256": str(row["profile_sha256"])}]
+        secret_values = {
+            "AGENTS_AGENT_TOKEN": derive_agent_token(
+                key, str(project["instance_id"]), int(row["id"]), int(row["generation"])
+            )
+        }
+        try:
+            remove_profile(
+                profile,
+                profile_path,
+                artifacts,
+                config.state_dir / "profiles.lock",
+                runtime_dir=config.state_dir / "runtime",
+                secret_values=secret_values,
+            )
+        except Exception as exc:
+            failures.append(f"profile {profile}: {exc}")
+    return failures
 
 
 def shutdown(config: AgentsConfig, client: Any | None = None) -> None:
-    """Stop Agents, fence its state, clean mapped CAO sessions, then stop CAO."""
-    from .auth import derive_agent_token, read_private_secret
-    from .cao_client import CaoClient, CaoNotFound
+    """Fence durable runs, close mapped workspaces, remove artifacts, and delete the Herdr session."""
     from .db import connect, utc_now
-    from .profiles import remove_profile, validate_manifest_artifact
 
-    database = config.state_dir / "agents.db"
+    stop_agents(config)
+    database = config.db_path
     if not database.exists():
-        stop_agents(config)
-        stop_cao(config)
+        session = _session(config)
+        herdr_client = client
+        if herdr_client is None:
+            herdr_client = _herdr_client(config, session)
+        try:
+            failures = _close_mapped_workspaces(
+                herdr_client,
+                f"{session}-",
+                {str(config.project.path.resolve())},
+            )
+        finally:
+            if client is None and herdr_client is not None:
+                herdr_client.close()
+        if failures:
+            raise ServiceError("shutdown cleanup incomplete: " + "; ".join(failures))
+        pid_record = _stop_named(config, "herdr", remove_record=False)
+        _delete_session(config, session)
+        if pid_record is not None:
+            pid_record.unlink(missing_ok=True)
         return
 
-    # Quiesce the reconciler before opening state.  Holding this lock after the
-    # process exits prevents a replacement agentsd from reserving a run
-    # between the durable snapshot and external CAO cleanup.
-    stop_agents(config)
     shutdown_lock = acquire_daemon_lock(config.state_dir)
     connection = connect(database)
-    cao_client = client or CaoClient(config.cao.api_port)
-    failures: list[str] = []
+    herdr_client: Any | None = client
     cleanup_complete = False
+    session: str | None = None
     try:
         project = connection.execute("SELECT instance_id FROM project WHERE id=1").fetchone()
         if project is None:
-            raise ServiceError("Agents project identity is missing; CAO was left running")
-        key = bytes.fromhex(read_private_secret(config.state_dir / "agent-auth-key"))
-        prefix = f"cao-agents-{project['instance_id']}-"
+            raise ServiceError("Agents project identity is missing; Herdr was left running")
+        session = resolve_execution_session(config, connection)
+        if not session:
+            raise ServiceError("Agents execution session is not configured or initialized")
+        prefix = f"agents-{project['instance_id']}-"
         now = utc_now()
         connection.execute("BEGIN IMMEDIATE")
         try:
             rows = list(
                 connection.execute(
-                    "SELECT * FROM terminal_runs WHERE session_name LIKE ? ORDER BY id",
-                    (f"{prefix}%",),
+                    "SELECT * FROM terminal_runs WHERE execution_name LIKE ? ORDER BY id", (f"{prefix}%",)
                 )
             )
             connection.execute(
                 "UPDATE terminal_runs SET token_revoked_at=COALESCE(token_revoked_at,?),"
-                "state=CASE WHEN state IN ('live','creating','reserved','retained') "
-                "THEN 'ending' ELSE state END,updated_at=? WHERE session_name LIKE ?",
+                "state=CASE WHEN state IN ('live','creating','reserved','retained') THEN 'ending' ELSE state END,"
+                "updated_at=? WHERE execution_name LIKE ?",
                 (now, now, f"{prefix}%"),
             )
             connection.execute(
@@ -287,13 +524,13 @@ def shutdown(config: AgentsConfig, client: Any | None = None) -> None:
                 "WHEN state IN ('posting','uncertain') THEN 'failed' ELSE state END,"
                 "counted=CASE WHEN state='reserved' THEN 0 ELSE counted END,error=COALESCE(error,'shutdown'),"
                 "updated_at=? WHERE terminal_run_id IN "
-                "(SELECT id FROM terminal_runs WHERE session_name LIKE ?) "
+                "(SELECT id FROM terminal_runs WHERE execution_name LIKE ?) "
                 "AND state IN ('reserved','posting','uncertain')",
                 (now, f"{prefix}%"),
             )
             connection.execute(
                 "UPDATE actor_leases SET released_at=? WHERE terminal_run_id IN "
-                "(SELECT id FROM terminal_runs WHERE session_name LIKE ?) AND released_at IS NULL",
+                "(SELECT id FROM terminal_runs WHERE execution_name LIKE ?) AND released_at IS NULL",
                 (now, f"{prefix}%"),
             )
             connection.commit()
@@ -301,183 +538,40 @@ def shutdown(config: AgentsConfig, client: Any | None = None) -> None:
             connection.rollback()
             raise
 
-        names = {str(row["session_name"]) for row in rows}
-        list_sessions = getattr(cao_client, "list_sessions", None)
-        if callable(list_sessions):
-            try:
-                sessions = list_sessions()
-            except Exception as exc:
-                failures.append(f"list sessions: {exc}")
-            else:
-                if not isinstance(sessions, list):
-                    failures.append("list sessions: response is not an array")
-                    sessions = []
-                for session in sessions:
-                    if not isinstance(session, dict):
-                        continue
-                    name = session.get("name", session.get("session_name"))
-                    if isinstance(name, str) and name.startswith(prefix):
-                        names.add(name)
-        unsafe_terminal_rows: set[int] = set()
-        terminal_ids: dict[int, str] = {}
-        for row in rows:
-            terminal_id = row["terminal_id"]
-            if isinstance(terminal_id, str):
-                terminal_ids[int(row["id"])] = terminal_id
-                continue
-            if str(row["provider"]) != "claude_code" or str(row["profile_state"]) == "reserved":
-                continue
-            try:
-                terminals = cao_client.list_terminals(str(row["session_name"]))
-            except Exception as exc:
-                unsafe_terminal_rows.add(int(row["id"]))
-                failures.append(f"{row['session_name']}: list terminals: {exc}")
-                continue
-            if (
-                not isinstance(terminals, list)
-                or len(terminals) != 1
-                or not isinstance(terminals[0], dict)
-                or not _terminal_matches(row, terminals[0])
-            ):
-                unsafe_terminal_rows.add(int(row["id"]))
-                failures.append(f"{row['session_name']}: exact terminal identity unavailable")
-                continue
-            value = terminals[0].get("id") or terminals[0].get("terminal_id")
-            if not isinstance(value, str):
-                unsafe_terminal_rows.add(int(row["id"]))
-                failures.append(f"{row['session_name']}: exact terminal identity unavailable")
-                continue
-            terminal_ids[int(row["id"])] = value
-
-        unsafe_session_names = {str(row["session_name"]) for row in rows if int(row["id"]) in unsafe_terminal_rows}
-        for name in sorted(names):
-            if name in unsafe_session_names:
-                continue
-            try:
-                cao_client.delete_session(name)
-                cao_client.get_session(name)
-            except CaoNotFound:
-                continue
-            except Exception as exc:
-                failures.append(f"{name}: {exc}")
-                continue
-            failures.append(f"{name}: session still exists after deletion")
-
-        cao = config.root / ".tools" / "bin" / "cao"
-        if not cao.is_file():
-            cao = config.root / ".tools" / "bin" / "cao-server"
-        for row in rows:
-            profile = str(row["profile_name"])
-            artifact_rows = list(
-                connection.execute(
-                    "SELECT kind,path,fragment_key,expected_sha256,expected_json_redacted,secret_fields_json "
-                    "FROM terminal_artifacts WHERE terminal_run_id=? AND state IN ('staged','installed')",
-                    (row["id"],),
-                )
-            )
-            profile_artifacts = [
-                {
-                    "kind": str(item["kind"]),
-                    "path": str(item["path"]),
-                    "sha256": str(item["expected_sha256"]),
-                    "fragment_key": item["fragment_key"],
-                    "expected_json_redacted": item["expected_json_redacted"],
-                    "secret_fields_json": item["secret_fields_json"],
-                }
-                for item in artifact_rows
-                if not str(item["kind"]).startswith("runtime_")
-            ]
-            profile_path = config.state_dir / "profiles" / f"{profile}.md"
-            if not profile_artifacts and profile_path.is_file() and not profile_path.is_symlink():
-                profile_artifacts = [{"path": str(profile_path), "sha256": str(row["profile_sha256"])}]
-            secret_values = {
-                "AGENTS_AGENT_TOKEN": derive_agent_token(
-                    key, str(project["instance_id"]), int(row["id"]), int(row["generation"])
-                )
-            }
-            try:
-                if int(row["id"]) in unsafe_terminal_rows:
-                    raise ServiceError("exact terminal identity unavailable; runtime cleanup was not attempted")
-                if profile not in {"", "reserved"}:
-                    if not cao.is_file():
-                        raise ServiceError(f"managed cao executable is missing for profile cleanup: {profile}")
-                    remove_profile(
-                        cao,
-                        config.cao_home,
-                        profile,
-                        profile_path,
-                        profile_artifacts,
-                        config.state_dir / "profiles.lock",
-                        secret_values=secret_values,
-                    )
-                terminal_id = terminal_ids.get(int(row["id"]))
-                if str(row["provider"]) == "claude_code" and terminal_id is not None:
-                    if not terminal_id or Path(terminal_id).name != terminal_id or terminal_id in {".", ".."}:
-                        raise ServiceError(f"unsafe terminal ID for runtime cleanup: {terminal_id}")
-                    runtime_root = (config.cao_home / "tmp").resolve()
-                    runtime_paths = {
-                        "runtime_prompt": (runtime_root / f"{terminal_id}.prompt").resolve(),
-                        "runtime_mcp": (runtime_root / f"{terminal_id}.mcp.json").resolve(),
-                    }
-                    if any(path.parent != runtime_root for path in runtime_paths.values()):
-                        raise ServiceError(f"runtime path escaped managed root: {terminal_id}")
-                    manifests = {
-                        str(item["kind"]): item for item in artifact_rows if str(item["kind"]).startswith("runtime_")
-                    }
-                    for kind, path in runtime_paths.items():
-                        manifest = manifests.get(kind)
-                        if manifest is not None and Path(str(manifest["path"])).resolve() != path:
-                            raise ServiceError(f"runtime manifest path mismatch: {manifest['path']}")
-                        if not path.exists():
-                            continue
-                        if manifest is not None:
-                            if not validate_manifest_artifact(
-                                path,
-                                str(manifest["expected_sha256"]),
-                                fragment_key=manifest["fragment_key"],
-                                expected_json_redacted=manifest["expected_json_redacted"],
-                                secret_fields_json=manifest["secret_fields_json"],
-                                secret_values=secret_values,
-                                require_secret_values=True,
-                            ):
-                                raise ServiceError(f"runtime artifact changed: {path}")
-                        elif path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o777 != 0o600:
-                            raise ServiceError(f"unsafe unsealed runtime artifact: {path}")
-                        path.unlink()
-                now = utc_now()
-                connection.execute("BEGIN IMMEDIATE")
-                connection.execute(
-                    "UPDATE actor_leases SET released_at=? WHERE terminal_run_id=? AND released_at IS NULL",
-                    (now, row["id"]),
-                )
-                connection.execute(
-                    "UPDATE terminal_artifacts SET state='removed',updated_at=? "
-                    "WHERE terminal_run_id=? AND state IN ('staged','installed')",
-                    (now, row["id"]),
-                )
-                connection.execute(
-                    "UPDATE terminal_runs SET state='ended',profile_state='removed',updated_at=? WHERE id=?",
-                    (now, row["id"]),
-                )
-                connection.commit()
-            except Exception as exc:
-                if connection.in_transaction:
-                    connection.rollback()
-                failures.append(f"profile {profile}: {exc}")
+        expected_cwds = {str(Path(row["working_directory"]).resolve()) for row in rows}
+        if herdr_client is None:
+            herdr_client = _herdr_client(config, session)
+        failures = _close_mapped_workspaces(herdr_client, prefix, expected_cwds)
+        failures.extend(_cleanup_profiles(config, connection, rows, project))
         if failures:
             raise ServiceError("shutdown cleanup incomplete: " + "; ".join(failures))
+        for row in rows:
+            now = utc_now()
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "UPDATE terminal_artifacts SET state='removed',updated_at=? "
+                "WHERE terminal_run_id=? AND state IN ('staged','installed')",
+                (now, row["id"]),
+            )
+            connection.execute(
+                "UPDATE terminal_runs SET state='ended',profile_state='removed',updated_at=? WHERE id=?",
+                (now, row["id"]),
+            )
+            connection.commit()
         cleanup_complete = True
     finally:
-        try:
-            close = getattr(cao_client, "close", None)
-            if callable(close):
-                close()
-        finally:
-            connection.close()
-            shutdown_lock.close()
-            if cleanup_complete:
-                stop_cao(config)
+        if herdr_client is not None and client is None:
+            herdr_client.close()
+        connection.close()
+        shutdown_lock.close()
+        if cleanup_complete:
+            if session is None:
+                raise ServiceError("Agents execution session disappeared during shutdown")
+            pid_record = _stop_named(config, "herdr", remove_record=False)
+            _delete_session(config, session)
+            if pid_record is not None:
+                pid_record.unlink(missing_ok=True)
 
 
 def status(config: AgentsConfig) -> dict[str, bool]:
-    return {name: _owned(config.state_dir / f"{name}.pid") is not None for name in ("agentsd", "cao")}
+    return {name: _owned(config.state_dir / f"{name}.pid") is not None for name in ("agentsd", "herdr")}

@@ -1,13 +1,12 @@
-"""Credential-free, isolated Agents delivery smoke.
+"""Credential-free, isolated direct-Herdr Agents delivery smoke.
 
-The smoke deliberately uses the managed CAO 2.4.1 server and tmux terminal. The
-only provider executable it exposes is ``tests/fixtures/bin/mock_cli``; that
-provider receives the generated Agents token through CAO's session env and
-performs the role-specific HTTP calls in the fixture.
+The only provider executable exposed is ``tests/fixtures/bin/mock_cli``. Herdr
+owns the isolated PTYs while the fixture exercises role-specific HTTP calls.
 """
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import os
 import re
@@ -25,6 +24,7 @@ from typing import Any
 import httpx
 
 from agents import service
+from agents.cli import doctor
 from agents.config import AgentsConfig, load
 from agents.db import connect, migrate
 from agents.reconciler import bootstrap_persistent_agents
@@ -55,12 +55,11 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _config_file(source: Path, destination: Path, cao_port: int, web_port: int) -> None:
+def _config_file(source: Path, destination: Path, web_port: int) -> None:
     text = source.read_text(encoding="utf-8")
     text = text.replace('verify = [["task", "check"], ["task", "test"]]', 'verify = [["git", "status", "--porcelain"]]')
     text = text.replace("poll_seconds = 5", "poll_seconds = 1")
     text = text.replace('provider = "opencode"', 'provider = "mock"')
-    text = re.sub(r"(?m)^api_port = \d+$", f"api_port = {cao_port}", text, count=1)
     text = re.sub(r"(?m)^port = \d+$", f"port = {web_port}", text, count=1)
     destination.write_text(text, encoding="utf-8")
     destination.chmod(0o600)
@@ -99,15 +98,6 @@ def _db_rows(config: AgentsConfig, query: str, args: tuple[Any, ...] = ()) -> li
         connection.close()
 
 
-def _mapped_sessions(client: Any, instance: str) -> list[dict[str, Any]]:
-    prefix = f"cao-agents-{instance}-"
-    return [
-        row
-        for row in client.list_sessions()
-        if str(row.get("name") or row.get("session_name") or "").startswith(prefix)
-    ]
-
-
 def _wait(stage: str, predicate: Callable[[], bool], timeout: float = 60.0) -> None:
     deadline = time.monotonic() + timeout
     last_error = "condition remained false"
@@ -131,26 +121,20 @@ def _isolated_environment(config_path: Path, home: Path, xdg: Path) -> Iterator[
         "AGENTS_MODEL",
         "AGENTS_EFFORT",
         "AGENTS_REASONING_EFFORT",
-        "AGENTS_CAO_PORT",
         "AGENTS_WEB_PORT",
         "AGENTS_WEB_TOKEN",
         "AGENTS_AGENT_TOKEN",
         "AGENTS_API_URL",
+        "AGENTS_EXECUTION_ID",
     ):
         os.environ.pop(name, None)
-    os.environ.pop("TMUX", None)
-    os.environ.pop("TMUX_PANE", None)
-    tmux_tmpdir = Path("/tmp") / f"agents-tmux-{uuid.uuid4().hex}"
-    tmux_tmpdir.mkdir(mode=0o700)
     fixture_path = str(FIXTURE_BIN)
     os.environ.update(
         {
             "AGENTS_CONFIG": str(config_path),
             "AGENTS_PROVIDER": "mock",
-            "CAO_HOME_DIR": str(config_path.parent / ".cao"),
             "HOME": str(home),
             "XDG_STATE_HOME": str(xdg),
-            "TMUX_TMPDIR": str(tmux_tmpdir),
             "PATH": fixture_path + os.pathsep + old.get("PATH", ""),
         }
     )
@@ -158,7 +142,6 @@ def _isolated_environment(config_path: Path, home: Path, xdg: Path) -> Iterator[
         yield
     finally:
         os.environ.clear()
-        shutil.rmtree(tmux_tmpdir, ignore_errors=True)
         os.environ.update(old)
 
 
@@ -166,12 +149,19 @@ def _prepare_runtime(runtime: Path, config_path: Path) -> AgentsConfig:
     (runtime / "agents").mkdir(parents=True)
     for profile in (ROOT / "agents").glob("*.md"):
         shutil.copy2(profile, runtime / "agents" / profile.name)
-    (runtime / ".tools" / "bin").mkdir(parents=True)
+    smoke_web = runtime / "src" / "agents" / "web.py"
+    smoke_web.parent.mkdir(parents=True)
+    shutil.copy2(ROOT / "src" / "agents" / "web.py", smoke_web)
     (runtime / ".venv" / "bin").mkdir(parents=True)
-    for name in ("cao", "cao-server"):
-        (runtime / ".tools" / "bin" / name).symlink_to((ROOT / ".tools" / "bin" / name).resolve())
-    for name in ("agentsd", "agents-mcp-server"):
-        (runtime / ".venv" / "bin" / name).symlink_to((ROOT / ".venv" / "bin" / name).resolve())
+    entrypoints = {"agentsd": "agents.web", "agents-mcp-server": "agents.mcp_server"}
+    for name, module in entrypoints.items():
+        executable = runtime / ".venv" / "bin" / name
+        executable.write_text(
+            f"#!{sys.executable}\nimport sys\nsys.path.insert(0, {str(ROOT / 'src')!r})\n"
+            f"from {module} import main\nraise SystemExit(main())\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
     config = load(config_path, env={"AGENTS_PROVIDER": "mock"})
     config.state_dir.mkdir(parents=True, mode=0o700)
     config.state_dir.chmod(0o700)
@@ -293,7 +283,7 @@ def _cleanup(config: AgentsConfig | None) -> list[str]:
 
 def run() -> None:
     config: AgentsConfig | None = None
-    with tempfile.TemporaryDirectory(prefix="agents-smoke-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="agents-smoke-", dir="/tmp") as temporary:
         runtime = Path(temporary)
         project = runtime / "project"
         config_path = runtime / "agents.toml"
@@ -302,7 +292,7 @@ def run() -> None:
         home.mkdir(mode=0o700)
         xdg.mkdir(mode=0o700)
         _make_project(project)
-        _config_file(ROOT / "agents.toml", config_path, _free_port(), _free_port())
+        _config_file(ROOT / "agents.toml", config_path, _free_port())
         # The copied config's relative project path now points at runtime/project.
         config_path.write_text(
             config_path.read_text(encoding="utf-8").replace('path = "."', 'path = "project"'), encoding="utf-8"
@@ -318,15 +308,56 @@ def run() -> None:
                 started = True
                 web = httpx.Client(base_url=f"http://127.0.0.1:{config.web.port}", timeout=10.0)
                 _wait(
-                    "Agents and CAO services ready",
-                    lambda: service.status(config) == {"agentsd": True, "cao": True},
+                    "Agents and Herdr services ready",
+                    lambda: service.status(config) == {"agentsd": True, "herdr": True},
                 )
+                doctor_errors = doctor(config)
+                if doctor_errors:
+                    raise SmokeFailure("doctor", "; ".join(doctor_errors))
+                _stage("doctor validated Herdr binary, schema, socket, provider, and ownership")
                 _wait(
                     "persistent agents live",
                     lambda: (
                         len(
                             _db_rows(
                                 config, "SELECT id FROM terminal_runs WHERE purpose_kind='persistent' AND state='live'"
+                            )
+                        )
+                        == 3
+                    ),
+                )
+                retained = _db_rows(
+                    config,
+                    "SELECT actor_slug,generation,backend_run_id,backend_terminal_id FROM terminal_runs "
+                    "WHERE purpose_kind='persistent' AND state='live' ORDER BY actor_slug",
+                )
+                service.stop(config)
+                if service.status(config) != {"agentsd": False, "herdr": True}:
+                    raise SmokeFailure("retention", "ordinary stop did not retain Herdr")
+                service.start(config)
+                _wait(
+                    "retained actors reconnected",
+                    lambda: (
+                        service.status(config) == {"agentsd": True, "herdr": True}
+                        and _db_rows(
+                            config,
+                            "SELECT actor_slug,generation,backend_run_id,backend_terminal_id FROM terminal_runs "
+                            "WHERE purpose_kind='persistent' AND state='live' ORDER BY actor_slug",
+                        )
+                        == retained
+                    ),
+                )
+                service.stop(config)
+                service.stop_herdr(config)
+                service.start(config)
+                _wait(
+                    "full Herdr restart fenced old actors",
+                    lambda: (
+                        len(
+                            _db_rows(
+                                config,
+                                "SELECT id FROM terminal_runs WHERE purpose_kind='persistent' AND state='live' "
+                                "AND generation>1",
                             )
                         )
                         == 3
@@ -495,14 +526,14 @@ def run() -> None:
                 _stage(
                     "delivery diagnostics", repr(_db_rows(config, "SELECT * FROM deliveries ORDER BY id DESC LIMIT 20"))
                 )
-                for log_name in ("agentsd.log", "cao.log"):
+                for log_name in ("agentsd.log", "herdr.log"):
                     log_path = config.state_dir / log_name
                     if log_path.exists():
                         _stage(log_name, log_path.read_text(encoding="utf-8", errors="replace")[-4000:])
                 raise
             except Exception as exc:
                 _stage("unexpected diagnostics", repr(exc))
-                for log_name in ("agentsd.log", "cao.log"):
+                for log_name in ("agentsd.log", "herdr.log"):
                     log_path = config.state_dir / log_name
                     if log_path.exists():
                         _stage(log_name, log_path.read_text(encoding="utf-8", errors="replace")[-8000:])
@@ -522,28 +553,23 @@ def run() -> None:
                 if instance_row is None:
                     raise SmokeFailure("cleanup", "project identity disappeared")
                 instance = str(instance_row["instance_id"])
-                sessions = subprocess.run(
-                    ["tmux", "list-sessions", "-F", "#{session_name}"],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                prefix = f"cao-agents-{instance}-"
-                remaining = [line for line in sessions.stdout.splitlines() if line.startswith(prefix)]
-                if remaining:
-                    raise SmokeFailure("cleanup", f"mapped tmux sessions survived: {remaining}")
+                # service.shutdown has already closed and confirmed every mapped workspace.
+                prefix = f"agents-{instance}-"
                 live = _db_rows(
                     config,
-                    "SELECT session_name,state,token_revoked_at FROM terminal_runs "
-                    "WHERE session_name LIKE ? AND state IN ('reserved','creating','live','retained')",
+                    "SELECT execution_name,state,token_revoked_at FROM terminal_runs "
+                    "WHERE execution_name LIKE ? AND state IN ('reserved','creating','live','retained')",
                     (f"{prefix}%",),
                 )
                 if live:
                     raise SmokeFailure("cleanup", f"mapped terminal rows remain active: {live}")
-                _stage("services stopped; no mapped CAO sessions survive")
+                _stage("services stopped; no mapped Herdr workspaces survive")
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--backend", choices=("herdr",), default="herdr")
+    parser.parse_args()
     try:
         run()
     except SmokeFailure as exc:

@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agents.config import AgentsConfig, CaoConfig, ModelChoice, ProjectConfig, RuntimeConfig, WebConfig
+from agents.config import AgentsConfig, ExecutionConfig, ModelChoice, ProjectConfig, RuntimeConfig, WebConfig
 from agents.db import (
     MigrationError,
     MutationConflict,
@@ -34,7 +34,7 @@ class DatabaseTests(unittest.TestCase):
             self.root,
             ProjectConfig("test", self.root / "repo", "main", (("task", "check"),)),
             RuntimeConfig(5, 1800, 12, 4, 3, 86400),
-            CaoConfig("2.4.1", "mock", "mock_cli", 9889, (ModelChoice(""),)),
+            ExecutionConfig("herdr", "0.8.2", None, "mock", "mock_cli", (ModelChoice(""),)),
             WebConfig("127.0.0.1", 9890),
             (
                 {"slug": "human", "kind": "human", "persistent": True, "capacity": 1},
@@ -96,10 +96,21 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.connection.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
         self.assertEqual(
             [row[0] for row in self.connection.execute("SELECT version FROM schema_migrations ORDER BY version")],
-            [1, 2, 3, 4],
+            [1, 2, 3, 4, 5],
         )
         terminal_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(terminal_runs)")}
-        self.assertIn("reasoning_effort", terminal_columns)
+        self.assertTrue(
+            {
+                "reasoning_effort",
+                "execution_name",
+                "execution_backend",
+                "backend_run_id",
+                "backend_terminal_id",
+                "agent_auth_id",
+                "backend_revision",
+            }
+            <= terminal_columns
+        )
 
     def test_project_identity_is_immutable(self) -> None:
         first = initialize_project(self.connection, self.config)
@@ -109,7 +120,7 @@ class DatabaseTests(unittest.TestCase):
             self.config.root,
             ProjectConfig("other", self.root / "repo", "main", self.config.project.verify),
             self.config.runtime,
-            self.config.cao,
+            self.config.execution,
             self.config.web,
             self.config.actors,
         )
@@ -150,11 +161,94 @@ class DatabaseTests(unittest.TestCase):
         )
         other.close()
 
+    def test_execution_backend_migration_backfills_historical_identity(self) -> None:
+        migrations = self.root / "execution-upgrade-migrations"
+        migrations.mkdir()
+        source = Path(__file__).parents[1] / "src/agents/migrations"
+        for name in ("001_initial.sql", "002_terminal_reasoning.sql", "003_schedules.sql"):
+            shutil.copy(source / name, migrations / name)
+        other = connect(self.root / "execution-upgrade.db")
+        migrate(other, migrations)
+        now = utc_now()
+        other.execute(
+            "INSERT INTO actors(slug,kind,persistent,capacity,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+            ("worker", "agent", 1, 1, now, now),
+        )
+        other.execute(
+            "INSERT INTO terminal_runs("
+            "session_name,profile_name,mcp_name,profile_sha256,provider,model,generation,actor_slug,"
+            "purpose_kind,purpose_id,working_directory,token_digest,terminal_id,profile_state,state,created_at,updated_at"
+            ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "cao-agents-deadbeef-p-worker-g0001",
+                "agents-deadbeef-r0000000001-g0001",
+                "mcp",
+                "sha",
+                "mock_cli",
+                "",
+                1,
+                "worker",
+                "persistent",
+                "worker",
+                "/repo",
+                "digest",
+                "cao-terminal",
+                "installed",
+                "live",
+                now,
+                now,
+            ),
+        )
+        other.execute(
+            "INSERT INTO terminal_runs("
+            "session_name,profile_name,mcp_name,profile_sha256,provider,model,generation,actor_slug,"
+            "purpose_kind,purpose_id,working_directory,token_digest,terminal_id,profile_state,state,created_at,updated_at"
+            ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "cao-agents-deadbeef-p-worker-g0002",
+                "reserved",
+                "reserved",
+                "",
+                "mock_cli",
+                "",
+                2,
+                "worker",
+                "persistent",
+                "worker-reserved",
+                "/repo",
+                "digest-2",
+                None,
+                "reserved",
+                "reserved",
+                now,
+                now,
+            ),
+        )
+        for name in ("004_general_channel.sql", "005_execution_backend.sql"):
+            shutil.copy(source / name, migrations / name)
+        migrate(other, migrations)
+        row = other.execute("SELECT * FROM terminal_runs WHERE state='live'").fetchone()
+        self.assertEqual(row["execution_backend"], "cao")
+        self.assertEqual(row["backend_run_id"], "cao-agents-deadbeef-p-worker-g0001")
+        self.assertEqual(row["backend_terminal_id"], "cao-terminal")
+        self.assertEqual(row["agent_auth_id"], "cao-terminal")
+        reserved = other.execute("SELECT * FROM terminal_runs WHERE state='reserved'").fetchone()
+        self.assertIsNone(reserved["backend_run_id"])
+        self.assertIsNone(reserved["backend_terminal_id"])
+        self.assertIsNone(reserved["agent_auth_id"])
+        other.close()
+
     def test_checksum_and_unknown_versions_fail(self) -> None:
         migrations = self.root / "migrations"
         migrations.mkdir()
         source = Path(__file__).parents[1] / "src/agents/migrations"
-        for name in ("001_initial.sql", "002_terminal_reasoning.sql", "003_schedules.sql", "004_general_channel.sql"):
+        for name in (
+            "001_initial.sql",
+            "002_terminal_reasoning.sql",
+            "003_schedules.sql",
+            "004_general_channel.sql",
+            "005_execution_backend.sql",
+        ):
             shutil.copy(source / name, migrations / name)
         other = connect(self.root / "other.db")
         migrate(other, migrations)

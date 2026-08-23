@@ -10,7 +10,6 @@ Taskfile.yaml
 .env.local
 .env.sops-age
 .sops-isolated-home/
-.cao/
 .agents/
 .tools/
 .worktrees/*

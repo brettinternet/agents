@@ -39,15 +39,15 @@ class AuthTests(unittest.TestCase):
                 ("persistent-agent", "agent", 1, 1, now, now),
             )
 
-            def add_terminal(terminal_id: str, purpose_kind: str, purpose_id: str) -> tuple[int, str]:
+            def add_terminal(agent_auth_id: str, purpose_kind: str, purpose_id: str) -> tuple[int, str]:
                 cursor = connection.execute(
                     "INSERT INTO terminal_runs("
-                    "session_name,profile_name,mcp_name,profile_sha256,provider,model,"
+                    "execution_name,profile_name,mcp_name,profile_sha256,provider,model,"
                     "generation,actor_slug,purpose_kind,purpose_id,working_directory,token_digest,"
                     "profile_state,state,created_at,updated_at"
                     ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
-                        f"session-{terminal_id}",
+                        f"execution-{agent_auth_id}",
                         "profile",
                         "mcp",
                         "sha",
@@ -70,8 +70,8 @@ class AuthTests(unittest.TestCase):
                 run_id = int(lastrowid)
                 token = derive_agent_token(key, instance_id, run_id, 1)
                 connection.execute(
-                    "UPDATE terminal_runs SET terminal_id=?,token_digest=? WHERE id=?",
-                    (terminal_id, token_digest(token), run_id),
+                    "UPDATE terminal_runs SET agent_auth_id=?,token_digest=? WHERE id=?",
+                    (agent_auth_id, token_digest(token), run_id),
                 )
                 connection.execute(
                     "INSERT INTO actor_leases("

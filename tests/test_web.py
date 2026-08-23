@@ -9,7 +9,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from agents.auth import AgentContext
-from agents.config import AgentsConfig, CaoConfig, ModelChoice, ProjectConfig, RuntimeConfig, WebConfig
+from agents.config import AgentsConfig, ExecutionConfig, ModelChoice, ProjectConfig, RuntimeConfig, WebConfig
 from agents.db import connect, migrate, utc_now
 from agents.messages import Messaging
 from agents.store import Store
@@ -35,7 +35,7 @@ class WebAuthTests(unittest.TestCase):
             root,
             ProjectConfig("test", repo, "main", (("task", "check"),)),
             RuntimeConfig(5, 1800, 12, 4, 3, 86400),
-            CaoConfig("2.4.1", "mock", "mock_cli", 9889, (ModelChoice(""),)),
+            ExecutionConfig("herdr", "0.8.2", None, "mock", "mock_cli", (ModelChoice(""),)),
             WebConfig("127.0.0.1", 9890),
             (
                 {"slug": "human", "kind": "human", "persistent": True, "capacity": 1},
@@ -75,15 +75,15 @@ class WebAuthTests(unittest.TestCase):
         self.connection.close()
         self.temp.cleanup()
 
-    def _terminal_run(self, purpose_kind: str, purpose_id: str, session_name: str) -> int:
+    def _terminal_run(self, purpose_kind: str, purpose_id: str, execution_name: str) -> int:
         now = utc_now()
         run_id = self.connection.execute(
             "INSERT INTO terminal_runs("
-            "session_name,profile_name,mcp_name,profile_sha256,provider,model,generation,"
+            "execution_name,profile_name,mcp_name,profile_sha256,provider,model,generation,"
             "actor_slug,purpose_kind,purpose_id,working_directory,token_digest,profile_state,state,created_at,updated_at"
             ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
-                session_name,
+                execution_name,
                 "profile",
                 "mcp",
                 "sha",
@@ -213,21 +213,21 @@ class WebAuthTests(unittest.TestCase):
         self.connection.commit()
         generic = Messaging(self.connection).post("web-generic", "human", "@explorer", "persistent notice")
 
-        def authenticate(_, terminal_id, *__):
-            if terminal_id == "persistent-terminal":
+        def authenticate(_, execution_id, *__):
+            if execution_id == "persistent-execution":
                 return AgentContext(persistent_run_id, "explorer", "persistent", "explorer", True)
-            if terminal_id == "work-terminal":
+            if execution_id == "work-execution":
                 return AgentContext(work_run_id, "explorer", "work", "AGENT-0001", False)
-            raise AssertionError(f"unexpected terminal {terminal_id}")
+            raise AssertionError(f"unexpected execution {execution_id}")
 
-        def headers(terminal_id: str) -> dict[str, str]:
+        def headers(execution_id: str) -> dict[str, str]:
             return {
                 "Authorization": "Bearer test-token",
-                "X-CAO-Terminal-ID": terminal_id,
+                "X-Agents-Execution-ID": execution_id,
             }
 
         with patch("agents.web.authenticate_agent", side_effect=authenticate):
-            persistent_inbox = self.client.get("/agent/v1/inbox", headers=headers("persistent-terminal"))
+            persistent_inbox = self.client.get("/agent/v1/inbox", headers=headers("persistent-execution"))
             self.assertEqual(persistent_inbox.status_code, 200)
             self.assertEqual(
                 [row["body"] for row in persistent_inbox.json()["data"]],
@@ -235,29 +235,29 @@ class WebAuthTests(unittest.TestCase):
             )
             denied = self.client.post(
                 "/agent/v1/inbox/ack",
-                headers=headers("persistent-terminal"),
+                headers=headers("persistent-execution"),
                 json={"request_id": "web-targeted-persistent", "message_ids": [targeted["id"]]},
             )
             self.assertEqual(denied.status_code, 403)
 
-            work_inbox = self.client.get("/agent/v1/inbox", headers=headers("work-terminal"))
+            work_inbox = self.client.get("/agent/v1/inbox", headers=headers("work-execution"))
             self.assertEqual(work_inbox.status_code, 200)
             self.assertEqual([row["body"] for row in work_inbox.json()["data"]], ["work assignment"])
             acknowledged = self.client.post(
                 "/agent/v1/inbox/ack",
-                headers=headers("work-terminal"),
+                headers=headers("work-execution"),
                 json={"request_id": "web-targeted-work", "message_ids": [targeted["id"]]},
             )
             self.assertEqual(acknowledged.status_code, 200)
             generic_denied = self.client.post(
                 "/agent/v1/inbox/ack",
-                headers=headers("work-terminal"),
+                headers=headers("work-execution"),
                 json={"request_id": "web-generic-work", "message_ids": [generic["id"]]},
             )
             self.assertEqual(generic_denied.status_code, 403)
             generic_ack = self.client.post(
                 "/agent/v1/inbox/ack",
-                headers=headers("persistent-terminal"),
+                headers=headers("persistent-execution"),
                 json={"request_id": "web-generic-persistent", "message_ids": [generic["id"]]},
             )
             self.assertEqual(generic_ack.status_code, 200)
@@ -325,11 +325,11 @@ class WebAuthTests(unittest.TestCase):
         csrf = self.client.cookies.get("agents_csrf")
         now = utc_now()
         terminal_id = self.connection.execute(
-            "INSERT INTO terminal_runs(session_name,profile_name,mcp_name,profile_sha256,provider,model,"
-            "generation,actor_slug,purpose_kind,purpose_id,working_directory,token_digest,terminal_id,"
-            "profile_state,state,created_at,updated_at) VALUES("
+            "INSERT INTO terminal_runs(execution_name,profile_name,mcp_name,profile_sha256,provider,model,"
+            "generation,actor_slug,purpose_kind,purpose_id,working_directory,token_digest,backend_terminal_id,"
+            "agent_auth_id,profile_state,state,created_at,updated_at) VALUES("
             "'session','profile','mcp','sha','mock','model',1,'elder','persistent','elder','.',"
-            "'digest','terminal','installed','live',?,?)",
+            "'digest','terminal','profile','installed','live',?,?)",
             (now, now),
         ).lastrowid
         self.assertIsNotNone(terminal_id)

@@ -9,7 +9,7 @@ from pathlib import Path
 
 from agents.config import (
     AgentsConfig,
-    CaoConfig,
+    ExecutionConfig,
     ModelChoice,
     ProjectConfig,
     RuntimeConfig,
@@ -36,7 +36,7 @@ class SchedulerTests(unittest.TestCase):
             root=self.root,
             project=ProjectConfig("test", repo, "main", (("task", "check"),)),
             runtime=RuntimeConfig(5, 1800, 12, 4, 3, 86400),
-            cao=CaoConfig("2.4.1", "mock", "mock_cli", 9889, (ModelChoice(""),)),
+            execution=ExecutionConfig("herdr", "0.8.2", None, "mock", "mock_cli", (ModelChoice(""),)),
             web=WebConfig("127.0.0.1", 9890),
             actors=(
                 {"slug": "human", "kind": "human", "persistent": True, "capacity": 1},

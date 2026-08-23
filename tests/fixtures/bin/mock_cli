@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Small CAO mock_cli provider used by the isolated smoke run.
+"""Small mock_cli provider used by the isolated smoke run.
 
-CAO starts this program inside a tmux pane and forwards Agents credentials
-through the pane environment. Each wake is acknowledged only after the role's
-fenced HTTP action has a definitive response; repeated wakes replay the same
-request IDs and are therefore harmless.
+The provider is launched directly by the execution backend and receives
+Agents credentials through its process environment. Each wake is acknowledged
+only after the role's fenced HTTP action has a definitive response; repeated
+wakes replay the same request IDs and are therefore harmless.
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from typing import Any
 
 BASE = os.environ.get("AGENTS_API_URL", "").rstrip("/")
 TOKEN = os.environ.get("AGENTS_AGENT_TOKEN", "")
-TERMINAL_ID = os.environ.get("CAO_TERMINAL_ID", "")
+EXECUTION_ID = os.environ.get("AGENTS_EXECUTION_ID", "")
 DELAY_MS = 50
 for index, argument in enumerate(sys.argv):
     if argument == "--delay-ms" and index + 1 < len(sys.argv):
@@ -33,13 +33,13 @@ for index, argument in enumerate(sys.argv):
 
 
 def _request(method: str, path: str, body: dict[str, Any] | None = None) -> tuple[int, Any]:
-    if not BASE or not TOKEN or not TERMINAL_ID:
+    if not BASE or not TOKEN or not EXECUTION_ID:
         return 0, {"error": "Agents credentials are not injected"}
     url = f"{BASE}{path}"
     data = None if body is None else json.dumps(body, separators=(",", ":")).encode()
     request = urllib.request.Request(url, data=data, method=method)
     request.add_header("Authorization", f"Bearer {TOKEN}")
-    request.add_header("X-CAO-Terminal-ID", TERMINAL_ID)
+    request.add_header("X-Agents-Execution-ID", EXECUTION_ID)
     if data is not None:
         request.add_header("Content-Type", "application/json")
     try:
@@ -265,7 +265,7 @@ def _handle_wake() -> str:
 
 
 def main() -> int:
-    print("mock_cli 2.4.1", flush=True)
+    print("mock_cli direct", flush=True)
     print("❯", flush=True)
     for line in sys.stdin:
         payload = line.strip()

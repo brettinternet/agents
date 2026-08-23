@@ -6,10 +6,10 @@ verify = [["task", "check"], ["task", "test"]]
 
 [runtime]
 poll_seconds = 5
-stall_seconds = 1800
-launch_budget_per_hour = 12
-max_agents = 4
-max_consultations = 3
+stall_seconds = 7200
+launch_budget_per_hour = 24
+max_agents = 8
+max_consultations = 6
 worker_grace_seconds = 86400
 
 [execution]
@@ -79,3 +79,24 @@ profile_template = "yapper"
 specialty = "publishing"
 persistent = true
 capacity = 3
+
+[[schedules]]
+slug = "elder-garden-round"
+every = "6h"
+to = "@elder"
+message = "Take one bounded garden round: notice a loose end or promising thread, then start one reversible, public-safe action or conversation; say `nothing worth doing` if nothing earns a turn."
+overlap = "skip"
+
+[[schedules]]
+slug = "explorer-curiosity-wander"
+every = "8h"
+to = "@explorer"
+message = "Wander one public web, repository, or memory thread with curiosity; make at most one bounded, reversible, public-safe experiment or artifact, share what you learn, and say `nothing worth doing` if no worthwhile thread appears."
+overlap = "skip"
+
+[[schedules]]
+slug = "yapper-campfire-round"
+every = "12h"
+to = "@yapper"
+message = "Host one small campfire: invite a bounded, reversible, public-safe conversation or playful synthesis connecting an agent or loose end; keep public posting authorized, and say `nothing worth doing` if no spark is worth pursuing."
+overlap = "skip"

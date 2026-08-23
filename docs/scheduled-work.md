@@ -7,6 +7,29 @@ five-field cron expression with an IANA timezone or an interval ending in `m`,
 The examples below are inactive until copied into `agents.toml`. Restart the
 service after adding or changing a schedule.
 
+## Default mode: recurring nudges for open-ended play
+
+Scheduled messages are the default for recurring wandering, conversations,
+experiments, drafts, and “see what happens” prompts. A nudge can produce a
+report, a playful synthesis, a reversible experiment, or simply a useful dead
+end without creating a worktree or demanding a commit. Generated material may
+be exploratory rather than factually rigorous; distinguish generated ideas from
+observations. Factual claims drawn from sources still require evidence and
+source links.
+
+The default garden has three recurring message rounds:
+
+| Round                                                       | Cadence and recipient   | What it invites                                                                                                                                                                                                                                                                   |
+| ----------------------------------------------------------- | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Elder garden round** (`elder-garden-round`)               | Every 6h to `@elder`    | Notice a loose end or promising thread, start one bounded reversible public-safe action or conversation, and say `nothing worth doing` when there is no worthwhile move.                                                                                                          |
+| **Explorer curiosity wander** (`explorer-curiosity-wander`) | Every 8h to `@explorer` | Wander one public web, repository, or memory thread; take at most one bounded reversible public-safe experiment or artifact; share the learning, or say `nothing worth doing`.                                                                                                    |
+| **Yapper campfire round** (`yapper-campfire-round`)         | Every 12h to `@yapper`  | Host a small campfire: invite bounded reversible public-safe conversation or playful synthesis around an agent or loose end. Posting remains authorization-gated; absent an authorized channel, yapper shares a draft with elder. Say `nothing worth doing` if there is no spark. |
+
+All three use `overlap = "skip"` and are message schedules, not
+`[schedules.work]` entries. A round may end with no action; no-op rounds are
+expected when there is no useful or safe thread to follow. Keep every external
+side effect within its explicit authorization and the repository safety rules.
+
 ## Message schedule
 
 A message schedule wakes a persistent actor or posts to an internal channel:
@@ -20,14 +43,20 @@ message = "Check the specified public sources and report only meaningful changes
 overlap = "skip"
 ```
 
-Use a message schedule when the occurrence should produce a report or other
-non-committed response.
+Use a message schedule when the occurrence should produce a report, a
+non-committed response, or an open-ended prompt for play. Prefer a direct
+message or message schedule when the outcome can remain in the conversation.
+The five dashboard lanes are presentation labels for tracked work; see
+[One-off work](one-off-work.md#dashboard-lanes) for their mapping to unchanged
+durable statuses.
 
 ## Tracked work schedule
 
-Use a work schedule when each occurrence should produce a committed artifact.
+Use a work schedule only when each occurrence should produce a committed
+artifact, requires approval or integration, or depends on the durable workflow.
 It creates a fresh intake item; the elder then refines it through the normal
-tracked-work lifecycle.
+tracked-work lifecycle. Do not use a tracked schedule just to make an
+experiment, draft, or wandering round feel official.
 
 Open-ended spikes still need lightweight, outcome-oriented acceptance criteria
 before they can become ready. A suitable criterion requires sourced findings,
@@ -46,6 +75,14 @@ title = "Daily public-web exploration"
 problem = "Look for useful developments related to the repository's current interests."
 outcome = "Commit a dated public-safe memory with source URLs, uncertainty, and recommended follow-up work."
 ```
+
+## Stewardship and safety
+
+Only **elder** may propose self-tuning of tracked `agents.toml` or
+`agents/*.md`. A proposal must be grounded in observed evidence and carried as
+reviewable tracked repository work. It must never mutate `.agents/`, relax
+safety rules, or weaken external-authorization gates. Elder may recommend no
+change, and a no-op round is a successful outcome.
 
 ## Occurrence behavior
 

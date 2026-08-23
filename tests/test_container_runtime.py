@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -49,21 +51,22 @@ class ContainerRuntimeTests(unittest.TestCase):
             "dev.agents.execution": "execution",
             "dev.agents.run_id": "1",
             "dev.agents.generation": "2",
-            "dev.agents.cwd_sha256": "digest",
+            "dev.agents.cwd_sha256": hashlib.sha256(cwd.encode()).hexdigest(),
             "dev.agents.image_id": "sha256:image",
             "dev.agents.retention": "ephemeral",
         }
         manifest = {
+            "execution_name": "execution",
             "container_name": "agents-instance-r1-g2",
             "image_id": "sha256:image",
             "cwd": cwd,
             "runtime_dir": runtime_dir,
-            "user": "501:20",
+            "user": f"{os.getuid()}:{os.getgid()}",
             "labels": labels,
         }
         inspect = {
             "Image": "sha256:image",
-            "Config": {"User": "501:20", "Labels": labels},
+            "Config": {"User": f"{os.getuid()}:{os.getgid()}", "WorkingDir": cwd, "Labels": labels},
             "HostConfig": {
                 "ReadonlyRootfs": True,
                 "PidsLimit": 512,
@@ -72,10 +75,16 @@ class ContainerRuntimeTests(unittest.TestCase):
                 "NetworkMode": "agents-runs",
                 "CapDrop": ["ALL"],
                 "SecurityOpt": ["no-new-privileges"],
+                "Tmpfs": {"/tmp": "rw,noexec,nosuid,nodev", "/run": "rw,noexec,nosuid,nodev"},
+                "Privileged": False,
+                "Devices": [],
+                "DeviceRequests": [],
             },
             "Mounts": [
-                {"Destination": cwd, "Source": cwd, "RW": True},
-                {"Destination": runtime_dir, "Source": runtime_dir, "RW": True},
+                {"Type": "bind", "Destination": cwd, "Source": cwd, "RW": True},
+                {"Type": "bind", "Destination": runtime_dir, "Source": runtime_dir, "RW": True},
+                {"Type": "tmpfs", "Destination": "/tmp", "Source": "", "RW": True},
+                {"Type": "tmpfs", "Destination": "/run", "Source": "", "RW": True},
             ],
         }
         return manifest, inspect
@@ -88,6 +97,7 @@ class ContainerRuntimeTests(unittest.TestCase):
         mutations = (
             ("Image", "sha256:wrong"),
             ("Config.User", "0:0"),
+            ("Config.WorkingDir", "/wrong"),
             ("HostConfig.ReadonlyRootfs", False),
             ("HostConfig.PidsLimit", 1),
             ("HostConfig.NanoCpus", 1),
@@ -95,6 +105,9 @@ class ContainerRuntimeTests(unittest.TestCase):
             ("HostConfig.NetworkMode", "bridge"),
             ("HostConfig.CapDrop", []),
             ("HostConfig.SecurityOpt", []),
+            ("HostConfig.Tmpfs", {}),
+            ("HostConfig.Privileged", True),
+            ("HostConfig.Devices", [{"PathOnHost": "/dev/null"}]),
             ("Config.Labels", {}),
             ("Mounts", []),
         )
@@ -109,6 +122,38 @@ class ContainerRuntimeTests(unittest.TestCase):
                 self.runtime.inspect_container.return_value = changed
                 with self.assertRaises(ExecutionConflict):
                     self.backend._verify(manifest)
+        changed = json.loads(json.dumps(inspect))
+        changed["Mounts"].append(
+            {"Type": "bind", "Destination": "/var/run/docker.sock", "Source": "/var/run/docker.sock", "RW": True}
+        )
+        self.runtime.inspect_container.return_value = changed
+        with self.assertRaises(ExecutionConflict):
+            self.backend._verify(manifest)
+        for key, value in (
+            ("container_name", "agents-instance-r9-g2"),
+            ("execution_name", "different"),
+            ("image_id", "sha256:different"),
+            ("user", "0:0"),
+        ):
+            with self.subTest(manifest_key=key):
+                changed_manifest = dict(manifest)
+                changed_manifest[key] = value
+                with self.assertRaises(ExecutionConflict):
+                    self.backend._verify(changed_manifest)
+        for key, value in (
+            ("dev.agents.instance", "other-instance"),
+            ("dev.agents.execution", "different"),
+            ("dev.agents.run_id", "9"),
+            ("dev.agents.generation", "9"),
+            ("dev.agents.cwd_sha256", "wrong"),
+            ("dev.agents.image_id", "sha256:different"),
+            ("dev.agents.retention", "persistent"),
+        ):
+            with self.subTest(manifest_label=key):
+                changed_manifest = json.loads(json.dumps(manifest))
+                changed_manifest["labels"][key] = value
+                with self.assertRaises(ExecutionConflict):
+                    self.backend._verify(changed_manifest)
 
     def test_delete_does_not_close_herdr_when_verified_container_removal_fails(self) -> None:
         manifest, inspect = self._identity()
@@ -121,13 +166,52 @@ class ContainerRuntimeTests(unittest.TestCase):
             self.backend.delete_run(RunHandle("execution", "workspace", "pane"))
         self.inner.delete_run.assert_not_called()
 
+    def test_delete_rejects_runtime_directory_outside_managed_root_without_side_effects(self) -> None:
+        manifest, inspect = self._identity()
+        outside = self.root / "outside"
+        outside.mkdir()
+        marker = outside / "keep"
+        marker.write_text("keep")
+        manifest["runtime_dir"] = str(outside)
+        mounts = cast(list[dict[str, object]], inspect["Mounts"])
+        mounts[1]["Destination"] = str(outside)
+        mounts[1]["Source"] = str(outside)
+        path = self.backend._manifest_path("execution")
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(manifest))
+        self.runtime.inspect_container.return_value = inspect
+        with self.assertRaisesRegex(ExecutionConflict, "managed root"):
+            self.backend.delete_run(RunHandle("execution", "workspace", "pane"))
+        self.runtime.remove_container.assert_not_called()
+        self.inner.delete_run.assert_not_called()
+        self.assertEqual(marker.read_text(), "keep")
+        self.assertTrue(path.is_file())
+
     def test_gc_removes_only_stale_owned_ephemeral_resources_and_trim_is_best_effort(self) -> None:
         connection = sqlite3.connect(":memory:")
-        connection.execute("CREATE TABLE terminal_runs(execution_name TEXT,state TEXT)")
-        connection.execute("INSERT INTO terminal_runs VALUES('active','live')")
+        connection.row_factory = sqlite3.Row
+        connection.execute(
+            "CREATE TABLE terminal_runs("
+            "id INTEGER,execution_name TEXT,state TEXT,agent_auth_id TEXT,generation INTEGER)"
+        )
+        connection.execute("CREATE TABLE launch_attempts(terminal_run_id INTEGER,state TEXT)")
+        connection.execute("CREATE TABLE assignments(terminal_run_id INTEGER,execution_id INTEGER)")
+        connection.execute("CREATE TABLE executions(id INTEGER,worktree_path TEXT,base_sha TEXT,state TEXT)")
+        connection.execute("CREATE TABLE submissions(id INTEGER,execution_id INTEGER,commit_sha TEXT)")
+        connection.execute("INSERT INTO terminal_runs VALUES(1,'active','live','active',1)")
+        connection.execute("INSERT INTO terminal_runs VALUES(2,'uncertain','failed','uncertain-auth',1)")
+        connection.execute("INSERT INTO launch_attempts VALUES(2,'uncertain')")
         runtime = MagicMock()
+        runtime.resolve_image_id.side_effect = lambda image: image if image.startswith("sha256:") else "sha256:image"
         runtime.docker.side_effect = [
-            "\n".join((json.dumps({"Names": "stale"}), json.dumps({"Names": "active"}))),
+            "\n".join(
+                (
+                    json.dumps({"Names": "stale"}),
+                    json.dumps({"Names": "active"}),
+                    json.dumps({"Names": "compose-init"}),
+                    json.dumps({"Names": "uncertain"}),
+                )
+            ),
             "ephemeral-volume\nactive-volume",
             json.dumps(
                 [
@@ -165,12 +249,27 @@ class ContainerRuntimeTests(unittest.TestCase):
             "Config": {"Labels": {"dev.agents.execution": "active", "dev.agents.retention": "ephemeral"}},
             "State": {"Running": False, "FinishedAt": "2000-01-01T00:00:00Z"},
         }
-        runtime.inspect_container.side_effect = [stale, active]
+        uncertain = {
+            "Config": {"Labels": {"dev.agents.execution": "uncertain", "dev.agents.retention": "ephemeral"}},
+            "State": {"Running": False, "FinishedAt": "2000-01-01T00:00:00Z"},
+        }
+        compose = {
+            "Config": {
+                "Labels": {
+                    "dev.agents.topology": "topology",
+                    "dev.agents.retention": "ephemeral",
+                }
+            },
+            "State": {"Running": False, "FinishedAt": "2000-01-01T00:00:00Z"},
+        }
+        runtime.inspect_container.side_effect = [stale, active, compose, uncertain]
         runtime.trim.side_effect = ContainerRuntimeError("trim unavailable")
         with patch("agents.container_runtime._instance_id", return_value="instance"):
             collector = ContainerGarbageCollector(self.config, connection, runtime)
         result = collector.collect()
         runtime.remove_container.assert_called_once_with("stale")
+        self.assertNotIn(call("compose-init"), runtime.remove_container.call_args_list)
+        self.assertNotIn(call("uncertain"), runtime.remove_container.call_args_list)
         self.assertEqual(result["volumes"], ["ephemeral-volume"])
         runtime.docker.assert_any_call(
             "volume",

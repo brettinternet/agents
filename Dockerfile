@@ -16,7 +16,7 @@ ARG AGENTS_UID=1000
 ARG AGENTS_GID=1000
 ARG TARGETARCH
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl git tini \
+    && apt-get install -y --no-install-recommends ca-certificates curl git tini util-linux \
     && rm -rf /var/lib/apt/lists/* \
     && case "${TARGETARCH:-$(uname -m)}" in \
          arm64|aarch64) herdr_arch=aarch64; herdr_sha=f55610658e1c2e0d2aaef730b4b2ab885f7f8ba00285ab372bfb14f2e3d5b40d ;; \

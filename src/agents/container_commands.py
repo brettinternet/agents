@@ -175,15 +175,88 @@ def _topology_record(config: AgentsConfig) -> Path:
     return config.state_dir / "container-topology.json"
 
 
+def _recover_dead_topology(config: AgentsConfig) -> None:
+    record = _topology_record(config)
+    if record.exists() or record.is_symlink():
+        if not record.is_file() or record.is_symlink():
+            raise ContainerCommandError("whole-system topology ownership record is unsafe")
+        try:
+            value = json.loads(record.read_text())
+            topology_id = str(value["topology_id"])
+            auth_file = Path(str(value["auth_file"]))
+        except (OSError, KeyError, ValueError, json.JSONDecodeError) as exc:
+            raise ContainerCommandError("whole-system topology ownership record is malformed") from exc
+        runtime = _runtime(config)
+        names = runtime.docker(
+            "container",
+            "ls",
+            "--all",
+            "--filter",
+            f"label=dev.agents.instance={_instance(config)}",
+            "--filter",
+            f"label=dev.agents.topology={topology_id}",
+            "--format",
+            "{{.Names}}",
+        )
+        if any(
+            bool(inspect.get("State", {}).get("Running"))
+            for name in names.splitlines()
+            if (inspect := runtime.inspect_container(name)) is not None
+        ):
+            raise ContainerCommandError("whole-system topology ownership record belongs to live containers")
+        expected = (config.state_dir / "runtime" / "system-auth").resolve()
+        if auth_file.is_symlink() or auth_file.parent.resolve() != expected:
+            raise ContainerCommandError("whole-system credential path is unsafe")
+        _completed(
+            ("docker", "compose", "-f", str(config.root / "compose.yaml"), "down", "--remove-orphans"),
+            env=_compose_environment(config, topology_id, auth_file),
+        )
+        auth_file.unlink(missing_ok=True)
+        record.unlink()
+
+    directory = config.state_dir / "runtime" / "system-auth"
+    if not directory.is_dir() or directory.is_symlink():
+        return
+    runtime = _runtime(config)
+    instance = _instance(config)
+    for candidate in directory.iterdir():
+        if candidate.is_symlink() or not candidate.is_file():
+            continue
+        containers = runtime.docker(
+            "container",
+            "ls",
+            "--all",
+            "--filter",
+            f"label=dev.agents.instance={instance}",
+            "--filter",
+            f"label=dev.agents.topology={candidate.name}",
+            "--format",
+            "{{.Names}}",
+        )
+        if not containers:
+            candidate.unlink()
+
+
+def _web_port_available(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
+
+
 def start(config: AgentsConfig) -> None:
     from . import service
 
     owned = service.status(config)
     if any(owned.values()):
         raise ContainerCommandError("host Agents/Herdr services are already owned; stop them before container:start")
+    _recover_dead_topology(config)
     record = _topology_record(config)
-    if record.exists() or record.is_symlink():
-        raise ContainerCommandError("whole-system topology ownership record already exists")
+    if not _web_port_available(config.web.port):
+        raise ContainerCommandError(f"web port 127.0.0.1:{config.web.port} is already owned by another process")
     janitor_record = config.state_dir / "container-janitor.pid"
     if janitor_record.exists() or janitor_record.is_symlink():
         if service._owned(janitor_record) is not None:
@@ -194,9 +267,10 @@ def start(config: AgentsConfig) -> None:
     directory = config.state_dir / "runtime" / "system-auth"
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     auth_file = directory / topology_id
+    auth_value = _auth_value(config)
     descriptor = os.open(auth_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        os.write(descriptor, _auth_value(config))
+        os.write(descriptor, auth_value)
     finally:
         os.close(descriptor)
     environment = _compose_environment(config, topology_id, auth_file)
@@ -267,6 +341,13 @@ def stop(config: AgentsConfig) -> None:
         ("docker", "compose", "-f", str(config.root / "compose.yaml"), "down", "--remove-orphans"),
         env=_compose_environment(config, topology_id, auth_file),
     )
+    deadline = time.monotonic() + 10
+    while not _web_port_available(config.web.port):
+        if time.monotonic() >= deadline:
+            raise ContainerCommandError(
+                f"web port 127.0.0.1:{config.web.port} remained occupied after whole-system shutdown"
+            )
+        time.sleep(0.1)
     auth_file.unlink(missing_ok=True)
     record.unlink(missing_ok=True)
 
@@ -292,12 +373,52 @@ def gc(config: AgentsConfig) -> dict[str, object]:
         connection.close()
 
 
+def _remove_stopped_topology_containers(config: AgentsConfig) -> list[str]:
+    record = _topology_record(config)
+    if not record.is_file() or record.is_symlink():
+        return []
+    try:
+        topology_id = str(json.loads(record.read_text())["topology_id"])
+    except (OSError, KeyError, ValueError, json.JSONDecodeError) as exc:
+        raise ContainerCommandError("whole-system topology ownership record is malformed") from exc
+    runtime = _runtime(config)
+    instance = _instance(config)
+    output = runtime.docker(
+        "container",
+        "ls",
+        "--all",
+        "--filter",
+        f"label=dev.agents.instance={instance}",
+        "--filter",
+        f"label=dev.agents.topology={topology_id}",
+        "--format",
+        "{{.Names}}",
+    )
+    removed: list[str] = []
+    for name in output.splitlines():
+        inspect = runtime.inspect_container(name)
+        if inspect is None:
+            continue
+        labels = inspect.get("Config", {}).get("Labels", {})
+        state = inspect.get("State", {})
+        if (
+            labels.get("dev.agents.instance") == instance
+            and labels.get("dev.agents.topology") == topology_id
+            and labels.get("dev.agents.retention") == "ephemeral"
+            and not bool(state.get("Running"))
+        ):
+            runtime.remove_container(name)
+            removed.append(name)
+    return removed
+
+
 def janitor(config: AgentsConfig) -> None:
     if config.execution.container is None:
         raise ContainerCommandError("[execution.container] is required")
     while True:
         try:
             result = gc(config)
+            _remove_stopped_topology_containers(config)
             if result.get("trim_error"):
                 print(result["trim_error"], flush=True)
         except (ContainerRuntimeError, OSError, sqlite3.Error, ValueError) as exc:

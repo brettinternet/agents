@@ -32,9 +32,16 @@ from .auth import (
     verify_human_session,
 )
 from .config import AgentsConfig, load
-from .container_runtime import ContainerGarbageCollector, ContainerRuntimeError
+from .container_runtime import (
+    ContainerGarbageCollector,
+    ContainerizedHerdrBackend,
+    ContainerRuntimeError,
+    build_execution_backend,
+    container_name,
+)
 from .db import MutationConflict, canonical_json, connect, migrate, mutation, utc_now
 from .delivery import Delivery
+from .execution import ExecutionError
 from .messages import Messages, Messaging
 from .policy import DomainError, validate_request_id, validate_text
 from .reconciler import Reconciler
@@ -179,11 +186,11 @@ def _declared_secret(request: Request, name: object) -> str:
     return name
 
 
-def _broker_child_identity() -> dict[str, int]:
+def _broker_child_prefix() -> tuple[str, ...]:
     uid_value = os.environ.get("AGENTS_BROKER_CHILD_UID")
     gid_value = os.environ.get("AGENTS_BROKER_CHILD_GID")
     if uid_value is None and gid_value is None:
-        return {}
+        return ()
     if (
         uid_value is None
         or gid_value is None
@@ -193,7 +200,36 @@ def _broker_child_identity() -> dict[str, int]:
         or int(gid_value) <= 0
     ):
         raise OSError("broker child UID/GID must both be positive integers")
-    return {"user": int(uid_value), "group": int(gid_value)}
+    return (
+        "setpriv",
+        "--reuid",
+        uid_value,
+        "--regid",
+        gid_value,
+        "--clear-groups",
+        "--no-new-privs",
+        "--bounding-set=-all",
+        "--inh-caps=-all",
+        "--ambient-caps=-all",
+        "--",
+    )
+
+
+def _container_secret_command(
+    container: str,
+    cwd: Path,
+    names: list[str],
+    argv: list[str],
+    tty: bool,
+) -> tuple[str, ...]:
+    command = ["docker", "exec", "--interactive"]
+    if tty:
+        command.append("--tty")
+    command.extend(("--workdir", str(cwd)))
+    for name in names:
+        command.extend(("--env", name))
+    command.extend((container, *argv))
+    return tuple(command)
 
 
 def _domain(call):
@@ -239,7 +275,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         async def collect_containers() -> None:
             while True:
                 try:
-                    await asyncio.to_thread(collector.collect)
+                    result = await asyncio.to_thread(collector.collect)
+                    failures = [str(result["trim_error"]), *map(str, result["cleanup_errors"])]
+                    failures = [failure for failure in failures if failure]
+                    if failures:
+                        raise ContainerRuntimeError("; ".join(failures))
                 except (ContainerRuntimeError, OSError, ValueError) as exc:
                     now = utc_now()
                     connection.execute(
@@ -435,6 +475,8 @@ def create_app(config: AgentsConfig | None = None, connection: sqlite3.Connectio
     @app.post("/agent/v1/secrets/list")
     async def agent_secret_list(request: Request, context: AgentAuth):
         _require_secret_access(context)
+        if await _json_body(request) != {}:
+            raise HTTPException(400, detail=error("malformed_json", "request body must be exactly {}"))
         try:
             values = broker_values(resolve_secret_paths(request.app.state.config.root))
         except SecretStoreError as exc:
@@ -445,6 +487,8 @@ def create_app(config: AgentsConfig | None = None, connection: sqlite3.Connectio
     @app.post("/agent/v1/secrets/check")
     async def agent_secret_check(request: Request, context: AgentAuth):
         _require_secret_access(context)
+        if await _json_body(request) != {}:
+            raise HTTPException(400, detail=error("malformed_json", "request body must be exactly {}"))
         try:
             check_store(resolve_secret_paths(request.app.state.config.root))
         except SecretStoreError as exc:
@@ -510,16 +554,30 @@ def create_app(config: AgentsConfig | None = None, connection: sqlite3.Connectio
             if context.purpose_kind not in {"work", "review"}:
                 raise AuthenticationError("execution is not authorized to access managed secrets")
             row = connection.execute(
-                "SELECT working_directory FROM terminal_runs WHERE id=?",
+                "SELECT execution_name,generation,working_directory FROM terminal_runs WHERE id=?",
                 (context.terminal_run_id,),
             ).fetchone()
             if row is None:
                 raise AuthenticationError("execution workspace is unavailable")
-            child_cwd = Path(str(row[0]))
+            docker_backend: ContainerizedHerdrBackend | None = None
+            docker_container = ""
+            if str(websocket.app.state.config.execution.isolation) == "container":
+                candidate = build_execution_backend(websocket.app.state.config)
+                if not isinstance(candidate, ContainerizedHerdrBackend):
+                    raise AuthenticationError("container execution backend is unavailable")
+                if candidate.find_run(str(row["execution_name"])) is None:
+                    raise AuthenticationError("container execution identity is unavailable")
+                docker_backend = candidate
+                docker_container = container_name(
+                    str(project[0]),
+                    context.terminal_run_id,
+                    int(row["generation"]),
+                )
+            child_cwd = Path(str(row["working_directory"]))
             if child_cwd.is_symlink() or not child_cwd.is_dir():
                 raise AuthenticationError("execution workspace is unsafe")
             child_cwd = child_cwd.resolve(strict=True)
-        except AuthenticationError, OSError, ValueError:
+        except AuthenticationError, ExecutionError, OSError, ValueError:
             await websocket.close(code=4401)
             return
         await websocket.accept()
@@ -535,7 +593,7 @@ def create_app(config: AgentsConfig | None = None, connection: sqlite3.Connectio
                 or len(names) != len(set(names))
                 or not isinstance(argv, list)
                 or not argv
-                or not all(isinstance(value, str) for value in argv)
+                or not all(isinstance(value, str) and value for value in argv)
                 or not isinstance(tty, bool)
             ):
                 await websocket.send_json({"error": "invalid run request"})
@@ -547,24 +605,31 @@ def create_app(config: AgentsConfig | None = None, connection: sqlite3.Connectio
                 await websocket.close(code=4403)
                 return
             values = broker_values(resolve_secret_paths(websocket.app.state.config.root), names)
-            environment = {
-                key: value
-                for key, value in os.environ.items()
-                if key in {"PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR"}
-            }
-            environment.update(values)
-            common = {
-                "cwd": child_cwd,
-                "env": environment,
-                "start_new_session": True,
-            }
+            container_child = docker_backend is not None
+            if container_child:
+                environment = docker_backend.runtime.docker_environment()
+                environment.update(values)
+                child_argv = _container_secret_command(docker_container, child_cwd, names, argv, tty)
+                common = {"env": environment, "start_new_session": True}
+            else:
+                environment = {
+                    key: value
+                    for key, value in os.environ.items()
+                    if key in {"PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR"}
+                }
+                environment.update(values)
+                child_argv = (*_broker_child_prefix(), *argv)
+                common = {
+                    "cwd": child_cwd,
+                    "env": environment,
+                    "start_new_session": True,
+                }
             master_fd: int | None = None
-            common.update(_broker_child_identity())
             if tty:
                 master_fd, slave_fd = pty.openpty()
                 try:
                     process = await asyncio.create_subprocess_exec(
-                        *argv,
+                        *child_argv,
                         stdin=slave_fd,
                         stdout=slave_fd,
                         stderr=slave_fd,
@@ -589,7 +654,7 @@ def create_app(config: AgentsConfig | None = None, connection: sqlite3.Connectio
                 readers = [asyncio.create_task(tty_output())]
             else:
                 process = await asyncio.create_subprocess_exec(
-                    *argv,
+                    *child_argv,
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
@@ -1613,8 +1678,6 @@ def _listen_host(config: AgentsConfig) -> str:
         if override != "0.0.0.0":
             raise RuntimeError("whole-system container listener must be 0.0.0.0")
         return override
-    if str(config.execution.isolation) == "container":
-        return "0.0.0.0"
     return config.web.host
 
 

@@ -58,6 +58,18 @@ def _profile_runtime(config: AgentsConfig, agent_auth_id: str) -> tuple[Path | N
     return root / "home", root / "provider"
 
 
+def _container_provider_credential(config: AgentsConfig, provider: str) -> tuple[str, str] | None:
+    if config.execution.isolation is not IsolationMode.CONTAINER:
+        return None
+    name = {"opencode_cli": "OPENCODE_AUTH_JSON", "claude_code": "CLAUDE_CODE_OAUTH_TOKEN"}.get(provider)
+    if name is None:
+        return None
+    value = os.environ.get(name)
+    if not value:
+        raise ExecutionUnavailable("container_auth_missing", f"{name} is required for containerized {provider}")
+    return name, value
+
+
 def _normalize_status(status: str | None) -> str:
     normalized = (status or "").strip().lower()
     return "completed" if normalized in _COMPLETION_STATUSES else normalized
@@ -165,6 +177,17 @@ def _reserve_terminal_unchecked(
     instance = str(project[0])
     profile = profile_name(instance, run_id, generation)
     mcp = mcp_name(instance, run_id, generation)
+    if purpose_kind == "persistent" and config.execution.isolation is IsolationMode.CONTAINER:
+        working_directory = config.state_dir / "runtime" / profile / "workspace"
+        if working_directory.is_symlink():
+            raise RuntimeError("persistent container workspace is unsafe")
+        working_directory.mkdir(parents=True, mode=0o700)
+        if any(working_directory.iterdir()):
+            raise RuntimeError("persistent container workspace is not empty")
+        connection.execute(
+            "UPDATE terminal_runs SET working_directory=? WHERE id=?",
+            (str(working_directory.resolve()), run_id),
+        )
     session_purpose_id = purpose_id
     if purpose_kind == "work":
         work = connection.execute("SELECT seq,active_execution_id FROM work_items WHERE id=?", (purpose_id,)).fetchone()
@@ -620,6 +643,8 @@ class Reconciler:
             if broker_url := os.environ.get("AGENTS_SECRETS_API_URL"):
                 environment["AGENTS_SECRETS_API_URL"] = broker_url
                 environment["AGENTS_SECRETS_TRANSPORT"] = "agent-api"
+            if credential := _container_provider_credential(self.config, provider):
+                environment[credential[0]] = credential[1]
             spec = RunSpec(
                 str(run["execution_name"]),
                 run_id,
@@ -952,6 +977,8 @@ class Reconciler:
         if broker_url := os.environ.get("AGENTS_SECRETS_API_URL"):
             environment["AGENTS_SECRETS_API_URL"] = broker_url
             environment["AGENTS_SECRETS_TRANSPORT"] = "agent-api"
+        if credential := _container_provider_credential(self.config, provider):
+            environment[credential[0]] = credential[1]
         return RunSpec(
             str(run["execution_name"]),
             run_id,

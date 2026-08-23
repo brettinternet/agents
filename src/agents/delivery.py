@@ -207,13 +207,22 @@ class Delivery:
                     return None
                 terminal_run_id = int(persistent["id"])
             else:
+                working_directory = self.config.project.path
+                if str(self.config.execution.isolation) == "container":
+                    working_directory = self.config.root / ".worktrees/consultation" / str(consultation["id"])
+                    add_agent_snapshot(
+                        self.config,
+                        self.config.project.path,
+                        branch_sha(self.config.project.path, self.config.project.default_branch),
+                        working_directory,
+                    )
                 run = reserve_terminal(
                     self.connection,
                     self.config,
                     actor=actor_slug,
                     purpose_kind="consultation",
                     purpose_id=str(consultation["id"]),
-                    working_directory=self.config.project.path,
+                    working_directory=working_directory,
                 )
                 terminal_run_id = int(run["id"])
         now = utc_now()
@@ -555,6 +564,9 @@ class Delivery:
         if assignment is None or work["status"] != "in_progress":
             raise DomainError("stale_generation", "implementation assignment changed")
         path = Path(str(assignment["worktree_path"]))
+        default = branch_sha(self.config.project.path, self.config.project.default_branch)
+        if default != assignment["base_sha"]:
+            raise DomainError("base_changed", "default branch advanced")
         if str(self.config.execution.isolation) == "container":
             try:
                 import_isolated_submission(
@@ -566,9 +578,6 @@ class Delivery:
                 )
             except GitError as exc:
                 raise DomainError("invalid_submission", str(exc)) from exc
-        default = branch_sha(self.config.project.path, self.config.project.default_branch)
-        if default != assignment["base_sha"]:
-            raise DomainError("base_changed", "default branch advanced")
         if (
             not is_clean(path)
             or head_sha(path) != commit_sha

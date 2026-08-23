@@ -25,6 +25,7 @@ from .execution import (
     RunSnapshot,
     RunSpec,
 )
+from .git_worktree import GitError, remove_recorded_workspace
 from .herdr_client import HerdrBackend
 
 _INSTANCE_LABEL = "dev.agents.instance"
@@ -127,9 +128,46 @@ class ContainerRuntime:
                 )
             )
             status = self.status()
-        mounts = status.get("mounts")
-        if mounts is not None and str(repository.resolve()) not in json.dumps(mounts):
-            raise ContainerRuntimeError("existing Colima profile does not mount the configured repository")
+        if (
+            status.get("driver") != "macOS Virtualization.Framework"
+            or status.get("arch") not in {"aarch64", "arm64"}
+            or status.get("runtime") != "docker"
+            or status.get("mount_type") != "virtiofs"
+            or status.get("kubernetes") is not False
+        ):
+            raise ContainerRuntimeError(
+                "existing Colima profile must use Apple Virtualization, arm64, Docker, VirtioFS, and disabled Kubernetes"
+            )
+        repository = repository.resolve()
+        mounted = self._ssh("test", "-d", str(repository), "-a", "-w", str(repository))
+        if mounted.returncode:
+            raise ContainerRuntimeError("existing Colima profile does not mount the repository read-write")
+        mounts = self._ssh("mount", "-t", "virtiofs")
+        mount_lines = [line for line in mounts.stdout.splitlines() if line.strip()]
+        marker = f" on {repository} type virtiofs ("
+        host_targets = []
+        for line in mount_lines:
+            if " on " in line and " type virtiofs " in line:
+                host_targets.append(line.split(" on ", 1)[1].split(" type virtiofs ", 1)[0])
+        if not any(marker in line and "rw," in line for line in mount_lines) or any(
+            target != str(repository)
+            for target in host_targets
+            if target.startswith(("/Users/", "/Volumes/", "/private/"))
+        ):
+            raise ContainerRuntimeError(
+                "Colima profile must expose the configured repository, and no wider host path, via VirtioFS"
+            )
+        ssh_agent = self._ssh("printenv", "SSH_AUTH_SOCK", check=False)
+        if ssh_agent.returncode == 0 and ssh_agent.stdout.strip():
+            raise ContainerRuntimeError("Colima profile forwards an SSH agent")
+        running = self.docker("container", "ls", "--format", "{{json .}}")
+        for line in running.splitlines():
+            try:
+                labels = str(json.loads(line).get("Labels", ""))
+            except (AttributeError, json.JSONDecodeError) as exc:
+                raise ContainerRuntimeError("docker returned malformed workload identity") from exc
+            if f"{_INSTANCE_LABEL}=" not in labels:
+                raise ContainerRuntimeError("Colima profile contains a running workload not owned by Agents")
         self._ensure_network("agents-runs", "172.30.0.0/24", instance)
         self._ensure_network("agents-system", "172.30.1.0/28", instance)
         self._install_firewall(instance, api_port)
@@ -158,8 +196,24 @@ class ContainerRuntime:
             or len(values) != 1
             or values[0].get("IPAM", {}).get("Config", [{}])[0].get("Subnet") != subnet
             or values[0].get("Labels", {}).get(_INSTANCE_LABEL) != instance
+            or values[0].get("EnableIPv6") is not False
         ):
             raise ContainerRuntimeError(f"existing Docker network {name!r} has an unexpected shape")
+
+    def verify_api_reachable(self, api_port: int) -> None:
+        result = self._ssh(
+            "curl",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "2",
+            f"http://host.lima.internal:{api_port}/health",
+            check=False,
+        )
+        if result.returncode:
+            detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+            raise ContainerRuntimeError(f"Colima cannot reach the loopback Agents listener: {detail}")
 
     def trim(self) -> None:
         _completed(("colima", "--profile", self.config.colima_profile, "ssh", "--", "sudo", "fstrim", "-a"))
@@ -205,6 +259,38 @@ class ContainerRuntime:
             pass
         self._ensure_firewall_rule(
             ("-s", "172.30.0.0/23", "-m", "comment", "--comment", comment, "-j", chain),
+            insert=True,
+        )
+        self._ensure_firewall_rule(
+            (
+                "-s",
+                "172.30.0.0/23",
+                "-m",
+                "comment",
+                "--comment",
+                comment,
+                "-j",
+                "REJECT",
+            ),
+            chain="INPUT",
+            insert=True,
+        )
+        self._ensure_firewall_rule(
+            (
+                "-s",
+                "172.30.0.0/23",
+                "-m",
+                "comment",
+                "--comment",
+                comment,
+                "-m",
+                "conntrack",
+                "--ctstate",
+                "RELATED,ESTABLISHED",
+                "-j",
+                "ACCEPT",
+            ),
+            chain="INPUT",
             insert=True,
         )
         self._ssh("sudo", "iptables", "-F", chain)
@@ -321,9 +407,13 @@ class ContainerGarbageCollector:
         active = {
             str(row[0])
             for row in self.connection.execute(
-                "SELECT execution_name FROM terminal_runs WHERE state IN ('reserved','creating','live','retained','ending')"
+                "SELECT tr.execution_name FROM terminal_runs tr "
+                "WHERE tr.state IN ('reserved','creating','live','retained','ending') "
+                "OR EXISTS (SELECT 1 FROM launch_attempts la WHERE la.terminal_run_id=tr.id "
+                "AND la.state IN ('posting','uncertain'))"
             )
         }
+        protected_images = {self.runtime.resolve_image_id(self.container.image)}
         removed_containers: list[str] = []
         rows = self.runtime.docker(
             "container",
@@ -344,6 +434,10 @@ class ContainerGarbageCollector:
             labels = inspect.get("Config", {}).get("Labels", {})
             execution = labels.get("dev.agents.execution")
             retention = labels.get(_RETENTION_LABEL)
+            image_id = str(inspect.get("Image", ""))
+            if execution in active and image_id.startswith("sha256:"):
+                protected_images.add(image_id)
+            topology = labels.get("dev.agents.topology")
             state = inspect.get("State", {})
             finished = str(state.get("FinishedAt") or "")
             try:
@@ -351,7 +445,10 @@ class ContainerGarbageCollector:
             except ValueError:
                 finished_epoch = now
             if (
-                execution not in active
+                isinstance(execution, str)
+                and execution
+                and execution not in active
+                and topology is None
                 and retention == "ephemeral"
                 and not bool(state.get("Running"))
                 and now - finished_epoch >= self.container.gc_grace_seconds
@@ -386,35 +483,92 @@ class ContainerGarbageCollector:
                 created_epoch = calendar.timegm(time.strptime(created[:19], "%Y-%m-%dT%H:%M:%S"))
             except ValueError:
                 created_epoch = now
+            execution = labels.get("dev.agents.execution")
             if (
                 labels.get(_INSTANCE_LABEL) == self.instance
                 and labels.get(_RETENTION_LABEL) == "ephemeral"
-                and labels.get("dev.agents.execution") not in active
+                and labels.get("dev.agents.topology") is None
+                and isinstance(execution, str)
+                and execution
+                and execution not in active
                 and now - created_epoch >= self.container.gc_grace_seconds
             ):
                 self.runtime.docker("volume", "rm", name)
                 removed_volumes.append(name)
+        cleanup_errors: list[str] = []
+        workspaces = self.connection.execute(
+            "SELECT DISTINCT tr.id terminal_run_id,e.worktree_path,"
+            "COALESCE((SELECT s.commit_sha FROM submissions s WHERE s.execution_id=e.id "
+            "ORDER BY s.id DESC LIMIT 1),e.base_sha) target_sha "
+            "FROM terminal_runs tr JOIN assignments a ON a.terminal_run_id=tr.id "
+            "JOIN executions e ON e.id=a.execution_id "
+            "WHERE tr.state IN ('ended','failed') AND e.state IN ('closed','superseded') "
+            "AND NOT EXISTS (SELECT 1 FROM launch_attempts la WHERE la.terminal_run_id=tr.id "
+            "AND la.state IN ('posting','uncertain'))"
+        )
+        for row in workspaces:
+            try:
+                if self.connection.execute(
+                    "SELECT 1 FROM launch_attempts WHERE terminal_run_id=? AND state IN ('posting','uncertain')",
+                    (row["terminal_run_id"],),
+                ).fetchone():
+                    continue
+                remove_recorded_workspace(
+                    self.config,
+                    self.config.project.path,
+                    Path(str(row["worktree_path"])),
+                    str(row["target_sha"]),
+                )
+            except (GitError, OSError) as exc:
+                cleanup_errors.append(str(exc))
+        for row in self.connection.execute(
+            "SELECT tr.id,tr.agent_auth_id,tr.generation FROM terminal_runs tr "
+            "WHERE tr.state IN ('ended','failed') AND tr.agent_auth_id IS NOT NULL "
+            "AND NOT EXISTS (SELECT 1 FROM launch_attempts la WHERE la.terminal_run_id=tr.id "
+            "AND la.state IN ('posting','uncertain'))"
+        ):
+            runtime_dir = self.config.state_dir / "runtime" / str(row["agent_auth_id"])
+            expected = (self.config.state_dir / "runtime").resolve()
+            try:
+                if self.connection.execute(
+                    "SELECT 1 FROM launch_attempts WHERE terminal_run_id=? AND state IN ('posting','uncertain')",
+                    (row["id"],),
+                ).fetchone():
+                    continue
+                if (
+                    runtime_dir.is_symlink()
+                    or runtime_dir.parent.resolve() != expected
+                    or self.runtime.inspect_container(
+                        container_name(self.instance, int(row["id"]), int(row["generation"]))
+                    )
+                    is not None
+                ):
+                    raise ContainerRuntimeError(f"refusing unsafe runtime cleanup for terminal {row['id']}")
+                if runtime_dir.is_dir():
+                    shutil.rmtree(runtime_dir)
+            except (ContainerRuntimeError, OSError) as exc:
+                cleanup_errors.append(str(exc))
         retention = self.container.build_cache_retention_hours
         self.runtime.docker("image", "prune", "--force", "--filter", f"until={retention}h")
         self.runtime.docker("builder", "prune", "--force", "--filter", f"until={retention}h")
+        for image_id in protected_images:
+            if self.runtime.resolve_image_id(image_id) != image_id:
+                raise ContainerRuntimeError(f"garbage collection changed protected image {image_id}")
         trim_error = ""
         try:
             self.runtime.trim()
         except ContainerRuntimeError as exc:
             trim_error = str(exc)
-        return {"containers": removed_containers, "volumes": removed_volumes, "trim_error": trim_error}
+        return {
+            "containers": removed_containers,
+            "volumes": removed_volumes,
+            "trim_error": trim_error,
+            "cleanup_errors": cleanup_errors,
+        }
 
 
 def container_name(instance: str, terminal_run_id: int, generation: int) -> str:
     return f"agents-{instance[:12]}-r{terminal_run_id}-g{generation}"
-
-
-def _mounts(inspect: Mapping[str, Any]) -> dict[str, tuple[str, bool]]:
-    values: dict[str, tuple[str, bool]] = {}
-    for mount in inspect.get("Mounts", ()):
-        if isinstance(mount, dict) and isinstance(mount.get("Destination"), str):
-            values[str(mount["Destination"])] = (str(mount.get("Source", "")), bool(mount.get("RW")))
-    return values
 
 
 class ContainerizedHerdrBackend:
@@ -461,6 +615,38 @@ class ContainerizedHerdrBackend:
             link.symlink_to(target)
 
     def _verify(self, manifest: Mapping[str, Any]) -> dict[str, Any]:
+        expected_labels = (
+            cast(Mapping[str, Any], manifest["labels"]) if isinstance(manifest.get("labels"), dict) else {}
+        )
+        runtime_dir = Path(str(manifest.get("runtime_dir", "")))
+        runtime_root = (self.config.state_dir / "runtime").resolve()
+        if not runtime_dir.is_absolute() or runtime_dir.is_symlink() or runtime_dir.parent.resolve() != runtime_root:
+            raise ExecutionConflict("container_manifest", "container runtime directory is outside the managed root")
+        try:
+            run_id = int(str(expected_labels["dev.agents.run_id"]))
+            generation = int(str(expected_labels["dev.agents.generation"]))
+        except (KeyError, ValueError) as exc:
+            raise ExecutionConflict("container_manifest", "container manifest has invalid run identity") from exc
+        expected_user = f"{os.getuid()}:{os.getgid()}"
+        execution_name = manifest.get("execution_name")
+        image_id = manifest.get("image_id")
+        if (
+            run_id <= 0
+            or generation <= 0
+            or not isinstance(execution_name, str)
+            or not execution_name
+            or not isinstance(image_id, str)
+            or not image_id.startswith("sha256:")
+            or manifest.get("container_name") != container_name(self.instance, run_id, generation)
+            or manifest.get("user") != expected_user
+            or expected_labels.get(_INSTANCE_LABEL) != self.instance
+            or expected_labels.get("dev.agents.execution") != execution_name
+            or expected_labels.get("dev.agents.image_id") != image_id
+            or expected_labels.get(_RETENTION_LABEL) != "ephemeral"
+            or expected_labels.get("dev.agents.cwd_sha256")
+            != hashlib.sha256(str(manifest.get("cwd", "")).encode()).hexdigest()
+        ):
+            raise ExecutionConflict("container_manifest", "container manifest identity is inconsistent")
         name = str(manifest["container_name"])
         inspect = self.runtime.inspect_container(name)
         if inspect is None:
@@ -468,9 +654,6 @@ class ContainerizedHerdrBackend:
         config = cast(Mapping[str, Any], inspect["Config"]) if isinstance(inspect.get("Config"), dict) else {}
         host = cast(Mapping[str, Any], inspect["HostConfig"]) if isinstance(inspect.get("HostConfig"), dict) else {}
         labels = cast(Mapping[str, Any], config["Labels"]) if isinstance(config.get("Labels"), dict) else {}
-        expected_labels = (
-            cast(Mapping[str, Any], manifest["labels"]) if isinstance(manifest.get("labels"), dict) else {}
-        )
         for key, expected in expected_labels.items():
             if labels.get(key) != expected:
                 raise ExecutionConflict("container_identity", f"container {name!r} has mismatched label {key}")
@@ -479,8 +662,12 @@ class ContainerizedHerdrBackend:
             raise ExecutionConflict("container_identity", f"container {name!r} has a mismatched image")
         if not bool(host.get("ReadonlyRootfs")):
             raise ExecutionConflict("container_identity", f"container {name!r} root filesystem is writable")
-        if str(config.get("User", "")) != str(manifest.get("user", "")):
-            raise ExecutionConflict("container_identity", f"container {name!r} has a mismatched user")
+        if str(config.get("User", "")) != str(manifest.get("user", "")) or str(config.get("WorkingDir", "")) != str(
+            manifest.get("cwd", "")
+        ):
+            raise ExecutionConflict(
+                "container_identity", f"container {name!r} has a mismatched user or working directory"
+            )
         if int(host.get("PidsLimit") or 0) != self.container.pids_limit:
             raise ExecutionConflict("container_identity", f"container {name!r} has a mismatched PID limit")
         if int(host.get("NanoCpus") or 0) != int(self.container.cpus * 1_000_000_000):
@@ -489,23 +676,54 @@ class ContainerizedHerdrBackend:
             raise ExecutionConflict("container_identity", f"container {name!r} has a mismatched memory limit")
         if host.get("NetworkMode") != "agents-runs":
             raise ExecutionConflict("container_identity", f"container {name!r} has a mismatched network")
+        security_options = host.get("SecurityOpt") or ()
         if "ALL" not in (host.get("CapDrop") or ()):
             raise ExecutionConflict("container_identity", f"container {name!r} retains Linux capabilities")
-        if "no-new-privileges" not in (host.get("SecurityOpt") or ()):
-            raise ExecutionConflict("container_identity", f"container {name!r} permits privilege escalation")
-        mounts = _mounts(inspect)
-        for destination, source in (
-            (manifest["cwd"], manifest["cwd"]),
-            (manifest["runtime_dir"], manifest["runtime_dir"]),
+        if (
+            "no-new-privileges" not in security_options
+            or any(str(option).startswith("seccomp=unconfined") for option in security_options)
+            or bool(host.get("Privileged"))
+            or bool(host.get("Devices"))
+            or bool(host.get("DeviceRequests"))
         ):
-            if mounts.get(str(destination)) != (str(source), True):
-                raise ExecutionConflict("container_identity", f"container {name!r} has a mismatched bind mount")
+            raise ExecutionConflict(
+                "container_identity", f"container {name!r} permits unsafe privilege or device access"
+            )
+        expected_tmpfs = {"/tmp", "/run"}
+        tmpfs = host.get("Tmpfs")
+        if (
+            not isinstance(tmpfs, dict)
+            or set(tmpfs) != expected_tmpfs
+            or any(
+                not {"rw", "noexec", "nosuid", "nodev"}.issubset(set(str(options).split(",")))
+                for options in tmpfs.values()
+            )
+        ):
+            raise ExecutionConflict("container_identity", f"container {name!r} has mismatched temporary filesystems")
+        raw_mounts = inspect.get("Mounts")
+        if not isinstance(raw_mounts, list):
+            raise ExecutionConflict("container_identity", f"container {name!r} has malformed mounts")
+        bind_mounts = {
+            str(mount.get("Destination")): (str(mount.get("Source", "")), bool(mount.get("RW")))
+            for mount in raw_mounts
+            if isinstance(mount, dict) and mount.get("Type") == "bind"
+        }
+        expected_mounts = {
+            str(manifest["cwd"]): (str(manifest["cwd"]), True),
+            str(runtime_dir): (str(runtime_dir), True),
+        }
+        if bind_mounts != expected_mounts or any(
+            isinstance(mount, dict) and mount.get("Type") not in {"bind", "tmpfs"} for mount in raw_mounts
+        ):
+            raise ExecutionConflict("container_identity", f"container {name!r} has mismatched bind mounts")
         return inspect
 
     def _verify_live(self, run: RunSnapshot) -> RunSnapshot:
         manifest = self._read_manifest(run.handle.name)
         if manifest is None:
             raise ExecutionConflict("container_manifest", f"container manifest for {run.handle.name!r} is absent")
+        if manifest.get("execution_name") != run.handle.name:
+            raise ExecutionConflict("container_manifest", f"container manifest for {run.handle.name!r} is mismatched")
         self._verify(manifest)
         return run
 
@@ -625,7 +843,16 @@ class ContainerizedHerdrBackend:
 
     def delete_run(self, handle: RunHandle) -> None:
         manifest = self._read_manifest(handle.name)
+        runtime_dir: Path | None = None
         if manifest is not None:
+            runtime_dir = Path(str(manifest.get("runtime_dir", "")))
+            runtime_root = (self.config.state_dir / "runtime").resolve()
+            if (
+                not runtime_dir.is_absolute()
+                or runtime_dir.is_symlink()
+                or runtime_dir.parent.resolve() != runtime_root
+            ):
+                raise ExecutionConflict("container_manifest", "container runtime directory is outside the managed root")
             try:
                 self._verify(manifest)
             except ExecutionNotFound:
@@ -633,8 +860,7 @@ class ContainerizedHerdrBackend:
             else:
                 self.runtime.remove_container(str(manifest["container_name"]))
         self.inner.delete_run(handle)
-        if manifest is not None:
-            runtime_dir = Path(str(manifest["runtime_dir"]))
+        if manifest is not None and runtime_dir is not None:
             if runtime_dir.is_dir() and not runtime_dir.is_symlink():
                 shutil.rmtree(runtime_dir)
             self._manifest_path(handle.name).unlink(missing_ok=True)

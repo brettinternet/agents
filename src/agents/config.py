@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import re
 import sqlite3
@@ -32,6 +33,7 @@ _SCHEDULE_SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _SCHEDULE_DURATION = re.compile(r"^([1-9][0-9]*)([mhd])$")
 _SCHEDULE_CHANNELS = frozenset({"#general", "#findings", "#publishing", "#coordination", "#incidents"})
 _COLIMA_PROFILE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_OCI_IMAGE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}$")
 
 
 class ConfigError(ValueError):
@@ -427,8 +429,8 @@ def load(path: Path | None = None, env: dict[str, str] | None = None) -> AgentsC
         if not isinstance(profile, str) or not _COLIMA_PROFILE.fullmatch(profile):
             raise ConfigError("execution.container.colima_profile must be a simple profile name")
         image = values.get("AGENTS_CONTAINER_IMAGE", container_raw.get("image"))
-        if not isinstance(image, str) or not image.strip() or any(character.isspace() for character in image):
-            raise ConfigError("execution.container.image must be a nonempty OCI image reference")
+        if not isinstance(image, str) or not _OCI_IMAGE.fullmatch(image):
+            raise ConfigError("execution.container.image must be a valid nonempty OCI image reference")
         cpus_value = container_raw.get("cpus")
         if isinstance(cpus_value, bool):
             raise ConfigError("execution.container.cpus must be positive")
@@ -436,8 +438,8 @@ def load(path: Path | None = None, env: dict[str, str] | None = None) -> AgentsC
             cpus = float(cast(float | int | str, cpus_value))
         except (TypeError, ValueError) as exc:
             raise ConfigError("execution.container.cpus must be positive") from exc
-        if cpus <= 0:
-            raise ConfigError("execution.container.cpus must be positive")
+        if not math.isfinite(cpus) or cpus <= 0:
+            raise ConfigError("execution.container.cpus must be finite and positive")
         container = ContainerConfig(
             colima_profile=profile,
             image=image,

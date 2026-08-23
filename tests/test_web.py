@@ -23,7 +23,7 @@ from agents.config import (
 from agents.db import connect, migrate, utc_now
 from agents.messages import Messaging
 from agents.store import Store
-from agents.web import _listen_host, create_app, create_secret_broker_app
+from agents.web import _container_secret_command, _listen_host, create_app, create_secret_broker_app
 
 
 class WebAuthTests(unittest.TestCase):
@@ -332,7 +332,41 @@ class WebAuthTests(unittest.TestCase):
                 ).status_code,
                 401,
             )
-        broker.assert_called_once()
+            self.assertEqual(
+                self.client.post("/agent/v1/secrets/list", headers=headers("work"), json=[]).status_code,
+                400,
+            )
+            listed = self.client.post("/agent/v1/secrets/list", headers=headers("work"), json={})
+            self.assertEqual(listed.status_code, 200)
+            self.assertEqual(listed.json()["data"]["names"], ["TEST_SECRET"])
+        self.assertEqual(broker.call_count, 2)
+
+    def test_container_secret_run_passes_only_secret_names_to_docker(self):
+        command = _container_secret_command(
+            "agents-instance-r1-g1",
+            Path("/workspace"),
+            ["TEST_SECRET"],
+            ["python", "-c", "print('ok')"],
+            False,
+        )
+        self.assertIn("TEST_SECRET", command)
+        self.assertNotIn("opaque-secret-value", command)
+        self.assertEqual(
+            command,
+            (
+                "docker",
+                "exec",
+                "--interactive",
+                "--workdir",
+                "/workspace",
+                "--env",
+                "TEST_SECRET",
+                "agents-instance-r1-g1",
+                "python",
+                "-c",
+                "print('ok')",
+            ),
+        )
 
     def test_snapshot_roster_exposes_terminal_purpose(self):
         self.client.post("/auth/login", data={"token": "w" * 64}, headers={"Origin": "http://testserver"})
@@ -430,7 +464,7 @@ class WebAuthTests(unittest.TestCase):
             1,
         )
 
-    def test_container_execution_listens_for_vm_traffic(self):
+    def test_per_agent_container_execution_preserves_loopback_listener(self):
         execution = replace(
             self.config.execution,
             isolation=IsolationMode.CONTAINER,
@@ -438,7 +472,15 @@ class WebAuthTests(unittest.TestCase):
         )
         config = replace(self.config, execution=execution)
         with patch.dict("os.environ", {}, clear=True):
-            self.assertEqual(_listen_host(config), "0.0.0.0")
+            self.assertEqual(_listen_host(config), "127.0.0.1")
+
+    def test_whole_system_container_uses_explicit_wide_listener(self):
+        with patch.dict(
+            "os.environ",
+            {"AGENTS_SYSTEM_CONTAINER": "1", "AGENTS_WEB_LISTEN_HOST": "0.0.0.0"},
+            clear=True,
+        ):
+            self.assertEqual(_listen_host(self.config), "0.0.0.0")
 
     def test_host_execution_preserves_configured_listener(self):
         with patch.dict("os.environ", {}, clear=True):

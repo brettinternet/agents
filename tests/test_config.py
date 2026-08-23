@@ -264,8 +264,28 @@ build_cache_retention_hours=168""",
             """isolation='container'
 [execution.container]
 colima_profile='agents'
+image='image!'
+cpus=2.0
+memory_mb=4096
+pids_limit=512
+gc_interval_seconds=3600
+gc_grace_seconds=3600
+build_cache_retention_hours=168""",
+            """isolation='container'
+[execution.container]
+colima_profile='agents'
 image='image'
 cpus=0
+memory_mb=4096
+pids_limit=512
+gc_interval_seconds=3600
+gc_grace_seconds=3600
+build_cache_retention_hours=168""",
+            """isolation='container'
+[execution.container]
+colima_profile='agents'
+image='image'
+cpus=nan
 memory_mb=4096
 pids_limit=512
 gc_interval_seconds=3600

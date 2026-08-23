@@ -26,6 +26,7 @@ import httpx
 from agents import service
 from agents.cli import doctor
 from agents.config import AgentsConfig, load
+from agents.container_runtime import ContainerRuntime, build_execution_backend, container_name
 from agents.db import connect, migrate
 from agents.reconciler import bootstrap_persistent_agents
 from agents.store import Store
@@ -99,6 +100,100 @@ def _db_rows(config: AgentsConfig, query: str, args: tuple[Any, ...] = ()) -> li
         return [dict(row) for row in connection.execute(query, args)]
     finally:
         connection.close()
+
+
+def _assert_container_boundary(config: AgentsConfig) -> None:
+    container = config.execution.container
+    if container is None:
+        raise SmokeFailure("container boundary", "container configuration is absent")
+    instance_row = _db_row(config, "SELECT instance_id FROM project WHERE id=1")
+    if instance_row is None:
+        raise SmokeFailure("container boundary", "project identity is absent")
+    instance = str(instance_row["instance_id"])
+    runtime = ContainerRuntime(container)
+    backend = build_execution_backend(config)
+    rows = _db_rows(
+        config,
+        "SELECT id,execution_name,generation,container_image_id FROM terminal_runs WHERE state='live' ORDER BY id",
+    )
+    if not rows:
+        raise SmokeFailure("container boundary", "no live container run exists")
+    expected_image = runtime.resolve_image_id(container.image)
+    for row in rows:
+        execution_name = str(row["execution_name"])
+        if backend.find_run(execution_name) is None:
+            raise SmokeFailure("container boundary", f"{execution_name} was not adopted")
+        name = container_name(instance, int(row["id"]), int(row["generation"]))
+        inspect = runtime.inspect_container(name)
+        if inspect is None:
+            raise SmokeFailure("container boundary", f"{name} is absent")
+        host = inspect.get("HostConfig", {})
+        config_data = inspect.get("Config", {})
+        labels = config_data.get("Labels", {})
+        if (
+            inspect.get("Image") != expected_image
+            or row["container_image_id"] != expected_image
+            or config_data.get("User") != f"{os.getuid()}:{os.getgid()}"
+            or not host.get("ReadonlyRootfs")
+            or int(host.get("NanoCpus") or 0) != int(container.cpus * 1_000_000_000)
+            or int(host.get("Memory") or 0) != container.memory_mb * 1024 * 1024
+            or int(host.get("PidsLimit") or 0) != container.pids_limit
+            or host.get("NetworkMode") != "agents-runs"
+            or "ALL" not in (host.get("CapDrop") or ())
+            or "no-new-privileges" not in (host.get("SecurityOpt") or ())
+            or labels.get("dev.agents.instance") != instance
+            or labels.get("dev.agents.execution") != execution_name
+            or labels.get("dev.agents.image_id") != expected_image
+        ):
+            raise SmokeFailure("container boundary", f"{name} has unexpected immutable identity or hardening")
+        mounts = inspect.get("Mounts", ())
+        bind_destinations = {
+            str(mount.get("Destination")) for mount in mounts if isinstance(mount, dict) and mount.get("Type") == "bind"
+        }
+        if len(bind_destinations) != 2 or any(
+            destination in bind_destinations
+            for destination in (
+                str(config.root.resolve()),
+                str(config.state_dir.resolve()),
+                str(Path.home()),
+                "/var/run/docker.sock",
+            )
+        ):
+            raise SmokeFailure("container boundary", f"{name} has an unexpected bind mount")
+        runtime.docker(
+            "exec",
+            name,
+            "python",
+            "-c",
+            (
+                "import socket,urllib.request\n"
+                f"urllib.request.urlopen('http://host.docker.internal:{config.web.port}/health',timeout=2).read()\n"
+                "def denied(address):\n"
+                "    sock=socket.socket()\n"
+                "    sock.settimeout(0.5)\n"
+                "    try:\n"
+                "        return sock.connect_ex(address)!=0\n"
+                "    finally:\n"
+                "        sock.close()\n"
+                "blocked=[('172.30.0.1',22),('172.30.1.3',8765),('169.254.169.254',80)]\n"
+                "results={address:denied(address) for address in blocked}\n"
+                "assert all(results.values()),results\n"
+            ),
+        )
+    original_image = expected_image
+    alternate_image = runtime.resolve_image_id("agents-system-mock:local")
+    if alternate_image == original_image:
+        raise SmokeFailure("container retag", "fixture images unexpectedly share one image ID")
+    runtime.docker("image", "tag", alternate_image, container.image)
+    try:
+        for row in rows:
+            if backend.find_run(str(row["execution_name"])) is None:
+                raise SmokeFailure("container retag", "active run disappeared after configured tag changed")
+    finally:
+        runtime.docker("image", "tag", original_image, container.image)
+    if runtime.resolve_image_id(container.image) != original_image:
+        raise SmokeFailure("container retag", "configured image tag was not restored")
+    _stage("container identity, hardening, network policy, and immutable retag adoption validated")
 
 
 def _wait(stage: str, predicate: Callable[[], bool], timeout: float = 60.0) -> None:
@@ -345,6 +440,8 @@ def run(isolation: str = "host") -> None:
                     "SELECT actor_slug,generation,backend_run_id,backend_terminal_id FROM terminal_runs "
                     "WHERE purpose_kind='persistent' AND state='live' ORDER BY actor_slug",
                 )
+                if isolation == "container":
+                    _assert_container_boundary(config)
                 service.stop(config)
                 if service.status(config) != {"agentsd": False, "herdr": True}:
                     raise SmokeFailure("retention", "ordinary stop did not retain Herdr")
@@ -410,7 +507,15 @@ def run(isolation: str = "host") -> None:
                     "manager refinement started",
                     lambda: (
                         (_db_row(config, "SELECT status FROM work_items WHERE id=?", (item_id,)) or {}).get("status")
-                        == "refining"
+                        in {
+                            "refining",
+                            "ready",
+                            "in_progress",
+                            "verifying",
+                            "awaiting_approval",
+                            "accepted",
+                            "delivered",
+                        }
                     ),
                 )
                 _wait(

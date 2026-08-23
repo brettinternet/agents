@@ -16,6 +16,7 @@ import uvicorn
 from . import service
 from .auth import derive_agent_token, read_agent_auth_key
 from .config import AgentsConfig, load, resolve_execution_session
+from .container_runtime import ContainerRuntime, ContainerRuntimeError
 from .db import connect, migrate, utc_now
 from .git_worktree import GitError, branch_sha, git, reserve_execution_workspace, validate_project
 from .herdr_client import HerdrClient, herdr_executable, herdr_socket_path
@@ -293,6 +294,11 @@ def doctor(config: AgentsConfig, online: bool = True) -> list[str]:
                     errors.append(f"Herdr provider integration is not current: {detail}")
         if service.status(config) != {"agentsd": True, "herdr": True}:
             errors.append(f"owned services are not both running: {service.status(config)}")
+        if config.execution.container is not None and str(config.execution.isolation) == "container":
+            try:
+                ContainerRuntime(config.execution.container).verify_api_reachable(config.web.port)
+            except ContainerRuntimeError as exc:
+                errors.append(str(exc))
     return errors
 
 

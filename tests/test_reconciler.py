@@ -32,11 +32,17 @@ from agents.execution import (
     ExecutionNotFound,
     ExecutionStatus,
     ExecutionTimeout,
+    ExecutionUnavailable,
     RunHandle,
     RunSnapshot,
     RunSpec,
 )
-from agents.reconciler import Reconciler, bootstrap_persistent_agents, reserve_terminal
+from agents.reconciler import (
+    Reconciler,
+    _container_provider_credential,
+    bootstrap_persistent_agents,
+    reserve_terminal,
+)
 from agents.store import Store
 
 
@@ -219,6 +225,20 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
             working_directory=self.config.project.path,
             budget_exempt=True,
         )
+
+    def test_container_provider_credentials_are_required_and_returned_only_as_environment(self):
+        container = ContainerConfig("agents", "image", 1.0, 512, 64, 60, 60, 24)
+        config = replace(
+            self.config,
+            execution=replace(self.config.execution, isolation=IsolationMode.CONTAINER, container=container),
+        )
+        with patch.dict(os.environ, {"OPENCODE_AUTH_JSON": "opaque-secret"}, clear=True):
+            self.assertEqual(
+                _container_provider_credential(config, "opencode_cli"),
+                ("OPENCODE_AUTH_JSON", "opaque-secret"),
+            )
+        with patch.dict(os.environ, {}, clear=True), self.assertRaisesRegex(ExecutionUnavailable, "OPENCODE_AUTH_JSON"):
+            _container_provider_credential(config, "opencode_cli")
 
     def test_container_reservation_persists_backend_and_immutable_image_id(self):
         container = ContainerConfig("agents", "image:local", 2.0, 4096, 512, 3600, 3600, 168)

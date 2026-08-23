@@ -317,7 +317,7 @@ main > header {
   background: #fbe9e9;
   color: var(--danger);
 }
-.question-preview {
+.queue-preview {
   max-width: min(42rem, 100%);
   overflow: hidden;
   text-overflow: ellipsis;

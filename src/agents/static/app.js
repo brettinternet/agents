@@ -233,18 +233,21 @@ function renderQueues() {
   incidents.addEventListener("click", openIncidents);
   container.append(incidents);
   for (const row of state.snapshot.decisions) {
-    const button = text("button", `Decision ${row.id}: ${row.title}`, "queue alert");
+    const label = `Decision ${row.id}: ${row.title}`,
+      button = text(
+        "button",
+        `Decision ${row.id}: ${preview(row.title)}`,
+        "queue alert queue-preview",
+      );
+    button.title = label;
     button.addEventListener("click", () => openDecision(row));
     container.append(button);
   }
   for (const row of state.snapshot.blockers) {
     const waitingForAnswer = row.kind === "waiting_user_answer",
-      button = text(
-        "button",
-        waitingForAnswer ? `${row.kind}: ${preview(row.reason)}` : `${row.kind}: ${row.reason}`,
-        `queue alert ${waitingForAnswer ? "question-preview" : ""}`,
-      );
-    if (waitingForAnswer) button.title = row.reason;
+      label = `${row.kind}: ${row.reason}`,
+      button = text("button", `${row.kind}: ${preview(row.reason)}`, "queue alert queue-preview");
+    button.title = label;
     button.addEventListener("click", () => (waitingForAnswer ? openAnswer(row) : openBlocker(row)));
     container.append(button);
   }

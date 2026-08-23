@@ -1009,10 +1009,15 @@
       ctx.save();
       ctx.font = "9px Inter, system-ui, sans-serif";
       ctx.textAlign = "center";
-      ctx.textBaseline = "top";
       ctx.fillStyle = "#94a3b8";
       for (const agent of entities.agents.values()) {
-        ctx.fillText(agent.slug, agent.x, agent.y + agent.appearance.radius + 7);
+        const home = isAtHome(agent);
+        ctx.textBaseline = home ? "bottom" : "top";
+        ctx.fillText(
+          agent.slug,
+          agent.x,
+          home ? agent.y - agent.appearance.radius - 5 : agent.y + agent.appearance.radius + 7,
+        );
       }
       ctx.restore();
     }

@@ -42,6 +42,7 @@ from .profiles import (
 _RETRY = (1, 5, 30, 120, 300)
 
 _COMPLETION_STATUSES = {"completed", "complete", "done", "exited", "stopped"}
+_STALE_CWD_REPLACED = "stale backend workspace replaced after cwd mismatch"
 
 
 def _normalize_status(status: str | None) -> str:
@@ -187,10 +188,13 @@ def bootstrap_persistent_agents(connection: sqlite3.Connection, config: AgentsCo
         ).fetchone():
             continue
         attempts = connection.execute(
-            "SELECT COUNT(*) FROM terminal_runs WHERE actor_slug=? AND purpose_kind='persistent'",
+            "SELECT COUNT(*) total,"
+            "COUNT(*) FILTER (WHERE error IS NULL OR error NOT LIKE "
+            "'CAO terminal working directory mismatch:%') relevant "
+            "FROM terminal_runs WHERE actor_slug=? AND purpose_kind='persistent'",
             (actor,),
-        ).fetchone()[0]
-        if attempts >= 3:
+        ).fetchone()
+        if attempts["relevant"] >= 3 or attempts["total"] >= 6:
             continue
         run = reserve_terminal(
             connection,
@@ -614,7 +618,7 @@ class Reconciler:
                     return
                 self.connection.execute(
                     "UPDATE terminal_runs SET backend_run_id=?,backend_terminal_id=?,backend_revision=?,"
-                    "state='live',launch_count=launch_count+1,updated_at=? "
+                    "state='live',error=NULL,launch_count=launch_count+1,updated_at=? "
                     "WHERE id=? AND state='creating' AND token_revoked_at IS NULL",
                     (
                         snapshot.handle.run_id,
@@ -741,6 +745,45 @@ class Reconciler:
     async def _delete_run(self, handle: RunHandle) -> None:
         async with self._profile_lock:
             await self._delete_run_locked(handle)
+
+    async def _replace_stale_cwd_run(self, run: sqlite3.Row, snapshot: RunSnapshot) -> bool:
+        if run["error"] == _STALE_CWD_REPLACED:
+            return False
+        try:
+            await self._delete_run(snapshot.handle)
+        except ExecutionError:
+            return False
+        now = utc_now()
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            fence = self.connection.execute(
+                "SELECT tr.state terminal_state,la.state launch_state,tr.token_revoked_at "
+                "FROM terminal_runs tr JOIN launch_attempts la ON la.terminal_run_id=tr.id WHERE tr.id=?",
+                (run["id"],),
+            ).fetchone()
+            if (
+                fence is None
+                or fence["terminal_state"] != "creating"
+                or fence["launch_state"] not in {"posting", "uncertain"}
+                or fence["token_revoked_at"] is not None
+            ):
+                self.connection.rollback()
+                return True
+            self.connection.execute(
+                "UPDATE terminal_runs SET state='reserved',backend_run_id=NULL,backend_terminal_id=NULL,"
+                "backend_revision=NULL,status=NULL,output_digest=NULL,output_tail='',digest_since=NULL,error=?,"
+                "updated_at=? WHERE id=?",
+                (_STALE_CWD_REPLACED, now, run["id"]),
+            )
+            self.connection.execute(
+                "UPDATE launch_attempts SET state='reserved',counted=0,error=?,updated_at=? WHERE terminal_run_id=?",
+                (_STALE_CWD_REPLACED, now, run["id"]),
+            )
+            self.connection.commit()
+            return True
+        except BaseException:
+            self.connection.rollback()
+            raise
 
     def _abort_prepost(self, run_id: int, reason: str) -> None:
         run = self.connection.execute("SELECT * FROM terminal_runs WHERE id=?", (run_id,)).fetchone()
@@ -898,6 +941,12 @@ class Reconciler:
             )
             with contextlib.suppress(ExecutionNotFound):
                 await self._delete_run(snapshot.handle)
+            return
+        if (
+            snapshot.handle.name == run["execution_name"]
+            and snapshot.cwd != Path(str(run["working_directory"])).resolve()
+            and await self._replace_stale_cwd_run(run, snapshot)
+        ):
             return
         if not self._snapshot_matches(run, snapshot):
             empty_shell = snapshot.agent_name is None and snapshot.agent_kind is None

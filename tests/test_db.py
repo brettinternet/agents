@@ -96,7 +96,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.connection.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
         self.assertEqual(
             [row[0] for row in self.connection.execute("SELECT version FROM schema_migrations ORDER BY version")],
-            [1, 2, 3, 4, 5],
+            [1, 2, 3, 4, 5, 6],
         )
         terminal_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(terminal_runs)")}
         self.assertTrue(
@@ -238,6 +238,72 @@ class DatabaseTests(unittest.TestCase):
         self.assertIsNone(reserved["agent_auth_id"])
         other.close()
 
+    def test_stale_cao_failure_migration_resolves_persistent_cutover_state(self) -> None:
+        migrations = self.root / "stale-cao-migrations"
+        migrations.mkdir()
+        source = Path(__file__).parents[1] / "src/agents/migrations"
+        for name in (
+            "001_initial.sql",
+            "002_terminal_reasoning.sql",
+            "003_schedules.sql",
+            "004_general_channel.sql",
+            "005_execution_backend.sql",
+        ):
+            shutil.copy(source / name, migrations / name)
+        other = connect(self.root / "stale-cao.db")
+        migrate(other, migrations)
+        now = utc_now()
+        other.execute(
+            "INSERT INTO actors(slug,kind,persistent,capacity,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+            ("worker", "agent", 1, 1, now, now),
+        )
+        run_id = other.execute(
+            "INSERT INTO terminal_runs("
+            "execution_name,profile_name,mcp_name,profile_sha256,provider,model,generation,actor_slug,"
+            "purpose_kind,purpose_id,working_directory,token_digest,profile_state,state,error,created_at,updated_at"
+            ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "cao-agents-deadbeef-p-worker-g0001",
+                "profile",
+                "mcp",
+                "sha",
+                "mock_cli",
+                "",
+                1,
+                "worker",
+                "persistent",
+                "worker",
+                "/new",
+                "digest",
+                "installed",
+                "failed",
+                "CAO terminal working directory mismatch: expected /new, got /old",
+                now,
+                now,
+            ),
+        ).lastrowid
+        self.assertIsNotNone(run_id)
+        other.execute(
+            "INSERT INTO blockers(target_kind,target_id,terminal_run_id,kind,reason,requested_role,"
+            "actor_slug,state,created_at,updated_at) VALUES('persistent','worker',?,'terminal_failure',"
+            "'wrong directory','human','worker','open',?,?)",
+            (run_id, now, now),
+        )
+        other.execute(
+            "INSERT INTO incidents(kind,entity_kind,entity_id,severity,state,summary,details_json,created_at,updated_at)"
+            " VALUES('terminal_failed','terminal',?,'error','open','wrong directory','{}',?,?)",
+            (str(run_id), now, now),
+        )
+        shutil.copy(source / "006_resolve_stale_cao_failures.sql", migrations / "006_resolve_stale_cao_failures.sql")
+        migrate(other, migrations)
+        self.assertEqual(other.execute("SELECT state FROM blockers").fetchone()[0], "resolved")
+        self.assertEqual(other.execute("SELECT state FROM incidents").fetchone()[0], "resolved")
+        self.assertEqual(
+            [row[0] for row in other.execute("SELECT version FROM schema_migrations ORDER BY version")],
+            [1, 2, 3, 4, 5, 6],
+        )
+        other.close()
+
     def test_checksum_and_unknown_versions_fail(self) -> None:
         migrations = self.root / "migrations"
         migrations.mkdir()
@@ -248,6 +314,7 @@ class DatabaseTests(unittest.TestCase):
             "003_schedules.sql",
             "004_general_channel.sql",
             "005_execution_backend.sql",
+            "006_resolve_stale_cao_failures.sql",
         ):
             shutil.copy(source / name, migrations / name)
         other = connect(self.root / "other.db")

@@ -57,7 +57,7 @@ select:focus-visible,
 }
 .shell {
   display: grid;
-  grid-template-columns: 13rem minmax(32rem, 1fr) 20rem;
+  grid-template-columns: 13rem minmax(32rem, 1fr) 26rem;
   min-height: 100vh;
 }
 .shell > nav,
@@ -67,9 +67,14 @@ select:focus-visible,
   overflow: auto;
 }
 .shell > nav {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
   border-right: 1px solid var(--line);
 }
 .shell > aside {
+  display: flex;
+  flex-direction: column;
   border-left: 1px solid var(--line);
 }
 nav h1 {
@@ -92,6 +97,10 @@ nav li button {
   width: 100%;
   text-align: left;
   padding: 0.3rem 0.4rem;
+}
+#logout {
+  align-self: flex-start;
+  margin-top: auto;
 }
 .presence {
   display: inline-block;
@@ -152,13 +161,21 @@ main > header {
   gap: 0.35rem;
 }
 .thread {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
   margin-top: 0.75rem;
 }
 .thread-header {
   display: flex;
   justify-content: space-between;
-  align-items: end;
-  gap: 0.5rem;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.5rem;
+}
+.thread-header h2 {
+  margin-bottom: 0;
 }
 .compose {
   margin-top: 0.5rem;
@@ -234,12 +251,17 @@ main > header {
   color: var(--danger);
 }
 .messages {
-  height: 15rem;
+  height: clamp(22rem, 44vh, 34rem);
   overflow: auto;
   border: 1px solid var(--line);
   border-radius: 0.5rem;
   padding: 0.35rem;
   background: #f8fafc;
+}
+.message-header {
+  display: flex;
+  align-items: baseline;
+  gap: 0.55rem;
 }
 .message {
   padding: 0.4rem;
@@ -253,6 +275,9 @@ main > header {
 .message time {
   font-size: 0.7rem;
   color: var(--muted);
+}
+.message p {
+  margin: 0.55rem 0;
 }
 #detail {
   max-height: 40vh;
@@ -340,6 +365,9 @@ dialog::backdrop {
 @media (max-width: 600px) {
   #world-canvas {
     height: 180px;
+  }
+  .shell > nav {
+    min-height: auto;
   }
 }
 @media (max-width: 1000px) {

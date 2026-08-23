@@ -359,6 +359,67 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(bootstrap_persistent_agents(self.connection, self.config), [])
 
+    def test_bootstrap_retries_after_stale_project_directory_failures(self):
+        for _ in range(3):
+            run = self.reserve()
+            now = utc_now()
+            self.connection.execute(
+                "UPDATE terminal_runs SET state='failed',error=?,token_revoked_at=?,updated_at=? WHERE id=?",
+                (
+                    "CAO terminal working directory mismatch: expected /new, got /old",
+                    now,
+                    now,
+                    run["id"],
+                ),
+            )
+            self.connection.execute(
+                "UPDATE launch_attempts SET state='failed',updated_at=? WHERE terminal_run_id=?",
+                (now, run["id"]),
+            )
+            self.connection.execute(
+                "UPDATE actor_leases SET released_at=? WHERE terminal_run_id=?",
+                (now, run["id"]),
+            )
+        reserved = bootstrap_persistent_agents(self.connection, self.config)
+        replacement = self.connection.execute(
+            "SELECT generation,state FROM terminal_runs WHERE id IN ({}) AND actor_slug='elder'".format(
+                ",".join("?" for _ in reserved)
+            ),
+            tuple(reserved),
+        ).fetchone()
+        self.assertEqual(tuple(replacement), (4, "reserved"))
+
+    def test_bootstrap_bounds_repeated_stale_directory_failures(self):
+        for _ in range(6):
+            run = self.reserve()
+            now = utc_now()
+            self.connection.execute(
+                "UPDATE terminal_runs SET state='failed',error=?,token_revoked_at=?,updated_at=? WHERE id=?",
+                (
+                    "CAO terminal working directory mismatch: expected /new, got /old",
+                    now,
+                    now,
+                    run["id"],
+                ),
+            )
+            self.connection.execute(
+                "UPDATE launch_attempts SET state='failed',updated_at=? WHERE terminal_run_id=?",
+                (now, run["id"]),
+            )
+            self.connection.execute(
+                "UPDATE actor_leases SET released_at=? WHERE terminal_run_id=?",
+                (now, run["id"]),
+            )
+        reserved = bootstrap_persistent_agents(self.connection, self.config)
+        self.assertFalse(
+            self.connection.execute(
+                "SELECT 1 FROM terminal_runs WHERE id IN ({}) AND actor_slug='elder'".format(
+                    ",".join("?" for _ in reserved)
+                ),
+                tuple(reserved),
+            ).fetchone()
+        )
+
     def test_discard_profile_removes_fragment_artifact(self):
         profile = self.config.state_dir / "profiles/test.md"
         profile.parent.mkdir(parents=True, exist_ok=True)
@@ -896,6 +957,79 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         await self.reconciler._remove_unmapped_sessions()
         self.assertIn(run["execution_name"], self.fake.terminals)
         self.assertEqual(self.fake.deleted, [])
+
+    async def test_mapped_stale_cwd_run_is_deleted_and_retried_once(self):
+        run = self.reserve()
+        now = utc_now()
+        self.connection.execute(
+            "UPDATE terminal_runs SET state='creating',updated_at=? WHERE id=?",
+            (now, run["id"]),
+        )
+        self.connection.execute(
+            "UPDATE launch_attempts SET state='uncertain',updated_at=? WHERE terminal_run_id=?",
+            (now, run["id"]),
+        )
+        self.fake.terminals[run["execution_name"]] = [
+            {
+                "id": "stale-terminal",
+                "workspace_id": "stale-workspace",
+                "working_directory": str(self.root / "foreign"),
+            }
+        ]
+        await self.reconciler._adopt(int(run["id"]))
+        reset = self.connection.execute(
+            "SELECT state,error FROM terminal_runs WHERE id=?",
+            (run["id"],),
+        ).fetchone()
+        self.assertEqual(reset["state"], "reserved")
+        self.assertIn("stale backend workspace replaced", reset["error"])
+        self.assertEqual(self.fake.deleted, ["stale-terminal"])
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM blockers").fetchone()[0], 0)
+        with patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "xdg")}):
+            await self.reconciler._launch(int(run["id"]))
+        live = self.connection.execute(
+            "SELECT state,error FROM terminal_runs WHERE id=?",
+            (run["id"],),
+        ).fetchone()
+        self.assertEqual(tuple(live), ("live", None))
+
+    async def test_mapped_stale_cwd_replacement_is_bounded(self):
+        run = self.reserve()
+
+        def install_stale(attempt: int) -> None:
+            now = utc_now()
+            self.connection.execute(
+                "UPDATE terminal_runs SET state='creating',updated_at=? WHERE id=?",
+                (now, run["id"]),
+            )
+            self.connection.execute(
+                "UPDATE launch_attempts SET state='uncertain',updated_at=? WHERE terminal_run_id=?",
+                (now, run["id"]),
+            )
+            self.fake.terminals[run["execution_name"]] = [
+                {
+                    "id": f"stale-terminal-{attempt}",
+                    "workspace_id": f"stale-workspace-{attempt}",
+                    "working_directory": str(self.root / "foreign"),
+                }
+            ]
+
+        install_stale(0)
+        await self.reconciler._adopt(int(run["id"]))
+        install_stale(1)
+        with patch.object(
+            self.fake,
+            "create_run",
+            side_effect=ExecutionConflict("cwd_mismatch", "workspace has an unexpected cwd"),
+        ):
+            await self.reconciler._adopt(int(run["id"]))
+        saved = self.connection.execute(
+            "SELECT state FROM terminal_runs WHERE id=?",
+            (run["id"],),
+        ).fetchone()
+        self.assertEqual(saved["state"], "ending")
+        self.assertEqual(self.fake.deleted, ["stale-terminal-0"])
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM blockers").fetchone()[0], 1)
 
     async def test_duplicate_uncertain_runs_clean_only_expected_cwd(self):
         run = self.reserve()

@@ -20,6 +20,20 @@ function text(tag, value, className = "") {
   if (className) node.className = className;
   return node;
 }
+function relativeTime(value, now = Date.now()) {
+  const timestamp = new Date(value).getTime();
+  if (!Number.isFinite(timestamp)) return "";
+  const seconds = Math.round((timestamp - now) / 1000);
+  const absolute = Math.abs(seconds);
+  if (absolute < 45) return "now";
+  const amount = Math.abs(seconds);
+  let compact;
+  if (absolute < 3600) compact = `${Math.round(amount / 60)}m`;
+  else if (absolute < 86400) compact = `${Math.round(amount / 3600)}h`;
+  else if (absolute < 604800) compact = `${Math.round(amount / 86400)}d`;
+  else return new Date(timestamp).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  return seconds < 0 ? `${compact} ago` : `in ${compact}`;
+}
 function notify(message, isError = false) {
   const node = $("status");
   node.textContent = message;
@@ -156,8 +170,11 @@ function renderMessages(rows = state.snapshot?.messages || [], hasMore = rows.le
   list.replaceChildren();
   for (const row of [...rows].reverse()) {
     const message = text("article", "", "message"),
-      header = text("div", "", `message-header ${row.urgency === "urgent" ? "urgent" : ""}`);
-    header.append(text("strong", row.sender_slug), text("time", row.created_at));
+      header = text("div", "", `message-header ${row.urgency === "urgent" ? "urgent" : ""}`),
+      time = text("time", relativeTime(row.created_at));
+    time.dateTime = row.created_at;
+    time.title = row.created_at;
+    header.append(text("strong", row.sender_slug), time);
     message.append(header, text("p", row.body));
     list.append(message);
   }
@@ -501,13 +518,30 @@ document
   .forEach((button) => button.addEventListener("click", () => button.closest("dialog").close()));
 $("new-dm").addEventListener("click", () => {
   const form = $("dm-form"),
-    select = form.elements.actor;
+    select = form.elements.actor,
+    submit = form.querySelector('[type="submit"]'),
+    actors = [
+      ...new Map(
+        state.snapshot.roster
+          .filter((row) => row.kind === "agent")
+          .map((actor) => [actor.slug, actor]),
+      ).values(),
+    ].sort(
+      (a, b) =>
+        Number(b.terminal_state === "live") - Number(a.terminal_state === "live") ||
+        a.slug.localeCompare(b.slug),
+    );
   select.replaceChildren();
-  for (const actor of state.snapshot.roster.filter((row) => row.terminal_state === "live")) {
-    const option = text("option", actor.slug);
+  for (const actor of actors) {
+    const live = actor.terminal_state === "live",
+      option = text("option", live ? actor.slug : `${actor.slug} — unavailable`);
     option.value = actor.slug;
+    option.disabled = !live;
     select.append(option);
   }
+  const hasLiveActor = actors.some((actor) => actor.terminal_state === "live");
+  submit.disabled = !hasLiveActor;
+  select.title = hasLiveActor ? "" : "Persistent agents are still starting";
   $("dm-dialog").showModal();
 });
 $("dm-form").addEventListener("submit", async (event) => {

@@ -317,6 +317,12 @@ main > header {
   background: #fbe9e9;
   color: var(--danger);
 }
+.question-preview {
+  max-width: min(42rem, 100%);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .messages {
   min-height: 0;
   overflow: auto;
@@ -447,6 +453,28 @@ dialog {
 }
 #incident-dialog {
   width: min(52rem, calc(100% - 2rem));
+}
+#answer-dialog {
+  width: min(42rem, calc(100% - 2rem));
+}
+.answer-question {
+  margin: 1rem 0;
+}
+.answer-question h3 {
+  margin-bottom: 0.4rem;
+}
+.answer-question pre {
+  max-height: min(35vh, 18rem);
+  margin: 0;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 0.4rem;
+  padding: 0.65rem;
+  background: var(--surface);
+  font: inherit;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 .incident-list {
   display: grid;

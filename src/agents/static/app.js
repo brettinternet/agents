@@ -21,6 +21,10 @@ function text(tag, value, className = "") {
   if (className) node.className = className;
   return node;
 }
+function preview(value, limit = 120) {
+  const compact = (value ?? "").replace(/\s+/g, " ").trim();
+  return compact.length > limit ? `${compact.slice(0, limit - 1)}…` : compact;
+}
 function relativeTime(value, now = Date.now()) {
   const timestamp = new Date(value).getTime();
   if (!Number.isFinite(timestamp)) return "";
@@ -234,10 +238,14 @@ function renderQueues() {
     container.append(button);
   }
   for (const row of state.snapshot.blockers) {
-    const button = text("button", `${row.kind}: ${row.reason}`, "queue alert");
-    button.addEventListener("click", () =>
-      row.kind === "waiting_user_answer" ? openAnswer(row) : openBlocker(row),
-    );
+    const waitingForAnswer = row.kind === "waiting_user_answer",
+      button = text(
+        "button",
+        waitingForAnswer ? `${row.kind}: ${preview(row.reason)}` : `${row.kind}: ${row.reason}`,
+        `queue alert ${waitingForAnswer ? "question-preview" : ""}`,
+      );
+    if (waitingForAnswer) button.title = row.reason;
+    button.addEventListener("click", () => (waitingForAnswer ? openAnswer(row) : openBlocker(row)));
     container.append(button);
   }
 }
@@ -636,6 +644,7 @@ function openAnswer(row) {
   const form = $("answer-form");
   form.elements.terminal_run_id.value = row.terminal_run_id;
   $("answer-title").textContent = `Answer ${row.actor_slug}`;
+  $("answer-question").textContent = row.reason;
   $("answer-dialog").showModal();
 }
 $("new-intake").addEventListener("click", () => $("intake-dialog").showModal());

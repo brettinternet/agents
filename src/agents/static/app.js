@@ -183,11 +183,11 @@ function renderMessages(rows = state.snapshot?.messages || [], hasMore = rows.le
   $("older").disabled = !hasMore;
 }
 const groups = [
-  { name: "Seeds / invitations", states: ["intake", "refining"] },
-  { name: "Ready to roam", states: ["ready"] },
-  { name: "Out exploring", states: ["in_progress"] },
-  { name: "Campfire / needs a nudge", states: ["verifying", "awaiting_approval", "blocked"] },
-  { name: "Keepsakes / archive", states: ["accepted", "delivered", "cancelled"] },
+  { name: "Prepare", states: ["intake", "refining"] },
+  { name: "Ready", states: ["ready"] },
+  { name: "In progress", states: ["in_progress"] },
+  { name: "Follow-up", states: ["verifying", "awaiting_approval", "blocked"] },
+  { name: "Done", states: ["accepted", "delivered", "cancelled"] },
 ];
 function renderQueues() {
   const container = $("queues");

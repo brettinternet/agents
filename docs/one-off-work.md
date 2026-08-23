@@ -32,13 +32,13 @@ The board presents every durable work status exactly once in five human-friendly
 lanes. These labels describe the view only; the underlying durable status values
 and state machine remain unchanged.
 
-| Dashboard lane               | Durable statuses                            | Meaning                                                          |
-| ---------------------------- | ------------------------------------------- | ---------------------------------------------------------------- |
-| **Seeds / invitations**      | `intake`, `refining`                        | New work is being invited in or shaped by the elder.             |
-| **Ready to roam**            | `ready`                                     | Refined work is ready for an actor to pick up.                   |
-| **Out exploring**            | `in_progress`                               | An actor is actively working on the item.                        |
-| **Campfire / needs a nudge** | `verifying`, `awaiting_approval`, `blocked` | Work is being checked, waiting for approval, or needs attention. |
-| **Keepsakes / archive**      | `accepted`, `delivered`, `cancelled`        | Terminal outcomes are retained as repository history.            |
+| Dashboard lane  | Durable statuses                            | Meaning                                                          |
+| --------------- | ------------------------------------------- | ---------------------------------------------------------------- |
+| **Prepare**     | `intake`, `refining`                        | New work is being accepted and shaped.                           |
+| **Ready**       | `ready`                                     | Refined work is ready for an actor to pick up.                   |
+| **In progress** | `in_progress`                               | An actor is actively working on the item.                        |
+| **Follow-up**   | `verifying`, `awaiting_approval`, `blocked` | Work is being checked, waiting for approval, or needs attention. |
+| **Done**        | `accepted`, `delivered`, `cancelled`        | Terminal outcomes are retained as repository history.            |
 
 ## Direct message
 

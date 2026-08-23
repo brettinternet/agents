@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import fcntl
 import getpass
 import json
 import os
@@ -10,6 +11,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from collections.abc import Generator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
@@ -21,6 +23,7 @@ CONFIG_NAME = ".sops.yaml"
 STORE_NAME = "agent-secrets.sops.json"
 KEY_NAME = ".env.sops-age"
 HOME_NAME = ".sops-isolated-home"
+LOCK_NAME = "agents-secret-store.lock"
 
 
 class SecretStoreError(Exception):
@@ -35,6 +38,7 @@ class Paths:
     store: Path
     key: Path
     isolated_home: Path
+    lock: Path
 
 
 def _run(
@@ -81,6 +85,7 @@ def resolve_paths(cwd: Path | None = None) -> Paths:
         store=worktree / STORE_NAME,
         key=common_root / KEY_NAME,
         isolated_home=common_root / HOME_NAME,
+        lock=common_dir / LOCK_NAME,
     )
 
 
@@ -121,6 +126,40 @@ def _ensure_home(path: Path, *, create: bool) -> None:
         raise SecretStoreError(f"unsafe permissions on isolated SOPS home; require mode 0700: {path}")
 
 
+@contextlib.contextmanager
+def _exclusive_lock(path: Path) -> Generator[None]:
+    kind = _kind(path)
+    if kind not in {"missing", "file"}:
+        raise SecretStoreError(f"secret-store lock path is unsafe ({kind}): {path}")
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW
+    old = os.umask(0o077)
+    try:
+        try:
+            descriptor = os.open(path, flags, 0o600)
+        except OSError:
+            raise SecretStoreError(f"unable to open secret-store lock safely: {path}") from None
+    finally:
+        os.umask(old)
+    try:
+        status = os.fstat(descriptor)
+        try:
+            path_status = path.lstat()
+        except OSError:
+            raise SecretStoreError(f"secret-store lock path changed while opening: {path}") from None
+        if (
+            not stat.S_ISREG(status.st_mode)
+            or status.st_nlink != 1
+            or status.st_uid != os.getuid()
+            or status.st_mode & 0o077
+            or (status.st_dev, status.st_ino) != (path_status.st_dev, path_status.st_ino)
+        ):
+            raise SecretStoreError(f"secret-store lock path is unsafe: {path}")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
+
+
 def _sops_env(paths: Paths) -> dict[str, str]:
     env = {name: value for name, value in os.environ.items() if not name.startswith("SOPS_")}
     env.update(
@@ -135,7 +174,9 @@ def _sops_env(paths: Paths) -> dict[str, str]:
 
 
 def _command_env(values: dict[str, str]) -> dict[str, str]:
-    env = {name: value for name, value in os.environ.items() if not name.startswith("SOPS_")}
+    env = {
+        name: value for name, value in os.environ.items() if not name.startswith("SOPS_") and name != "__VARLOCK_ENV"
+    }
     env.update(values)
     return env
 
@@ -316,51 +357,54 @@ def _existing_state(paths: Paths) -> tuple[str, str, str]:
 
 
 def init_store(paths: Paths) -> None:
-    _ensure_home(paths.isolated_home, create=True)
-    key_kind, config_kind, store_kind = _existing_state(paths)
-    if any(kind not in {"missing", "file"} for kind in (key_kind, config_kind, store_kind)):
-        raise SecretStoreError("secret-store paths must be regular files, not symlinks or special files")
-    tracked = (config_kind == "file", store_kind == "file")
-    if tracked[0] != tracked[1]:
-        raise SecretStoreError("inconsistent secret store: .sops.yaml and agent-secrets.sops.json must exist together")
-    if tracked[0] and key_kind == "missing":
-        raise SecretStoreError("missing .env.sops-age; restore the identity matching the committed ciphertext")
-    if key_kind == "missing":
-        _create_identity(paths)
-    recipient = _derive_recipient(paths)
-    if tracked[0]:
+    with _exclusive_lock(paths.lock):
+        _ensure_home(paths.isolated_home, create=True)
+        key_kind, config_kind, store_kind = _existing_state(paths)
+        if any(kind not in {"missing", "file"} for kind in (key_kind, config_kind, store_kind)):
+            raise SecretStoreError("secret-store paths must be regular files, not symlinks or special files")
+        tracked = (config_kind == "file", store_kind == "file")
+        if tracked[0] != tracked[1]:
+            raise SecretStoreError(
+                "inconsistent secret store: .sops.yaml and agent-secrets.sops.json must exist together"
+            )
+        if tracked[0] and key_kind == "missing":
+            raise SecretStoreError("missing .env.sops-age; restore the identity matching the committed ciphertext")
+        if key_kind == "missing":
+            _create_identity(paths)
+        recipient = _derive_recipient(paths)
+        if tracked[0]:
+            _validate_ciphertext(paths, recipient)
+            _decrypt(paths)
+            return
+        config = _config_text(recipient).encode("utf-8")
+        plaintext = _json_bytes({FORMAT_KEY: FORMAT_VERSION})
+        encrypted = _run(
+            [
+                "sops",
+                "encrypt",
+                "--age",
+                recipient,
+                "--input-type",
+                "json",
+                "--output-type",
+                "json",
+                "/dev/stdin",
+            ],
+            cwd=paths.worktree,
+            env=_sops_env(paths),
+            input_bytes=plaintext,
+            failure="unable to initialize the encrypted secret store",
+        )
+        encrypted = _json_bytes(_parse_json(encrypted, "new encrypted secret store"))
+        _atomic_write(paths.config, config)
+        try:
+            _atomic_write(paths.store, encrypted)
+        except Exception:
+            with contextlib.suppress(OSError):
+                paths.config.unlink()
+            raise
         _validate_ciphertext(paths, recipient)
         _decrypt(paths)
-        return
-    config = _config_text(recipient).encode("utf-8")
-    plaintext = _json_bytes({FORMAT_KEY: FORMAT_VERSION})
-    encrypted = _run(
-        [
-            "sops",
-            "encrypt",
-            "--age",
-            recipient,
-            "--input-type",
-            "json",
-            "--output-type",
-            "json",
-            "/dev/stdin",
-        ],
-        cwd=paths.worktree,
-        env=_sops_env(paths),
-        input_bytes=plaintext,
-        failure="unable to initialize the encrypted secret store",
-    )
-    encrypted = _json_bytes(_parse_json(encrypted, "new encrypted secret store"))
-    _atomic_write(paths.config, config)
-    try:
-        _atomic_write(paths.store, encrypted)
-    except Exception:
-        with contextlib.suppress(OSError):
-            paths.config.unlink()
-        raise
-    _validate_ciphertext(paths, recipient)
-    _decrypt(paths)
 
 
 def _ready_paths() -> Paths:
@@ -397,30 +441,38 @@ def _read_value() -> str:
 
 def set_secret(paths: Paths, name: str) -> None:
     _validate_name(name)
-    _decrypt(paths)
-    _validate_schema(paths, {name: "managed-secret-validation-value"})
-    value = _read_value()
-    encoded = json.dumps(value).encode("utf-8")
-    _run(
-        ["sops", "set", "--value-stdin", str(paths.store), json.dumps([name])],
-        cwd=paths.worktree,
-        env=_sops_env(paths),
-        input_bytes=encoded,
-        failure="unable to update the encrypted secret store",
-    )
+    with _exclusive_lock(paths.lock):
+        values = _decrypt(paths)
+        value = _read_value()
+        proposed = {**values, name: value}
+        _validate_schema(paths, proposed)
+        encoded = json.dumps(value).encode("utf-8")
+        _run(
+            ["sops", "set", "--value-stdin", str(paths.store), json.dumps([name])],
+            cwd=paths.worktree,
+            env=_sops_env(paths),
+            input_bytes=encoded,
+            failure="unable to update the encrypted secret store",
+        )
+        _validate_schema(paths, _decrypt(paths))
 
 
 def unset_secret(paths: Paths, name: str) -> None:
     _validate_name(name)
-    values = _decrypt(paths)
-    if name not in values:
-        raise SecretStoreError(f"managed key does not exist: {name}")
-    _run(
-        ["sops", "unset", str(paths.store), json.dumps([name])],
-        cwd=paths.worktree,
-        env=_sops_env(paths),
-        failure="unable to update the encrypted secret store",
-    )
+    with _exclusive_lock(paths.lock):
+        values = _decrypt(paths)
+        if name not in values:
+            raise SecretStoreError(f"managed key does not exist: {name}")
+        remaining = dict(values)
+        del remaining[name]
+        _validate_schema(paths, remaining)
+        _run(
+            ["sops", "unset", str(paths.store), json.dumps([name])],
+            cwd=paths.worktree,
+            env=_sops_env(paths),
+            failure="unable to update the encrypted secret store",
+        )
+        _validate_schema(paths, _decrypt(paths))
 
 
 def reveal_secret(paths: Paths, name: str) -> None:
@@ -439,15 +491,38 @@ def list_secrets(paths: Paths) -> None:
         print(name)
 
 
-def run_command(paths: Paths, command: list[str]) -> NoReturn:
+def _parse_run_args(arguments: list[str]) -> tuple[list[str], list[str]]:
+    try:
+        separator = arguments.index("--")
+    except ValueError:
+        raise SecretStoreError("run requires managed secret names followed by -- and a command") from None
+    names = arguments[:separator]
+    command = arguments[separator + 1 :]
+    if not names:
+        raise SecretStoreError("run requires at least one managed secret name before --")
     if not command:
         raise SecretStoreError("run requires a command after --")
+    for name in names:
+        _validate_name(name)
+    if len(set(names)) != len(names):
+        raise SecretStoreError("run does not allow duplicate managed secret names")
+    return names, command
+
+
+def run_command(paths: Paths, names: list[str], command: list[str]) -> NoReturn:
     values = _decrypt(paths)
+    unknown = [name for name in names if name not in values]
+    if unknown:
+        raise SecretStoreError(f"unknown managed secret name: {unknown[0]}")
     _validate_schema(paths, values)
     argv = [
         "varlock",
         "run",
         "--redact-stdout",
+        "--inject",
+        "vars",
+        "--filter",
+        ",".join(names),
         "-p",
         ".env.schema",
         "-p",
@@ -472,7 +547,7 @@ def _parser() -> argparse.ArgumentParser:
         command = subparsers.add_parser(action)
         command.add_argument("name")
     run = subparsers.add_parser("run")
-    run.add_argument("command", nargs=argparse.REMAINDER)
+    run.add_argument("arguments", nargs=argparse.REMAINDER)
     return parser
 
 
@@ -494,8 +569,8 @@ def main(argv: list[str] | None = None) -> int:
             elif args.action == "reveal":
                 reveal_secret(paths, args.name)
             elif args.action == "run":
-                command = args.command[1:] if args.command[:1] == ["--"] else args.command
-                run_command(paths, command)
+                names, command = _parse_run_args(args.arguments)
+                run_command(paths, names, command)
     except SecretStoreError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

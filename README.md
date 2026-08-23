@@ -80,16 +80,17 @@ Piped input is exact, including any trailing newline. Other operations:
 ```sh
 task secrets:list
 task secrets:check
-task secrets:run -- command arg
+task secrets:run -- SERVICE_TOKEN OTHER_TOKEN -- command arg
 task secrets:reveal -- SERVICE_TOKEN
 task secrets:unset -- SERVICE_TOKEN
 ```
 
-Prefer `secrets:run`, which injects validated values and uses Varlock to redact
-command output. Reserve `secrets:reveal` for login surfaces that cannot consume
-environment variables. Necessary discovery or reveal output is transient
-private control-plane data: do not echo it deliberately or retain it in tracked
-files, command arguments, messages, durable logs, or durable memory. Persistent
+Prefer `secrets:run`, which injects only the explicitly selected managed values
+and uses Varlock to redact command output. Reserve `secrets:reveal` for login
+surfaces that cannot consume environment variables. Necessary discovery or
+reveal output is transient private control-plane data: do not echo it
+deliberately or retain it in tracked files, command arguments, messages,
+durable logs, or durable memory. Persistent
 MCP-only sessions request a work item rather than bypassing the command
 boundary. Commit only `.sops.yaml` and ciphertext—never the identity, isolated
 home, or plaintext.

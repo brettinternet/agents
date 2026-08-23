@@ -76,7 +76,7 @@ tasks:
     cmd: "{{.SECRETS_CLI}} reveal {{.CLI_ARGS}}"
   secrets:run:
     desc: Run a command with agent-managed secrets through Varlock
-    cmd: "{{.SECRETS_CLI}} run -- {{.CLI_ARGS}}"
+    cmd: "{{.SECRETS_CLI}} run {{.CLI_ARGS}}"
   migrate:
     desc: Apply Agents SQLite migrations
     cmd: "{{.ENV_RUN}} {{.PYTHON}} -m agents.cli migrate"

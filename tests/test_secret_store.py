@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
 import os
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -24,10 +27,23 @@ class SecretStoreTests(unittest.TestCase):
             "# ---\n"
             "# @sensitive\n"
             "DEMO_TOKEN=\n"
+            "# @sensitive\n"
+            "OTHER_TOKEN=\n"
             "# Public test value.\n"
             "NOT_SENSITIVE=\n"
         )
         (root / ".env.local").touch()
+
+    def make_paths(self, root: Path) -> secret_store.Paths:
+        return secret_store.Paths(
+            worktree=root,
+            common_root=root,
+            config=root / ".sops.yaml",
+            store=root / "agent-secrets.sops.json",
+            key=root / ".env.sops-age",
+            isolated_home=root / ".sops-isolated-home",
+            lock=root / "secret-store.lock",
+        )
 
     def cli(
         self,
@@ -67,6 +83,76 @@ class SecretStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(secret_store.SecretStoreError, "symlink"):
                 secret_store._require_file(symlink, "SOPS config")
 
+            unsafe_lock = root / "unsafe.lock"
+            unsafe_lock.touch(mode=0o644)
+            unsafe_lock.chmod(0o644)
+            with (
+                self.assertRaisesRegex(secret_store.SecretStoreError, "unsafe"),
+                secret_store._exclusive_lock(unsafe_lock),
+            ):
+                self.fail("unsafe lock was acquired")
+
+            lock_target = root / "lock-target"
+            lock_target.touch(mode=0o600)
+            symlink_lock = root / "symlink.lock"
+            symlink_lock.symlink_to(lock_target)
+            with (
+                self.assertRaisesRegex(secret_store.SecretStoreError, "unsafe"),
+                secret_store._exclusive_lock(symlink_lock),
+            ):
+                self.fail("symlink lock was acquired")
+
+            safe_lock = root / "safe.lock"
+            acquired = threading.Event()
+
+            def acquire_same_lock() -> None:
+                with secret_store._exclusive_lock(safe_lock):
+                    acquired.set()
+
+            with secret_store._exclusive_lock(safe_lock):
+                waiter = threading.Thread(target=acquire_same_lock)
+                waiter.start()
+                self.assertFalse(acquired.wait(0.1))
+                self.assertEqual(safe_lock.read_bytes(), b"")
+            waiter.join(timeout=1)
+            self.assertTrue(acquired.is_set())
+            self.assertFalse(waiter.is_alive())
+
+    def test_linked_worktrees_resolve_the_same_common_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repository"
+            linked = Path(directory) / "linked"
+            self.make_repository(root)
+            (root / "tracked").touch()
+            subprocess.run(["git", "add", "tracked"], cwd=root, check=True, capture_output=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Synthetic Test",
+                    "-c",
+                    "user.email=test.invalid@example.invalid",
+                    "commit",
+                    "-qm",
+                    "fixture",
+                ],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "worktree", "add", "--detach", str(linked)],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+
+            root_paths = secret_store.resolve_paths(root)
+            linked_paths = secret_store.resolve_paths(linked)
+
+            self.assertEqual(root_paths.lock, linked_paths.lock)
+            self.assertEqual(root_paths.lock, (root / ".git").resolve() / secret_store.LOCK_NAME)
+
     def test_missing_identity_with_tracked_artifacts_does_not_rotate(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -102,6 +188,20 @@ class SecretStoreTests(unittest.TestCase):
             self.assertNotEqual(nonsensitive.returncode, 0)
             self.assertIn(b"not declared sensitive", nonsensitive.stderr)
             self.assertNotIn(b"not-exposed", nonsensitive.stderr)
+
+    def test_constrained_sensitive_schema_rejects_real_value_without_persisting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_repository(root)
+            with (root / ".env.schema").open("a") as schema:
+                schema.write("# @sensitive @type=port\nPORT_TOKEN=\n")
+            self.assertEqual(self.cli(root, "init").returncode, 0)
+
+            rejected = self.cli(root, "set", "PORT_TOKEN", input_bytes=b"not-a-port")
+
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertNotIn(b"not-a-port", rejected.stderr)
+            self.assertNotIn(b"PORT_TOKEN", self.cli(root, "list").stdout)
 
     def test_set_update_list_reveal_run_and_unset(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -139,13 +239,15 @@ class SecretStoreTests(unittest.TestCase):
             program = (
                 "import os; "
                 "ok = (os.environ.get('DEMO_TOKEN') == 'charlie-delta' "
+                "and 'OTHER_TOKEN' not in os.environ "
+                "and '__VARLOCK_ENV' not in os.environ "
                 "and 'SOPS_AGE_KEY_FILE' not in os.environ "
                 "and 'SOPS_KMS_ARN' not in os.environ "
                 f"and os.environ.get('HOME') == {str(normal_home)!r} "
                 f"and os.environ.get('XDG_CONFIG_HOME') == {str(normal_xdg)!r}); "
                 "print('ok' if ok else 'bad')"
             )
-            ran = self.cli(root, "run", "--", sys.executable, "-c", program, env=env)
+            ran = self.cli(root, "run", "DEMO_TOKEN", "--", sys.executable, "-c", program, env=env)
             self.assertEqual(ran.returncode, 0, ran.stderr.decode())
             self.assertEqual(ran.stdout, b"ok\n")
 
@@ -158,17 +260,237 @@ class SecretStoreTests(unittest.TestCase):
             self.assertNotIn(b"alpha-bravo", missing.stderr)
             self.assertNotIn(b"charlie-delta", missing.stderr)
 
+    def test_run_selection_filtering_argv_validation_and_redaction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_repository(root)
+            self.assertEqual(self.cli(root, "init").returncode, 0)
+            self.assertEqual(
+                self.cli(root, "set", "DEMO_TOKEN", input_bytes=b"selected-value").returncode,
+                0,
+            )
+            self.assertEqual(
+                self.cli(root, "set", "OTHER_TOKEN", input_bytes=b"unselected-value").returncode,
+                0,
+            )
+
+            environment_check = (
+                "import os,sys; "
+                "sys.exit(0 if (os.environ.get('DEMO_TOKEN') == 'selected-value' "
+                "and 'OTHER_TOKEN' not in os.environ "
+                "and '__VARLOCK_ENV' not in os.environ) else 3)"
+            )
+            selected = self.cli(
+                root,
+                "run",
+                "DEMO_TOKEN",
+                "--",
+                sys.executable,
+                "-c",
+                environment_check,
+                env={**os.environ, "__VARLOCK_ENV": "synthetic-aggregate"},
+            )
+            self.assertEqual(selected.returncode, 0, selected.stderr.decode())
+
+            expected_argv = ["semi;colon", 'embedded"quote', "--tail"]
+            argv_result = self.cli(
+                root,
+                "run",
+                "DEMO_TOKEN",
+                "--",
+                sys.executable,
+                "-c",
+                "import json,sys; print(json.dumps(sys.argv[1:]))",
+                *expected_argv,
+            )
+            self.assertEqual(argv_result.returncode, 0, argv_result.stderr.decode())
+            self.assertEqual(json.loads(argv_result.stdout), expected_argv)
+
+            redacted = self.cli(
+                root,
+                "run",
+                "DEMO_TOKEN",
+                "--",
+                sys.executable,
+                "-c",
+                "import os,sys; print(os.environ['DEMO_TOKEN']); print(os.environ['DEMO_TOKEN'], file=sys.stderr)",
+            )
+            self.assertEqual(redacted.returncode, 0)
+            self.assertNotIn(b"selected-value", redacted.stdout)
+            self.assertNotIn(b"selected-value", redacted.stderr)
+
+            rejected = (
+                self.cli(root, "run", "--", sys.executable, "-c", "pass"),
+                self.cli(root, "run", "DEMO_TOKEN"),
+                self.cli(root, "run", "UNKNOWN_TOKEN", "--", sys.executable, "-c", "pass"),
+                self.cli(
+                    root,
+                    "run",
+                    "DEMO_TOKEN",
+                    "DEMO_TOKEN",
+                    "--",
+                    sys.executable,
+                    "-c",
+                    "pass",
+                ),
+            )
+            for result in rejected:
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn(b"selected-value", result.stderr)
+                self.assertNotIn(b"unselected-value", result.stderr)
+
+    def test_set_rejects_invalid_complete_proposed_store_before_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = self.make_paths(Path(directory))
+            validated: list[dict[str, str]] = []
+
+            def reject_invalid(_paths: secret_store.Paths, values: dict[str, str]) -> None:
+                validated.append(dict(values))
+                if values.get("OTHER_TOKEN") == "invalid":
+                    raise secret_store.SecretStoreError("schema rejected proposed store")
+
+            with (
+                patch.object(secret_store, "_decrypt", return_value={"OTHER_TOKEN": "invalid"}),
+                patch.object(secret_store, "_validate_schema", side_effect=reject_invalid),
+                patch.object(secret_store, "_read_value", return_value="new-value"),
+                patch.object(secret_store, "_run") as mutation,
+                self.assertRaisesRegex(secret_store.SecretStoreError, "proposed store"),
+            ):
+                secret_store.set_secret(paths, "DEMO_TOKEN")
+
+            self.assertEqual(validated, [{"OTHER_TOKEN": "invalid", "DEMO_TOKEN": "new-value"}])
+            mutation.assert_not_called()
+
+    def test_set_validates_complete_persisted_store_after_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = self.make_paths(Path(directory))
+            validated: list[dict[str, str]] = []
+            persisted = {"DEMO_TOKEN": "new-value", "OTHER_TOKEN": "persisted-value"}
+
+            with (
+                patch.object(secret_store, "_decrypt", side_effect=[{"OTHER_TOKEN": "old-value"}, persisted]),
+                patch.object(
+                    secret_store,
+                    "_validate_schema",
+                    side_effect=lambda _paths, values: validated.append(dict(values)),
+                ),
+                patch.object(secret_store, "_read_value", return_value="new-value"),
+                patch.object(secret_store, "_run"),
+            ):
+                secret_store.set_secret(paths, "DEMO_TOKEN")
+
+            self.assertEqual(
+                validated,
+                [
+                    {"OTHER_TOKEN": "old-value", "DEMO_TOKEN": "new-value"},
+                    persisted,
+                ],
+            )
+
+    def test_unset_validates_remaining_proposed_and_persisted_stores(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = self.make_paths(Path(directory))
+            existing = {"DEMO_TOKEN": "remove", "OTHER_TOKEN": "keep"}
+            persisted = {"OTHER_TOKEN": "persisted"}
+            validated: list[dict[str, str]] = []
+
+            with (
+                patch.object(secret_store, "_decrypt", side_effect=[existing, persisted]),
+                patch.object(
+                    secret_store,
+                    "_validate_schema",
+                    side_effect=lambda _paths, values: validated.append(dict(values)),
+                ),
+                patch.object(secret_store, "_run"),
+            ):
+                secret_store.unset_secret(paths, "DEMO_TOKEN")
+
+            self.assertEqual(validated, [{"OTHER_TOKEN": "keep"}, persisted])
+
+            with (
+                patch.object(secret_store, "_decrypt", return_value=existing),
+                patch.object(
+                    secret_store,
+                    "_validate_schema",
+                    side_effect=secret_store.SecretStoreError("invalid remaining store"),
+                ),
+                patch.object(secret_store, "_run") as mutation,
+                self.assertRaisesRegex(secret_store.SecretStoreError, "remaining store"),
+            ):
+                secret_store.unset_secret(paths, "DEMO_TOKEN")
+            mutation.assert_not_called()
+
+    def test_concurrent_writers_preserve_both_updates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = self.make_paths(Path(directory))
+            state: dict[str, str] = {}
+            state_guard = threading.Lock()
+            start = threading.Barrier(3)
+            errors: list[Exception] = []
+            values = {"writer-one": "first-value", "writer-two": "second-value"}
+
+            def decrypt(_paths: secret_store.Paths) -> dict[str, str]:
+                with state_guard:
+                    return dict(state)
+
+            def mutate(
+                argv: list[str],
+                *,
+                cwd: Path,
+                env: dict[str, str] | None = None,
+                input_bytes: bytes | None = None,
+                failure: str,
+            ) -> bytes:
+                del cwd, env, failure
+                name = json.loads(argv[-1])[0]
+                value = json.loads((input_bytes or b"").decode())
+                with state_guard:
+                    proposed = dict(state)
+                time.sleep(0.05)
+                proposed[name] = value
+                with state_guard:
+                    state.clear()
+                    state.update(proposed)
+                return b""
+
+            def write_secret(name: str) -> None:
+                try:
+                    start.wait()
+                    secret_store.set_secret(paths, name)
+                except Exception as exc:
+                    errors.append(exc)
+
+            with (
+                patch.object(secret_store, "_decrypt", side_effect=decrypt),
+                patch.object(secret_store, "_validate_schema"),
+                patch.object(
+                    secret_store,
+                    "_read_value",
+                    side_effect=lambda: values[threading.current_thread().name],
+                ),
+                patch.object(secret_store, "_run", side_effect=mutate),
+            ):
+                writers = [
+                    threading.Thread(target=write_secret, args=("DEMO_TOKEN",), name="writer-one"),
+                    threading.Thread(target=write_secret, args=("OTHER_TOKEN",), name="writer-two"),
+                ]
+                for writer in writers:
+                    writer.start()
+                start.wait()
+                for writer in writers:
+                    writer.join(timeout=2)
+
+            self.assertEqual(errors, [])
+            self.assertTrue(all(not writer.is_alive() for writer in writers))
+            self.assertEqual(
+                state,
+                {"DEMO_TOKEN": "first-value", "OTHER_TOKEN": "second-value"},
+            )
+
     def test_set_value_uses_stdin_and_never_argv(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            paths = secret_store.Paths(
-                worktree=root,
-                common_root=root,
-                config=root / ".sops.yaml",
-                store=root / "agent-secrets.sops.json",
-                key=root / ".env.sops-age",
-                isolated_home=root / ".sops-isolated-home",
-            )
+            paths = self.make_paths(root)
             calls: list[tuple[list[str], bytes | None, str]] = []
 
             def capture_run(
@@ -200,14 +522,7 @@ class SecretStoreTests(unittest.TestCase):
     def test_sops_environment_isolated_from_caller(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            paths = secret_store.Paths(
-                worktree=root,
-                common_root=root,
-                config=root / ".sops.yaml",
-                store=root / "agent-secrets.sops.json",
-                key=root / ".env.sops-age",
-                isolated_home=root / ".sops-isolated-home",
-            )
+            paths = self.make_paths(root)
             with patch.dict(
                 os.environ,
                 {

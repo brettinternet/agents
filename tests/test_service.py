@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import signal
 import subprocess
 import tempfile
 import unittest
@@ -136,6 +137,21 @@ class ServiceTests(unittest.TestCase):
             ):
                 stop(config)
             self.assertTrue(record.exists())
+
+    def test_stop_signals_verified_owned_process_before_removing_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = _config(Path(temporary))
+            config.state_dir.mkdir(mode=0o700)
+            record = config.state_dir / "agentsd.pid"
+            record.write_text('{"pid": 123, "executable": "/owned", "started": "now"}')
+            with (
+                patch("agents.service._owned", return_value=(123, {})),
+                patch("agents.service.os.killpg") as kill_group,
+                patch("agents.service.os.kill", side_effect=ProcessLookupError),
+            ):
+                stop(config)
+            kill_group.assert_called_once_with(123, signal.SIGTERM)
+            self.assertFalse(record.exists())
 
     def test_stop_preserves_herdr(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

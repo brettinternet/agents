@@ -63,6 +63,28 @@ class McpBoundaryTests(unittest.TestCase):
             self.assertEqual(headers["X-Agents-Execution-ID"], "execution")
             self.assertNotIn("secret", str(request.call_args.kwargs["json"]))
 
+    def test_managed_secret_tools_send_only_nonsecret_metadata(self):
+        response = httpx.Response(
+            200,
+            json={"ok": True, "data": {"id": "request", "name": "SERVICE_TOKEN", "state": "pending"}},
+            request=httpx.Request("POST", "http://127.0.0.1:9890/agent/v1/secrets/requests"),
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "AGENTS_API_URL": "http://127.0.0.1:9890",
+                    "AGENTS_AGENT_TOKEN": "agent-token",
+                    "AGENTS_EXECUTION_ID": "execution",
+                },
+                clear=True,
+            ),
+            patch("httpx.request", return_value=response) as request,
+        ):
+            mcp_server.request_managed_secret_set("SERVICE_TOKEN")
+            self.assertEqual(request.call_args.args[:2], ("POST", "http://127.0.0.1:9890/agent/v1/secrets/requests"))
+            self.assertEqual(request.call_args.kwargs["json"], {"name": "SERVICE_TOKEN"})
+
     def test_query_parameters_are_encoded_and_cursor_is_forwarded(self):
         response = httpx.Response(
             200,

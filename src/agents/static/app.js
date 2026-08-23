@@ -138,6 +138,21 @@ async function api(
   }
   return value.data;
 }
+async function submitSecretValue(requestId, body) {
+  const response = await fetch(`/api/v1/secret-requests/${encodeURIComponent(requestId)}/value`, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/octet-stream",
+      "X-CSRF-Token": csrf(),
+      Origin: location.origin,
+    },
+    body,
+  });
+  const value = await response.json();
+  if (!response.ok || !value.ok) throw new Error(value.error?.message || `HTTP ${response.status}`);
+  return value.data;
+}
 function renderRoster() {
   const list = $("roster");
   list.replaceChildren();
@@ -219,6 +234,7 @@ function renderQueues() {
     ["Decisions", state.snapshot.decisions.length, true],
     ["Blockers", state.snapshot.blockers.length, true],
     ["Approvals", state.snapshot.approvals.length, true],
+    ["Secrets", state.snapshot.secret_requests.length, true],
   ];
   for (const [label, count, alert] of summary)
     container.append(text("span", `${label}: ${count}`, `queue ${alert && count ? "alert" : ""}`));
@@ -249,6 +265,12 @@ function renderQueues() {
       button = text("button", `${row.kind}: ${preview(row.reason)}`, "queue alert queue-preview");
     button.title = label;
     button.addEventListener("click", () => (waitingForAnswer ? openAnswer(row) : openBlocker(row)));
+    container.append(button);
+  }
+  for (const row of state.snapshot.secret_requests) {
+    const button = text("button", `Secret: ${row.name}`, "queue alert queue-preview");
+    button.title = `${row.actor_slug} requested ${row.name}`;
+    button.addEventListener("click", () => openSecretRequest(row));
     container.append(button);
   }
 }
@@ -643,6 +665,16 @@ function openBlocker(row) {
   $("blocker-reason").textContent = row.reason;
   $("blocker-dialog").showModal();
 }
+function openSecretRequest(row) {
+  const form = $("secret-form");
+  form.reset();
+  form.elements.request_id.value = row.id;
+  $("secret-title").textContent = `Set ${row.name}`;
+  $("secret-request").textContent =
+    `${row.actor_slug} requested this value for its active work assignment.`;
+  $("secret-dialog").showModal();
+}
+
 function openAnswer(row) {
   const form = $("answer-form");
   form.elements.terminal_run_id.value = row.terminal_run_id;
@@ -809,6 +841,23 @@ $("thread-dialog").addEventListener("close", () => {
   thread.classList.add("thread-preview");
   $("thread-home").append(thread);
 });
+$("secret-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget,
+    requestId = form.elements.request_id.value,
+    body = new Blob([form.elements.value.value], { type: "application/octet-stream" });
+  form.elements.value.value = "";
+  try {
+    await submitSecretValue(requestId, body);
+    form.reset();
+    $("secret-dialog").close();
+    notify("Managed secret set");
+    await hydrate();
+  } catch (error) {
+    notify(error.message, true);
+  }
+});
+
 $("answer-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget,

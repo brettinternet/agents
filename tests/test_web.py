@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from agents import secret_store
 from agents.auth import AgentContext
 from agents.config import AgentsConfig, ExecutionConfig, ModelChoice, ProjectConfig, RuntimeConfig, WebConfig
 from agents.db import connect, migrate, utc_now
@@ -103,6 +104,42 @@ class WebAuthTests(unittest.TestCase):
         ).lastrowid
         assert run_id is not None
         return int(run_id)
+
+    def _active_work_terminal(self) -> tuple[str, int]:
+        created = Store(self.connection).create_work(
+            actor="human",
+            parent_id=None,
+            kind="task",
+            title="Secret request",
+            problem="Set an assignment-authorized managed secret",
+            outcome="Ciphertext is updated without durable plaintext",
+        )
+        item_id = str(created["id"])
+        now = utc_now()
+        worktree = str(self.config.project.path)
+        self.connection.execute(
+            "UPDATE work_items SET status='in_progress',specialty='research',updated_at=? WHERE id=?",
+            (now, item_id),
+        )
+        execution_id = self.connection.execute(
+            "INSERT INTO executions(work_id,number,base_sha,branch,worktree_path,state,created_at,updated_at) "
+            "VALUES(?,1,'base','agents/secret-request',?,'active',?,?)",
+            (item_id, worktree, now, now),
+        ).lastrowid
+        assert execution_id is not None
+        self.connection.execute("UPDATE work_items SET active_execution_id=? WHERE id=?", (execution_id, item_id))
+        terminal_id = self._terminal_run("work", item_id, "researcher-secret-work")
+        self.connection.execute(
+            "UPDATE terminal_runs SET working_directory=? WHERE id=?",
+            (worktree, terminal_id),
+        )
+        self.connection.execute(
+            "INSERT INTO assignments(work_id,execution_id,actor_slug,terminal_run_id,state,created_at,updated_at) "
+            "VALUES(?,?, 'researcher',?,'open',?,?)",
+            (item_id, execution_id, terminal_id, now, now),
+        )
+        self.connection.commit()
+        return item_id, terminal_id
 
     def test_public_surface_and_login_origin(self):
         self.assertEqual(self.client.get("/", follow_redirects=False).status_code, 303)
@@ -319,6 +356,8 @@ class WebAuthTests(unittest.TestCase):
         self.assertIn('id="intake-dialog"', page.text)
         self.assertIn('id="incident-dialog"', page.text)
         self.assertIn('id="detail-dialog"', page.text)
+        self.assertIn('id="secret-dialog"', page.text)
+        self.assertIn('type="password"', page.text)
         self.assertIn('id="thread-dialog"', page.text)
         self.assertIn('id="open-thread"', page.text)
         self.assertIn("Internet exploration", page.text)
@@ -350,6 +389,166 @@ class WebAuthTests(unittest.TestCase):
                 "blockers",
             },
         )
+
+    def test_managed_secret_request_uses_ephemeral_private_body(self):
+        item_id, terminal_id = self._active_work_terminal()
+        context = AgentContext(terminal_id, "researcher", "work", item_id, False)
+        agent_headers = {"Authorization": "Bearer test-token", "X-Agents-Execution-ID": "work-execution"}
+        with patch("agents.web.authenticate_agent", return_value=context):
+            requested = self.client.post(
+                "/agent/v1/secrets/requests",
+                headers=agent_headers,
+                json={"name": "SERVICE_TOKEN"},
+            )
+        self.assertEqual(requested.status_code, 200)
+        secret_request = requested.json()["data"]
+        self.assertEqual((secret_request["name"], secret_request["state"]), ("SERVICE_TOKEN", "pending"))
+        self.assertNotIn(secret_request["id"], "\n".join(self.connection.iterdump()))
+
+        self.client.post("/auth/login", data={"token": "w" * 64}, headers={"Origin": "http://testserver"})
+        csrf = self.client.cookies.get("agents_csrf")
+        private_value = b"private-test-value\n"
+        completed = subprocess.CompletedProcess([], 0)
+        with patch("agents.web.subprocess.run", return_value=completed) as run:
+            response = self.client.post(
+                f"/api/v1/secret-requests/{secret_request['id']}/value",
+                headers={
+                    "Origin": "http://testserver",
+                    "X-CSRF-Token": csrf,
+                    "Content-Type": "application/octet-stream",
+                },
+                content=private_value,
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["data"]["state"], "set")
+        argv = run.call_args.args[0]
+        self.assertEqual((Path(argv[0]).name, argv[1]), ("task", "--taskfile"))
+        self.assertIn("secrets:set", argv)
+        self.assertEqual(argv[-2:], ["--", "SERVICE_TOKEN"])
+        self.assertNotIn(private_value.decode(), argv)
+        self.assertEqual(run.call_args.kwargs["input"], private_value)
+        self.assertEqual(argv[2], str(self.config.project.path / "Taskfile.dist.yaml"))
+        self.assertEqual(argv[3:5], ["--dir", str(self.config.project.path)])
+        self.assertTrue(next(value for value in argv if value.startswith("SECRETS_CLI=")).endswith("secret_store.py"))
+        self.assertNotIn("shell", run.call_args.kwargs)
+        self.assertIs(run.call_args.kwargs["stdout"], subprocess.DEVNULL)
+        self.assertIs(run.call_args.kwargs["stderr"], subprocess.DEVNULL)
+        trusted_environment = run.call_args.kwargs["env"]
+        self.assertNotIn(private_value.decode(), repr(trusted_environment))
+        self.assertNotIn(str(self.config.project.path), trusted_environment["PATH"])
+        self.assertNotIn("AGENTS_AGENT_TOKEN", trusted_environment)
+        self.assertNotIn("AGENTS_WEB_TOKEN", trusted_environment)
+        self.assertNotIn(private_value.decode(), response.text)
+        self.assertNotIn(private_value.decode(), "\n".join(self.connection.iterdump()))
+        self.assertNotIn(private_value.decode(), repr(self.client.app.state.managed_secret_requests))
+
+        with patch("agents.web.authenticate_agent", return_value=context):
+            status = self.client.get(
+                f"/agent/v1/secrets/requests/{secret_request['id']}",
+                headers=agent_headers,
+            )
+        self.assertEqual(status.json()["data"]["state"], "set")
+
+    def test_managed_secret_request_runs_real_setter_end_to_end(self):
+        repo = self.config.project.path
+        (repo / ".env.schema").write_text(
+            "# @defaultSensitive=false @defaultRequired=false\n# ---\n# @sensitive\nSERVICE_TOKEN=\n"
+        )
+        (repo / ".env.local").touch()
+        source_taskfile = Path(__file__).parents[1] / "Taskfile.dist.yaml"
+        (repo / "Taskfile.dist.yaml").write_text(source_taskfile.read_text())
+        paths = secret_store.resolve_paths(repo)
+        secret_store.init_store(paths)
+        item_id, terminal_id = self._active_work_terminal()
+        context = AgentContext(terminal_id, "researcher", "work", item_id, False)
+        agent_headers = {"Authorization": "Bearer test-token", "X-Agents-Execution-ID": "work-execution"}
+        with patch("agents.web.authenticate_agent", return_value=context):
+            requested = self.client.post(
+                "/agent/v1/secrets/requests",
+                headers=agent_headers,
+                json={"name": "SERVICE_TOKEN"},
+            ).json()["data"]
+
+        self.client.post("/auth/login", data={"token": "w" * 64}, headers={"Origin": "http://testserver"})
+        response = self.client.post(
+            f"/api/v1/secret-requests/{requested['id']}/value",
+            headers={
+                "Origin": "http://testserver",
+                "X-CSRF-Token": self.client.cookies.get("agents_csrf"),
+                "Content-Type": "application/octet-stream",
+            },
+            content=b"route-e2e-test-value",
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(secret_store._decrypt(paths)["SERVICE_TOKEN"], "route-e2e-test-value")
+        self.assertNotIn("route-e2e-test-value", response.text)
+        self.assertNotIn("route-e2e-test-value", "\n".join(self.connection.iterdump()))
+
+    def test_managed_secret_request_requires_active_work_and_is_one_shot(self):
+        persistent = AgentContext(1, "researcher", "persistent", "researcher", True)
+        headers = {"Authorization": "Bearer test-token", "X-Agents-Execution-ID": "persistent"}
+        with patch("agents.web.authenticate_agent", return_value=persistent):
+            denied = self.client.post(
+                "/agent/v1/secrets/requests",
+                headers=headers,
+                json={"name": "SERVICE_TOKEN"},
+            )
+        self.assertEqual(denied.status_code, 403)
+
+        item_id, terminal_id = self._active_work_terminal()
+        context = AgentContext(terminal_id, "researcher", "work", item_id, False)
+        with patch("agents.web.authenticate_agent", return_value=context):
+            requested = self.client.post(
+                "/agent/v1/secrets/requests",
+                headers={"Authorization": "Bearer test-token", "X-Agents-Execution-ID": "work"},
+                json={"name": "SERVICE_TOKEN"},
+            ).json()["data"]
+        self.client.post("/auth/login", data={"token": "w" * 64}, headers={"Origin": "http://testserver"})
+        csrf = self.client.cookies.get("agents_csrf")
+        request_headers = {
+            "Origin": "http://testserver",
+            "X-CSRF-Token": csrf,
+            "Content-Type": "application/octet-stream",
+        }
+        with patch("agents.web.subprocess.run", return_value=subprocess.CompletedProcess([], 1)):
+            rejected = self.client.post(
+                f"/api/v1/secret-requests/{requested['id']}/value",
+                headers=request_headers,
+                content=b"rejected-test-value",
+            )
+        self.assertEqual(rejected.status_code, 422)
+        self.assertEqual(self.client.app.state.managed_secret_requests[requested["id"]]["state"], "failed")
+        retry = self.client.post(
+            f"/api/v1/secret-requests/{requested['id']}/value",
+            headers=request_headers,
+            content=b"retry-test-value",
+        )
+        self.assertEqual(retry.status_code, 404)
+
+    def test_managed_secret_requests_expire_and_do_not_survive_restart(self):
+        item_id, terminal_id = self._active_work_terminal()
+        context = AgentContext(terminal_id, "researcher", "work", item_id, False)
+        headers = {"Authorization": "Bearer test-token", "X-Agents-Execution-ID": "work"}
+        with (
+            patch("agents.web.authenticate_agent", return_value=context),
+            patch("agents.web.time.monotonic", return_value=100.0),
+        ):
+            requested = self.client.post(
+                "/agent/v1/secrets/requests",
+                headers=headers,
+                json={"name": "SERVICE_TOKEN"},
+            ).json()["data"]
+        with (
+            patch("agents.web.authenticate_agent", return_value=context),
+            patch("agents.web.time.monotonic", return_value=701.0),
+        ):
+            expired = self.client.get(f"/agent/v1/secrets/requests/{requested['id']}", headers=headers)
+        self.assertEqual(expired.status_code, 404)
+        self.assertNotIn(requested["id"], self.client.app.state.managed_secret_requests)
+
+        restarted = create_app(self.config, self.connection)
+        self.assertEqual(restarted.state.managed_secret_requests, {})
 
     def test_terminal_answer_requires_open_prompt_and_is_one_shot(self):
         self.client.post("/auth/login", data={"token": "w" * 64}, headers={"Origin": "http://testserver"})

@@ -5,7 +5,13 @@ import contextlib
 import hashlib
 import json
 import os
+import secrets
+import shlex
+import shutil
 import sqlite3
+import subprocess
+import sys
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -35,6 +41,7 @@ from .messages import Messages, Messaging
 from .policy import DomainError, validate_request_id, validate_text
 from .reconciler import Reconciler
 from .repository_access import RepositoryAccessError, list_repository, read_repository
+from .secret_store import FORMAT_KEY, NAME_RE
 from .service import acquire_daemon_lock
 from .store import Store
 from .workflow import Workflow
@@ -43,6 +50,49 @@ CSP = (
     "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; "
     "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
 )
+SECRET_REQUEST_TTL_SECONDS = 600
+
+
+def _secret_requests(app: FastAPI) -> dict[str, dict[str, Any]]:
+    now = time.monotonic()
+    requests = app.state.managed_secret_requests
+    for request_id, item in list(requests.items()):
+        if item["expires_at"] <= now:
+            del requests[request_id]
+    return requests
+
+
+def _public_secret_request(item: dict[str, Any]) -> dict[str, Any]:
+    return {key: item[key] for key in ("id", "terminal_run_id", "actor_slug", "name", "state", "created_at")}
+
+
+def _active_secret_assignment(connection: sqlite3.Connection, terminal_run_id: int) -> sqlite3.Row | None:
+    return connection.execute(
+        "SELECT tr.working_directory FROM terminal_runs tr "
+        "JOIN work_items w ON w.id=tr.purpose_id AND w.active_execution_id IS NOT NULL "
+        "JOIN executions e ON e.id=w.active_execution_id AND e.work_id=w.id "
+        "AND e.worktree_path=tr.working_directory AND e.state='active' "
+        "JOIN assignments a ON a.work_id=w.id AND a.execution_id=e.id "
+        "AND a.terminal_run_id=tr.id AND a.actor_slug=tr.actor_slug AND a.state='open' "
+        "WHERE tr.id=? AND tr.purpose_kind='work' AND tr.state='live' AND tr.token_revoked_at IS NULL",
+        (terminal_run_id,),
+    ).fetchone()
+
+
+def _trusted_secret_tools() -> tuple[str, dict[str, str]]:
+    executables: dict[str, str] = {}
+    for name in ("task", "git", "age-keygen", "sops", "varlock"):
+        path = shutil.which(name)
+        if path is None:
+            raise RuntimeError(f"required managed-secret tool is unavailable: {name}")
+        executables[name] = str(Path(path).resolve())
+    environment = {
+        name: os.environ[name]
+        for name in ("HOME", "TMPDIR", "LANG", "LC_ALL", "USER", "SHELL", "TERM")
+        if name in os.environ
+    }
+    environment["PATH"] = os.pathsep.join(dict.fromkeys(str(Path(path).parent) for path in executables.values()))
+    return executables["task"], environment
 
 
 def ok(data: Any, version: int | None = None) -> dict[str, Any]:
@@ -138,6 +188,20 @@ HumanMutation = Annotated[HumanSession, Depends(_human_mutation)]
 AgentAuth = Annotated[AgentContext, Depends(_agent)]
 
 
+def _human_secret_mutation(
+    request: Request,
+    csrf: Annotated[str | None, Header(alias="X-CSRF-Token")] = None,
+) -> HumanSession:
+    session = _human(request)
+    _same_origin(request)
+    if csrf is None or not constant_time_token(csrf, session.csrf):
+        raise HTTPException(403, detail=error("invalid_csrf", "CSRF token mismatch"))
+    return session
+
+
+HumanSecretMutation = Annotated[HumanSession, Depends(_human_secret_mutation)]
+
+
 def _domain(call):
     try:
         return call()
@@ -188,6 +252,7 @@ def create_app(config: AgentsConfig | None = None, connection: sqlite3.Connectio
         redoc_url=None,
         openapi_url=None,
     )
+    app.state.managed_secret_requests = {}
     static = Path(__file__).with_name("static")
     app.mount("/static", StaticFiles(directory=static), name="static")
     if config is not None:
@@ -321,6 +386,11 @@ def create_app(config: AgentsConfig | None = None, connection: sqlite3.Connectio
                 ],
                 "approvals": [
                     dict(row) for row in connection.execute("SELECT * FROM approvals WHERE state='pending' LIMIT 100")
+                ],
+                "secret_requests": [
+                    _public_secret_request(item)
+                    for item in _secret_requests(request.app).values()
+                    if item["state"] == "pending"
                 ],
                 "incidents": [
                     dict(row) for row in connection.execute("SELECT * FROM incidents WHERE state='open' LIMIT 100")
@@ -646,6 +716,56 @@ def create_app(config: AgentsConfig | None = None, connection: sqlite3.Connectio
             (current, version, now, item_id, expected_version),
         )
         return {"id": item_id, "blocker_id": cursor.lastrowid, "state": "blocked", "version": version}
+
+    @app.post("/agent/v1/secrets/requests")
+    async def agent_request_secret_set(request: Request, context: AgentAuth):
+        body = await _json_body(request)
+        name = body["name"]
+        if (
+            context.purpose_kind != "work"
+            or _active_secret_assignment(request.app.state.connection, context.terminal_run_id) is None
+        ):
+            raise HTTPException(
+                403, detail=error("unauthorized", "managed secrets require an active execute-capable assignment")
+            )
+        if not isinstance(name, str) or not NAME_RE.fullmatch(name) or name == FORMAT_KEY:
+            raise HTTPException(400, detail=error("validation_failed", "invalid managed secret name"))
+        requests = _secret_requests(request.app)
+        existing = next(
+            (
+                item
+                for item in requests.values()
+                if item["terminal_run_id"] == context.terminal_run_id
+                and item["name"] == name
+                and item["state"] in {"pending", "setting"}
+            ),
+            None,
+        )
+        if existing is not None:
+            return ok(_public_secret_request(existing))
+        now = time.monotonic()
+        item = {
+            "id": secrets.token_urlsafe(18),
+            "terminal_run_id": context.terminal_run_id,
+            "actor_slug": context.actor_slug,
+            "name": name,
+            "state": "pending",
+            "created_at": utc_now(),
+            "expires_at": now + SECRET_REQUEST_TTL_SECONDS,
+        }
+        requests[item["id"]] = item
+        return ok(_public_secret_request(item))
+
+    @app.get("/agent/v1/secrets/requests/{secret_request_id}")
+    async def agent_secret_set_status(request: Request, secret_request_id: str, context: AgentAuth):
+        item = _secret_requests(request.app).get(secret_request_id)
+        if (
+            item is None
+            or item["terminal_run_id"] != context.terminal_run_id
+            or item["actor_slug"] != context.actor_slug
+        ):
+            raise HTTPException(404, detail=error("not_found", "managed secret request does not exist"))
+        return ok(_public_secret_request(item))
 
     @app.post("/agent/v1/backlog/{item_id}/progress")
     async def agent_report_progress(request: Request, item_id: str, context: AgentAuth):
@@ -1302,6 +1422,77 @@ def create_app(config: AgentsConfig | None = None, connection: sqlite3.Connectio
             )
         )
         return ok(data)
+
+    @app.post("/api/v1/secret-requests/{secret_request_id}/value")
+    async def human_set_secret(
+        request: Request,
+        secret_request_id: str,
+        _: HumanSecretMutation,
+    ):
+        if request.headers.get("content-type", "").split(";", 1)[0].strip() != "application/octet-stream":
+            raise HTTPException(
+                415, detail=error("invalid_content_type", "secret input must use application/octet-stream")
+            )
+        content_length = request.headers.get("content-length")
+        if content_length is not None:
+            try:
+                declared_length = int(content_length)
+            except ValueError:
+                raise HTTPException(400, detail=error("invalid_content_length", "invalid content length")) from None
+            if declared_length < 0 or declared_length > 64 * 1024:
+                raise HTTPException(413, detail=error("secret_too_large", "secret input exceeds 64 KiB"))
+        item = _secret_requests(request.app).get(secret_request_id)
+        if item is None or item["state"] != "pending":
+            raise HTTPException(404, detail=error("not_found", "managed secret request is not active"))
+        assignment = _active_secret_assignment(request.app.state.connection, item["terminal_run_id"])
+        if assignment is None:
+            del request.app.state.managed_secret_requests[secret_request_id]
+            raise HTTPException(404, detail=error("not_found", "managed secret request is not active"))
+        try:
+            task_executable, trusted_environment = _trusted_secret_tools()
+        except RuntimeError:
+            raise HTTPException(503, detail=error("secret_set_unavailable", "secret setter unavailable")) from None
+        item["state"] = "setting"
+        item["expires_at"] = time.monotonic() + SECRET_REQUEST_TTL_SECONDS
+        value = bytearray()
+        try:
+            async for chunk in request.stream():
+                if len(value) + len(chunk) > 64 * 1024:
+                    item["state"] = "failed"
+                    raise HTTPException(413, detail=error("secret_too_large", "secret input exceeds 64 KiB"))
+                value.extend(chunk)
+            trusted_setter = shlex.join((sys.executable, str(Path(__file__).with_name("secret_store.py").resolve())))
+            result = await asyncio.to_thread(
+                subprocess.run,
+                [
+                    task_executable,
+                    "--taskfile",
+                    str(request.app.state.config.project.path / "Taskfile.dist.yaml"),
+                    "--dir",
+                    str(assignment["working_directory"]),
+                    "secrets:set",
+                    f"SECRETS_CLI={trusted_setter}",
+                    "--",
+                    item["name"],
+                ],
+                input=bytes(value),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=60,
+                env=trusted_environment,
+            )
+        except OSError, subprocess.TimeoutExpired:
+            item["state"] = "failed"
+            raise HTTPException(503, detail=error("secret_set_unavailable", "secret setter unavailable")) from None
+        finally:
+            value.clear()
+        if result.returncode:
+            item["state"] = "failed"
+            raise HTTPException(422, detail=error("secret_set_rejected", "secret setter rejected the value"))
+        item["state"] = "set"
+        item["expires_at"] = time.monotonic() + SECRET_REQUEST_TTL_SECONDS
+        return ok(_public_secret_request(item))
 
     @app.get("/api/v1/terminals/{terminal_run_id}/output")
     async def human_terminal_output(request: Request, terminal_run_id: int, _: HumanRead):

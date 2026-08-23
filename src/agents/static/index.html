@@ -338,6 +338,37 @@
       </form>
     </dialog>
 
+    <dialog id="secret-dialog">
+      <form id="secret-form">
+        <header class="dialog-header">
+          <p class="eyebrow">Private managed-secret input</p>
+          <h2 id="secret-title">Set managed secret</h2>
+        </header>
+        <p class="warning">
+          The value goes directly to the assigned worktree setter. It is not stored in Agents
+          messages, events, terminal input, or retry state.
+        </p>
+        <p id="secret-request"></p>
+        <p class="form-error" role="alert" hidden></p>
+        <input type="hidden" name="request_id" />
+        <label
+          >Secret value
+          <input
+            name="value"
+            type="password"
+            required
+            maxlength="65536"
+            autocomplete="new-password"
+            spellcheck="false"
+          />
+        </label>
+        <div class="actions">
+          <button type="button" data-close>Cancel</button>
+          <button class="primary" type="submit">Set once</button>
+        </div>
+      </form>
+    </dialog>
+
     <dialog id="answer-dialog">
       <form id="answer-form">
         <header class="dialog-header">

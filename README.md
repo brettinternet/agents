@@ -90,6 +90,13 @@ channel and write the value through the transient control plane. Non-TTY input
 is exact, including any trailing newline. Never place the value in shell command
 text, arguments, environment assignments, or files. Other operations:
 
+CAO work agents request the same operation with Agent MCP
+`request_managed_secret_set`, passing only the declared name. The dashboard then
+shows a private one-shot form for the operator-provided value. That raw body is
+held only long enough to pipe it to `task secrets:set`; it does not enter agent
+tool arguments, terminal input, SQLite, messages, events, logs, or retry state.
+The agent can poll non-secret completion with `managed_secret_set_status`.
+
 ```sh
 task secrets:list
 task secrets:check

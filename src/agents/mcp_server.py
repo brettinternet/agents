@@ -443,6 +443,18 @@ def conversation_history(address: str, before_id: int | None = None, limit: int 
 
 
 @mcp.tool
+def request_managed_secret_set(name: str) -> Any:
+    """Request operator-provided secret input without sending the value through the agent transcript."""
+    return _request("POST", "/secrets/requests", {"name": name})
+
+
+@mcp.tool
+def managed_secret_set_status(request_id: str) -> Any:
+    """Read non-secret status for this execution's managed-secret request."""
+    return _request("GET", f"/secrets/requests/{request_id}")
+
+
+@mcp.tool
 def get_assignment() -> Any:
     return _request("GET", "/assignment")
 

@@ -411,7 +411,7 @@ class HerdrBackend:
             if adopted.cwd != spec.cwd.resolve():
                 raise ExecutionConflict("agent_start_mismatch", "Herdr started an unexpected workspace occupant")
             return adopted
-        for delay in (0.0, 0.05, 0.15, 0.3):
+        for delay in (0.0, 0.1, 0.4, 1.0, 2.0, 3.0, 4.0):
             if delay:
                 time.sleep(delay)
                 adopted = self.get_run(run.handle)

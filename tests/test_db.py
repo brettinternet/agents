@@ -96,7 +96,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.connection.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
         self.assertEqual(
             [row[0] for row in self.connection.execute("SELECT version FROM schema_migrations ORDER BY version")],
-            [1, 2, 3, 4, 5, 6, 7],
+            [1, 2, 3, 4, 5, 6, 7, 8],
         )
         terminal_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(terminal_runs)")}
         self.assertTrue(
@@ -261,6 +261,10 @@ class DatabaseTests(unittest.TestCase):
             "INSERT INTO actors(slug,kind,persistent,capacity,created_at,updated_at) VALUES(?,?,?,?,?,?)",
             ("other", "agent", 1, 1, now, now),
         )
+        other.execute(
+            "INSERT INTO actors(slug,kind,persistent,capacity,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+            ("late", "agent", 1, 1, now, now),
+        )
         run_id = other.execute(
             "INSERT INTO terminal_runs("
             "execution_name,profile_name,mcp_name,profile_sha256,provider,model,generation,actor_slug,"
@@ -352,21 +356,67 @@ class DatabaseTests(unittest.TestCase):
             migrations / "007_resolve_transient_herdr_launches.sql",
         )
         migrate(other, migrations)
+        late_run_id = other.execute(
+            "INSERT INTO terminal_runs("
+            "execution_name,profile_name,mcp_name,profile_sha256,provider,model,generation,actor_slug,"
+            "purpose_kind,purpose_id,working_directory,token_digest,profile_state,state,error,created_at,updated_at"
+            ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "agents-deadbeef-p-late-g0001",
+                "profile-late",
+                "mcp-late",
+                "sha-late",
+                "opencode_cli",
+                "",
+                1,
+                "late",
+                "persistent",
+                "late",
+                "/new",
+                "digest-late",
+                "installed",
+                "ended",
+                "backend run identity, occupant, or cwd mismatch",
+                now,
+                now,
+            ),
+        ).lastrowid
+        self.assertIsNotNone(late_run_id)
+        other.execute(
+            "INSERT INTO blockers(target_kind,target_id,terminal_run_id,kind,reason,requested_role,"
+            "actor_slug,state,created_at,updated_at) VALUES('persistent','late',?,'terminal_failure',"
+            "'identity lag','human','late','open',?,?)",
+            (late_run_id, now, now),
+        )
+        other.execute(
+            "INSERT INTO incidents(kind,entity_kind,entity_id,severity,state,summary,details_json,created_at,updated_at)"
+            " VALUES('terminal_failed','terminal',?,'error','open','identity lag','{}',?,?)",
+            (str(late_run_id), now, now),
+        )
+        shutil.copy(
+            source / "008_resolve_agent_start_propagation.sql",
+            migrations / "008_resolve_agent_start_propagation.sql",
+        )
+        migrate(other, migrations)
         self.assertEqual(
             dict(other.execute("SELECT state,COUNT(*) FROM blockers GROUP BY state")),
-            {"open": 1, "resolved": 2},
+            {"open": 1, "resolved": 3},
         )
         self.assertEqual(
             dict(other.execute("SELECT state,COUNT(*) FROM incidents GROUP BY state")),
-            {"open": 1, "resolved": 2},
+            {"open": 1, "resolved": 3},
         )
         self.assertEqual(
             other.execute("SELECT error FROM terminal_runs WHERE id=?", (herdr_run_id,)).fetchone()[0],
             "transient Herdr cutover: agent_pane_busy: agent target pane w1:p1 is not an available shell",
         )
         self.assertEqual(
+            other.execute("SELECT error FROM terminal_runs WHERE id=?", (late_run_id,)).fetchone()[0],
+            "transient Herdr cutover: backend run identity, occupant, or cwd mismatch",
+        )
+        self.assertEqual(
             [row[0] for row in other.execute("SELECT version FROM schema_migrations ORDER BY version")],
-            [1, 2, 3, 4, 5, 6, 7],
+            [1, 2, 3, 4, 5, 6, 7, 8],
         )
         other.close()
 
@@ -382,6 +432,7 @@ class DatabaseTests(unittest.TestCase):
             "005_execution_backend.sql",
             "006_resolve_stale_cao_failures.sql",
             "007_resolve_transient_herdr_launches.sql",
+            "008_resolve_agent_start_propagation.sql",
         ):
             shutil.copy(source / name, migrations / name)
         other = connect(self.root / "other.db")

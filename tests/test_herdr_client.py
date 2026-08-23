@@ -284,7 +284,7 @@ class HerdrClientTests(unittest.TestCase):
         spec = RunSpec("agents-test", 1, 1, Path("/tmp"), "worker", "opencode", ("opencode",), (), "opencode")
         with patch("agents.herdr_client.time.sleep") as sleep:
             run = HerdrBackend(cast(Any, FakeClient()), provider_id="opencode_cli").create_run(spec)
-        sleep.assert_called_once_with(0.05)
+        sleep.assert_called_once_with(0.1)
         self.assertEqual(run.handle, RunHandle("agents-test", "w1", "p1"))
         stale = FakeClient()
         stale.expected_after = 999
@@ -294,7 +294,7 @@ class HerdrClientTests(unittest.TestCase):
         ):
             HerdrBackend(cast(Any, stale), provider_id="opencode_cli").create_run(spec)
         self.assertEqual(raised.exception.code, "agent_start_mismatch")
-        self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.05, 0.15, 0.3])
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.1, 0.4, 1.0, 2.0, 3.0, 4.0])
 
     def test_create_run_rejects_missing_authoritative_workspace_ids(self) -> None:
         class FakeClient:

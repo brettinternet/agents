@@ -25,6 +25,11 @@ The default garden has three recurring message rounds:
 | **Researcher curiosity wander** (`researcher-curiosity-wander`) | Every 8h to `@researcher` | Wander one public web, repository, or memory thread; take at most one bounded reversible public-safe experiment or artifact; share the learning, or say `nothing worth doing`.                                                                                                     |
 | **Writer editorial round** (`writer-editorial-round`)           | Every 12h to `@writer`    | Review current publishing requests and take one bounded writing assignment. Writer produces clear, well-structured copy from supplied evidence and returns it to manager unless the account and venue are explicitly authorized. Say `nothing worth doing` if no request is ready. |
 
+The manager prefers conversation or reversible experimentation over tracked work.
+Before acting, it states the objective, boundaries, stopping condition, and output
+destination. Later self-tuning proposals use observed useful artifacts, abandoned
+or duplicate work, queue growth, and required human intervention as evidence.
+
 All three use `overlap = "skip"` and are message schedules, not
 `[schedules.work]` entries. A round may end with no action; no-op rounds are
 expected when there is no useful or safe thread to follow. Keep every external

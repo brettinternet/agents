@@ -102,6 +102,8 @@ Choose at most one worthwhile action:
 3. Propose one evidence-backed agents.toml or agents/*.md improvement through tracked implementation work.
 4. Report `nothing worth doing`.
 
+Prefer a conversation or reversible experiment over tracked work. Before acting, state the objective, boundaries, stopping condition, and output destination. Base later tuning proposals on useful artifacts, abandoned or duplicate work, queue growth, and required human intervention.
+
 Do not manufacture work to satisfy the round. Do not weaken safety, authorization, review, verification, or human approval.
 """
 overlap = "skip"

@@ -140,25 +140,47 @@ def _record(path: Path, process: subprocess.Popen[bytes], executable: Path) -> N
 
 
 def _owned(path: Path) -> tuple[int, dict[str, object]] | None:
+    if path.is_symlink():
+        raise ServiceError(f"unsafe service ownership record: {path} is a symlink")
     try:
-        record = json.loads(path.read_text(encoding="utf-8"))
+        raw_record = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ServiceError(f"cannot read service ownership record {path}: {exc}") from exc
+    try:
+        record = json.loads(raw_record)
         pid = int(record["pid"])
+        if pid <= 0:
+            raise ValueError("pid must be positive")
         expected = str(record["executable"])
         started = str(record["started"])
-        actual_started = _process_started(pid)
+    except (TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+        raise ServiceError(f"invalid service ownership record {path}: {exc}") from exc
+    try:
         os.kill(pid, 0)
+    except ProcessLookupError:
+        return None
+    except OSError as exc:
+        raise ServiceError(f"cannot inspect process {pid} from service ownership record {path}: {exc}") from exc
+    try:
+        actual_started = _process_started(pid)
         command = subprocess.run(
             ["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True, check=True
         ).stdout.strip()
-    except OSError, ValueError, KeyError, json.JSONDecodeError, subprocess.SubprocessError, ServiceError:
-        return None
+    except (subprocess.SubprocessError, ServiceError) as exc:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return None
+        raise ServiceError(f"cannot inspect process {pid} from service ownership record {path}: {exc}") from exc
     if started != actual_started:
-        raise ServiceError(f"pid {pid} start time does not match owned record")
+        raise ServiceError(f"pid {pid} start time does not match service ownership record {path}")
     executable_tokens = {
         str(Path(token).resolve()) for token in shlex.split(command) if token.startswith("/") and Path(token).exists()
     }
     if expected not in executable_tokens:
-        raise ServiceError(f"pid {pid} executable does not match owned record")
+        raise ServiceError(f"pid {pid} executable does not match service ownership record {path}")
     return pid, record
 
 
@@ -235,10 +257,13 @@ def start(config: AgentsConfig) -> None:
     try:
         owned = {name: _owned(path) for name, path in paths.items()}
     except ServiceError as exc:
-        raise ServiceError(f"{exc}; {_EXPLICIT_RESTART}") from exc
-    stale = [name for name, path in paths.items() if (path.exists() or path.is_symlink()) and owned[name] is None]
-    if stale:
-        raise ServiceError(f"stale service ownership record for {', '.join(stale)}; {_EXPLICIT_RESTART}")
+        raise ServiceError(
+            f"cannot validate service ownership: {exc}; ownership records were left unchanged; "
+            "verify the recorded processes before removing any record"
+        ) from exc
+    for name, path in paths.items():
+        if path.exists() and owned[name] is None:
+            path.unlink()
 
     herdr_owned = owned["herdr"] is not None
     agentsd_owned = owned["agentsd"] is not None
@@ -294,9 +319,16 @@ def _stop_named(config: AgentsConfig, name: str, *, remove_record: bool = True) 
     path = config.state_dir / f"{name}.pid"
     if not path.exists() and not path.is_symlink():
         return None
-    owned = _owned(path)
+    try:
+        owned = _owned(path)
+    except ServiceError as exc:
+        raise ServiceError(
+            f"cannot validate {name} ownership before stopping: {exc}; the ownership record was left unchanged; "
+            "verify the recorded process before removing the record"
+        ) from exc
     if owned is None:
-        raise ServiceError(f"cannot stop unowned {name} process; {_EXPLICIT_RESTART}")
+        path.unlink(missing_ok=True)
+        return path
     pid, _ = owned
     try:
         os.killpg(pid, signal.SIGTERM)

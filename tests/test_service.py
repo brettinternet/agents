@@ -81,17 +81,61 @@ class ServiceTests(unittest.TestCase):
             ):
                 start(config)
 
-    def test_start_rejects_stale_ownership_record(self) -> None:
+    def test_start_removes_stale_record_and_starts_agentsd(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            agentsd = root / ".venv" / "bin" / "agentsd"
+            agentsd.parent.mkdir(parents=True)
+            agentsd.write_text("#!/bin/sh\n")
+            agentsd.chmod(0o755)
             config = _config(root)
             config.state_dir.mkdir(mode=0o700)
-            (config.state_dir / "agentsd.pid").write_text("{}")
+            record = config.state_dir / "agentsd.pid"
+            record.write_text('{"pid": 123, "executable": "/missing", "started": "old"}')
             with (
-                patch("agents.service._owned", return_value=None),
-                self.assertRaisesRegex(ServiceError, "stale service ownership record for agentsd"),
+                patch("agents.service._owned", side_effect=(None, (123, {}))),
+                patch("agents.service._herdr_health", return_value=True),
+                patch("agents.service._web_health_ready", return_value=True),
+                patch("agents.service._launch_process", return_value=FakeProcess()) as launch,
             ):
                 start(config)
+            self.assertFalse(record.exists())
+            launch.assert_called_once()
+            self.assertEqual(launch.call_args.args[1], "agentsd")
+
+    def test_start_reports_invalid_record_without_removing_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = _config(Path(temporary))
+            config.state_dir.mkdir(mode=0o700)
+            record = config.state_dir / "agentsd.pid"
+            record.write_text("{}")
+            with self.assertRaisesRegex(
+                ServiceError, "cannot validate service ownership: invalid service ownership record"
+            ):
+                start(config)
+            self.assertTrue(record.exists())
+
+    def test_stop_removes_stale_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = _config(Path(temporary))
+            config.state_dir.mkdir(mode=0o700)
+            record = config.state_dir / "agentsd.pid"
+            record.write_text('{"pid": 123, "executable": "/missing", "started": "old"}')
+            with patch("agents.service._owned", return_value=None):
+                stop(config)
+            self.assertFalse(record.exists())
+
+    def test_stop_reports_invalid_record_without_removing_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = _config(Path(temporary))
+            config.state_dir.mkdir(mode=0o700)
+            record = config.state_dir / "agentsd.pid"
+            record.write_text("{}")
+            with self.assertRaisesRegex(
+                ServiceError, "cannot validate agentsd ownership before stopping: invalid service ownership record"
+            ):
+                stop(config)
+            self.assertTrue(record.exists())
 
     def test_stop_preserves_herdr(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -110,6 +154,13 @@ class ServiceTests(unittest.TestCase):
                 self.assertEqual((state / "agentsd.lock").stat().st_mode & 0o777, 0o600)
             finally:
                 first.close()
+
+    def test_owned_returns_none_when_recorded_process_is_gone(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            pidfile = Path(temporary) / "service.pid"
+            pidfile.write_text('{"pid": 123, "executable": "/missing", "started": "old"}')
+            with patch("agents.service.os.kill", side_effect=ProcessLookupError):
+                self.assertIsNone(_owned(pidfile))
 
     def test_owned_process_accepts_resolved_symlink_executable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -57,6 +57,7 @@ class RepositoryAccessTests(unittest.TestCase):
             "ssh_host_ecdsa_key",
             "ssh_host_ed25519_key",
             "ssh_host_rsa_key",
+            "ssh_host_rsa_key.bak",
         ):
             self._write(path, "private\n")
         self._write(".ssh/id_ecdsa", "private key\n")
@@ -134,6 +135,7 @@ class RepositoryAccessTests(unittest.TestCase):
             "ssh_host_ecdsa_key",
             "ssh_host_ed25519_key",
             "ssh_host_rsa_key",
+            "ssh_host_rsa_key.bak",
             "PRIVATE.PEM",
             "linked.md",
             "untracked.md",

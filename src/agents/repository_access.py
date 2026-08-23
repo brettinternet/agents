@@ -111,9 +111,7 @@ def _denied(path: str) -> bool:
         )
         credential_file = component.startswith(("credentials.", "credentials_"))
         managed_secret = ".sops." in component and component != ".sops.yaml"
-        ssh_artifact = component.startswith("authorized_keys") or (
-            component.startswith("ssh_host_") and (component.endswith("_key") or component.endswith("_key.pub"))
-        )
+        ssh_artifact = component.startswith(("authorized_keys", "ssh_host_"))
         if (
             component in _DENIED_COMPONENTS
             or component in _DENIED_NAMES

@@ -60,7 +60,7 @@ class ProfileTests(unittest.TestCase):
             root.mkdir()
             package = Path(d) / "installed_package"
             package.mkdir()
-            for name in ("elder", "explorer", "yapper"):
+            for name in ("elder", "explorer", "writer"):
                 (package / f"{name}.md").write_bytes((repository / "agents" / f"{name}.md").read_bytes())
             with patch.object(profiles_module, "__file__", str(package / "profiles.py")):
                 validate_templates(root)

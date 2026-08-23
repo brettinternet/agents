@@ -58,10 +58,10 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
                 "capacity": 3,
             },
             {
-                "slug": "yapper",
+                "slug": "writer",
                 "kind": "agent",
                 "reports_to": "elder",
-                "profile_template": "yapper",
+                "profile_template": "writer",
                 "specialty": "publishing",
                 "persistent": True,
                 "capacity": 3,
@@ -106,7 +106,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         )
         consult = self.delivery.request_consultation("elder", created["id"], refined["version"], "publishing", "review")
         self.connection.execute(
-            "UPDATE consultations SET state='completed',responder='yapper',response='good',updated_at=? WHERE id=?",
+            "UPDATE consultations SET state='completed',responder='writer',response='good',updated_at=? WHERE id=?",
             (utc_now(), consult["id"]),
         )
         ready = self.workflow.mark_ready("ready", "elder", created["id"], refined["version"])
@@ -138,9 +138,9 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         persistent = reserve_terminal(
             self.connection,
             self.config,
-            actor="yapper",
+            actor="writer",
             purpose_kind="persistent",
-            purpose_id="yapper",
+            purpose_id="writer",
             working_directory=self.config.project.path,
             budget_exempt=True,
         )
@@ -148,7 +148,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.connection.execute(
             "UPDATE terminal_runs SET state='live',profile_state='installed',backend_run_id=?,"
             "backend_terminal_id=?,updated_at=? WHERE id=?",
-            (str(persistent["execution_name"]), "yapper-persistent", now, persistent["id"]),
+            (str(persistent["execution_name"]), "writer-persistent", now, persistent["id"]),
         )
 
         assigned = self.delivery.dispatch_consultation_next()
@@ -158,12 +158,12 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         delivery = self.connection.execute(
             "SELECT d.actor_slug,d.terminal_run_id,d.state FROM deliveries d "
             "JOIN messages m ON m.id=d.message_id WHERE m.body=?",
-            (f"Consultation {consultation['id']} assigned to @yapper.",),
+            (f"Consultation {consultation['id']} assigned to @writer.",),
         ).fetchone()
         self.assertIsNotNone(delivery)
         self.assertEqual(
             (delivery["actor_slug"], delivery["terminal_run_id"], delivery["state"]),
-            ("yapper", persistent["id"], "pending"),
+            ("writer", persistent["id"], "pending"),
         )
 
     def queue_check(self, command: list[str]) -> int:
@@ -173,7 +173,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         (worktree / "file").write_text("changed")
         subprocess.run(["git", "-C", str(worktree), "commit", "-am", "implement"], check=True, capture_output=True)
         submission = self.delivery.submit_work(
-            "yapper", item, version + 1, head_sha(worktree), "done", dispatch["terminal_run_id"]
+            "writer", item, version + 1, head_sha(worktree), "done", dispatch["terminal_run_id"]
         )
         self.connection.execute(
             "UPDATE checks SET command=? WHERE submission_id=?",
@@ -290,18 +290,18 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         assignment_delivery = self.connection.execute(
             "SELECT d.actor_slug,d.terminal_run_id,d.state FROM deliveries d "
             "JOIN messages m ON m.id=d.message_id WHERE m.body=?",
-            ("Implementation assigned to @yapper.",),
+            ("Implementation assigned to @writer.",),
         ).fetchone()
         self.assertIsNotNone(assignment_delivery)
         self.assertEqual(
             (assignment_delivery["actor_slug"], assignment_delivery["terminal_run_id"], assignment_delivery["state"]),
-            ("yapper", dispatch["terminal_run_id"], "pending"),
+            ("writer", dispatch["terminal_run_id"], "pending"),
         )
         worktree = Path(dispatch["worktree"])
         (worktree / "file").write_text("changed")
         subprocess.run(["git", "-C", str(worktree), "commit", "-am", "implement"], check=True, capture_output=True)
         submission = self.delivery.submit_work(
-            "yapper", item, version + 1, head_sha(worktree), "done", dispatch["terminal_run_id"]
+            "writer", item, version + 1, head_sha(worktree), "done", dispatch["terminal_run_id"]
         )
         check = await self.delivery.run_next_check()
         self.assertIsNotNone(check)
@@ -346,14 +346,14 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.delivery.finish_integration(item)["integration_sha"], branch_sha(self.config.project.path, "main")
         )
 
-    async def test_required_publishing_review_retries_after_yapper_capacity_frees(self):
+    async def test_required_publishing_review_retries_after_writer_capacity_frees(self):
         item, version = self.ready_item(gates=["publishing"])
         persistent = reserve_terminal(
             self.connection,
             self.config,
-            actor="yapper",
+            actor="writer",
             purpose_kind="persistent",
-            purpose_id="yapper",
+            purpose_id="writer",
             working_directory=self.config.project.path,
             budget_exempt=True,
         )
@@ -361,7 +361,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.connection.execute(
             "UPDATE terminal_runs SET state='live',profile_state='installed',backend_run_id=?,"
             "backend_terminal_id=?,updated_at=? WHERE id=?",
-            (str(persistent["execution_name"]), "yapper-persistent", now, persistent["id"]),
+            (str(persistent["execution_name"]), "writer-persistent", now, persistent["id"]),
         )
         dispatch = self.delivery.dispatch_next()
         self.assertIsNotNone(dispatch)
@@ -370,7 +370,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         (worktree / "file").write_text("changed")
         subprocess.run(["git", "-C", str(worktree), "commit", "-am", "implement"], check=True, capture_output=True)
         submission = self.delivery.submit_work(
-            "yapper", item, version + 1, head_sha(worktree), "done", dispatch["terminal_run_id"]
+            "writer", item, version + 1, head_sha(worktree), "done", dispatch["terminal_run_id"]
         )
         check = await self.delivery.run_next_check()
         self.assertIsNotNone(check)
@@ -379,7 +379,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         held = reserve_terminal(
             self.connection,
             self.config,
-            actor="yapper",
+            actor="writer",
             purpose_kind="review",
             purpose_id=f"{item}-capacity-hold",
             working_directory=self.root / "capacity-hold",
@@ -387,7 +387,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             self.connection.execute(
-                "SELECT COUNT(*) FROM actor_leases WHERE actor_slug='yapper' AND released_at IS NULL"
+                "SELECT COUNT(*) FROM actor_leases WHERE actor_slug='writer' AND released_at IS NULL"
             ).fetchone()[0],
             3,
         )
@@ -425,7 +425,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             self.connection.execute(
-                "SELECT COUNT(*) FROM actor_leases WHERE actor_slug='yapper' AND released_at IS NULL"
+                "SELECT COUNT(*) FROM actor_leases WHERE actor_slug='writer' AND released_at IS NULL"
             ).fetchone()[0],
             2,
         )
@@ -434,11 +434,11 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
             "SELECT * FROM reviews WHERE submission_id=? AND gate='publishing'", (submission["submission_id"],)
         ).fetchone()
         self.assertIsNotNone(publishing_review)
-        self.assertEqual(cast(Any, publishing_review)["actor_slug"], "yapper")
+        self.assertEqual(cast(Any, publishing_review)["actor_slug"], "writer")
         self.assertEqual(cast(Any, publishing_review)["verdict"], "pending")
 
         approved = self.delivery.submit_review(
-            "yapper",
+            "writer",
             item,
             submission["submission_id"],
             submission["version"],
@@ -466,7 +466,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaises(DomainError):
             self.delivery.submit_work(
-                "yapper", item, version + 1, dispatch["base_sha"], "bad", dispatch["terminal_run_id"]
+                "writer", item, version + 1, dispatch["base_sha"], "bad", dispatch["terminal_run_id"]
             )
         decision = self.delivery.propose_decision(
             "elder", item_id=item, title="Choose", question="Which?", options=["A", "B"], recommendation="A"
@@ -586,4 +586,4 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         ).fetchone()
         self.assertIsNotNone(replacement)
         self.assertEqual(replacement["generation"], 2)
-        self.assertIn("-w-1-2-yapper-g0002", replacement["execution_name"])
+        self.assertIn("-w-1-2-writer-g0002", replacement["execution_name"])

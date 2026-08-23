@@ -49,7 +49,7 @@ class DatabaseTests(unittest.TestCase):
                     "capacity": 3,
                 },
                 {
-                    "slug": "yapper",
+                    "slug": "writer",
                     "kind": "agent",
                     "reports_to": "elder",
                     "specialty": "publishing",
@@ -96,7 +96,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.connection.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
         self.assertEqual(
             [row[0] for row in self.connection.execute("SELECT version FROM schema_migrations ORDER BY version")],
-            [1, 2, 3, 4, 5, 6, 7, 8],
+            [1, 2, 3, 4, 5, 6, 7, 8, 9],
         )
         terminal_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(terminal_runs)")}
         self.assertTrue(
@@ -417,6 +417,91 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(
             [row[0] for row in other.execute("SELECT version FROM schema_migrations ORDER BY version")],
             [1, 2, 3, 4, 5, 6, 7, 8],
+        )
+        other.close()
+
+    def test_writer_migration_replaces_persisted_yapper_actor_and_run(self) -> None:
+        migrations = self.root / "writer-cutover-migrations"
+        migrations.mkdir()
+        source = Path(__file__).parents[1] / "src/agents/migrations"
+        for name in (
+            "001_initial.sql",
+            "002_terminal_reasoning.sql",
+            "003_schedules.sql",
+            "004_general_channel.sql",
+            "005_execution_backend.sql",
+            "006_resolve_stale_cao_failures.sql",
+            "007_resolve_transient_herdr_launches.sql",
+            "008_resolve_agent_start_propagation.sql",
+        ):
+            shutil.copy(source / name, migrations / name)
+        other = connect(self.root / "writer-cutover.db")
+        migrate(other, migrations)
+        now = utc_now()
+        other.execute(
+            "INSERT INTO actors(slug,kind,profile_template,specialty,persistent,capacity,created_at,updated_at) "
+            "VALUES('yapper','agent','yapper','publishing',1,3,?,?)",
+            (now, now),
+        )
+        run_id = other.execute(
+            "INSERT INTO terminal_runs("
+            "execution_name,profile_name,mcp_name,profile_sha256,provider,model,generation,actor_slug,"
+            "purpose_kind,purpose_id,working_directory,token_digest,profile_state,state,created_at,updated_at"
+            ") VALUES('agents-test-p-yapper-g0001','profile','mcp','sha','mock_cli','',1,'yapper',"
+            "'persistent','yapper',?,'digest','installed','live',?,?)",
+            (str(self.root), now, now),
+        ).lastrowid
+        self.assertIsNotNone(run_id)
+        other.execute(
+            "INSERT INTO actor_leases(actor_slug,purpose_kind,purpose_id,terminal_run_id,acquired_at) "
+            "VALUES('yapper','persistent','yapper',?,?)",
+            (run_id, now),
+        )
+        conversation_id = other.execute(
+            "INSERT INTO conversations(address,kind,created_at,updated_at) VALUES('dm:human:yapper','dm',?,?)",
+            (now, now),
+        ).lastrowid
+        self.assertIsNotNone(conversation_id)
+        other.execute(
+            "INSERT INTO conversation_members(conversation_id,actor_slug,notify) VALUES(?,'yapper',1)",
+            (conversation_id,),
+        )
+        message_id = other.execute(
+            "INSERT INTO messages(conversation_id,sender_slug,body,urgency,created_at) "
+            "VALUES(?,'yapper','draft','normal',?)",
+            (conversation_id, now),
+        ).lastrowid
+        self.assertIsNotNone(message_id)
+        other.execute(
+            "INSERT INTO deliveries(message_id,actor_slug,terminal_run_id,state,attempts) "
+            "VALUES(?,'yapper',?,'pending',0)",
+            (message_id, run_id),
+        )
+
+        shutil.copy(source / "009_rename_yapper_to_writer.sql", migrations / "009_rename_yapper_to_writer.sql")
+        migrate(other, migrations)
+
+        self.assertEqual(
+            [row[0] for row in other.execute("SELECT slug FROM actors ORDER BY slug")],
+            ["writer"],
+        )
+        run = other.execute(
+            "SELECT actor_slug,purpose_id,state,token_revoked_at FROM terminal_runs WHERE id=?",
+            (run_id,),
+        ).fetchone()
+        self.assertEqual((run["actor_slug"], run["purpose_id"], run["state"]), ("writer", "writer", "ending"))
+        self.assertIsNotNone(run["token_revoked_at"])
+        lease = other.execute(
+            "SELECT actor_slug,purpose_id,released_at FROM actor_leases WHERE terminal_run_id=?",
+            (run_id,),
+        ).fetchone()
+        self.assertEqual((lease["actor_slug"], lease["purpose_id"]), ("writer", "writer"))
+        self.assertIsNotNone(lease["released_at"])
+        delivery = other.execute("SELECT actor_slug,terminal_run_id FROM deliveries").fetchone()
+        self.assertEqual((delivery["actor_slug"], delivery["terminal_run_id"]), ("writer", None))
+        self.assertEqual(
+            other.execute("SELECT address FROM conversations WHERE id=?", (conversation_id,)).fetchone()[0],
+            "dm:human:writer",
         )
         other.close()
 

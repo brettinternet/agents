@@ -441,7 +441,7 @@ def _seed_development(connection: sqlite3.Connection, config: AgentsConfig) -> N
             run = reserve_terminal(
                 connection,
                 config,
-                actor="yapper",
+                actor="writer",
                 purpose_kind="work",
                 purpose_id=str(item["id"]),
                 working_directory=worktree,
@@ -457,7 +457,7 @@ def _seed_development(connection: sqlite3.Connection, config: AgentsConfig) -> N
             )
             connection.execute(
                 "INSERT INTO assignments(work_id,execution_id,actor_slug,terminal_run_id,state,created_at,updated_at)"
-                "VALUES(?,?, 'yapper',?,'open',?,?)",
+                "VALUES(?,?, 'writer',?,'open',?,?)",
                 (item["id"], execution, run["id"], now, now),
             )
 

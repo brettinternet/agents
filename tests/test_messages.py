@@ -41,7 +41,7 @@ class MessageTests(unittest.TestCase):
                 "capacity": 1,
             },
             {
-                "slug": "yapper",
+                "slug": "writer",
                 "kind": "agent",
                 "reports_to": "elder",
                 "specialty": "publishing",
@@ -112,16 +112,16 @@ class MessageTests(unittest.TestCase):
     def test_seeded_members_and_notification_policy(self):
         expected = {
             "#general": (
-                {"human", "system", "elder", "explorer", "yapper"},
-                {"elder", "explorer", "yapper"},
+                {"human", "system", "elder", "explorer", "writer"},
+                {"elder", "explorer", "writer"},
             ),
             "#findings": (
                 {"human", "system", "elder", "explorer"},
                 {"elder", "explorer"},
             ),
             "#publishing": (
-                {"human", "system", "elder", "yapper"},
-                {"elder", "yapper"},
+                {"human", "system", "elder", "writer"},
+                {"elder", "writer"},
             ),
             "#coordination": ({"human", "system", "elder"}, {"elder"}),
             "#incidents": ({"human", "system", "elder"}, {"elder"}),
@@ -143,7 +143,7 @@ class MessageTests(unittest.TestCase):
             row[0]: row[1]
             for row in self.connection.execute("SELECT slug,reports_to FROM actors WHERE kind='agent' ORDER BY slug")
         }
-        self.assertEqual(hierarchy, {"elder": "human", "explorer": "elder", "yapper": "elder"})
+        self.assertEqual(hierarchy, {"elder": "human", "explorer": "elder", "writer": "elder"})
 
     def test_post_is_atomic_replayable_and_delivered(self):
         first = self.messaging.post("post-1", "human", "#coordination", "Please refine")
@@ -170,7 +170,7 @@ class MessageTests(unittest.TestCase):
                     (publishing["id"],),
                 )
             },
-            {"elder", "yapper"},
+            {"elder", "writer"},
         )
 
     def test_general_broadcasts_to_agents_and_ack_is_actor_scoped(self):
@@ -256,7 +256,7 @@ class MessageTests(unittest.TestCase):
         }
         self.assertEqual(deliveries["explorer"], work_run_id)
         self.assertIsNone(deliveries["elder"])
-        self.assertIsNone(deliveries["yapper"])
+        self.assertIsNone(deliveries["writer"])
 
         persistent_inbox = Messages(self.connection).inbox("explorer", persistent_run_id, True)
         self.assertNotIn(posted["id"], {row["id"] for row in persistent_inbox})

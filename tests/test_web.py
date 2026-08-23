@@ -58,10 +58,10 @@ class WebAuthTests(unittest.TestCase):
                     "capacity": 3,
                 },
                 {
-                    "slug": "yapper",
+                    "slug": "writer",
                     "kind": "agent",
                     "reports_to": "elder",
-                    "profile_template": "yapper",
+                    "profile_template": "writer",
                     "specialty": "publishing",
                     "persistent": True,
                     "capacity": 1,

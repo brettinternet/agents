@@ -10,7 +10,7 @@ from .policy import DomainError, validate_page, validate_text
 
 MENTION = re.compile(r"(?<![A-Za-z0-9_.-])@([a-z0-9-]+)")
 CHANNELS = ("#general", "#findings", "#publishing", "#coordination", "#incidents")
-WORK_MEMBERS = ("human", "elder", "explorer", "yapper")
+WORK_MEMBERS = ("human", "elder", "explorer", "writer")
 
 
 def seed_conversations(connection: sqlite3.Connection) -> None:
@@ -22,16 +22,16 @@ def seed_conversations(connection: sqlite3.Connection) -> None:
         )
     actors = {str(row[0]) for row in connection.execute("SELECT slug FROM actors")}
     channel_members = {
-        "#general": {"human", "system", "elder", "explorer", "yapper"},
+        "#general": {"human", "system", "elder", "explorer", "writer"},
         "#findings": {"human", "system", "elder", "explorer"},
-        "#publishing": {"human", "system", "elder", "yapper"},
+        "#publishing": {"human", "system", "elder", "writer"},
         "#coordination": {"human", "system", "elder"},
         "#incidents": {"human", "system", "elder"},
     }
     channel_notifications = {
-        "#general": {"elder", "explorer", "yapper"},
+        "#general": {"elder", "explorer", "writer"},
         "#findings": {"elder", "explorer"},
-        "#publishing": {"elder", "yapper"},
+        "#publishing": {"elder", "writer"},
         "#coordination": {"elder"},
         "#incidents": {"elder"},
     }

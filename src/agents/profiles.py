@@ -20,7 +20,7 @@ class ProfileError(ValueError):
 _REQUIRED = {
     "elder",
     "explorer",
-    "yapper",
+    "writer",
 }
 PROVIDER_CAPABILITIES = {
     "opencode_cli": {"mcp_env": "values", "native_tools": True},

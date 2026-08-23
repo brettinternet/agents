@@ -22,7 +22,7 @@ class PolicyTests(unittest.TestCase):
         with self.assertRaises(DomainError):
             authorize_transition("elder", "awaiting_approval", "accepted")
         with self.assertRaises(DomainError):
-            authorize_transition("yapper", "in_progress", "verifying", assigned_actor="explorer")
+            authorize_transition("writer", "in_progress", "verifying", assigned_actor="explorer")
         with self.assertRaises(DomainError):
             authorize_reopen("elder", "in_progress", True)
 
@@ -106,7 +106,7 @@ class WorkflowTests(unittest.TestCase):
                     "capacity": 1,
                 },
                 {
-                    "slug": "yapper",
+                    "slug": "writer",
                     "kind": "agent",
                     "reports_to": "elder",
                     "specialty": "publishing",

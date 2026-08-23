@@ -48,7 +48,11 @@ send it. The default actor slugs are:
 - **elder** — vague requests, coordination, or deciding what tracked work should
   be created.
 - **explorer** — direct research of public sources.
-- **yapper** — synthesis or publishing-oriented work.
+- **writer** — synthesis, publishing-oriented work, and all final public-post copy.
+
+Route every public-post request to writer with its audience, venue, purpose,
+constraints, source material, and authorization status. Elder and explorer may
+coordinate or supply research, but writer authors the final copy.
 
 State the objective, boundaries, stopping condition, output destination, and
 whether external side effects are authorized. For example:

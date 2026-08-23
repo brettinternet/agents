@@ -350,7 +350,7 @@ The dashboard is a projection of durable adventure, work, message, and event sta
 - `scout-1` using the explorer profile: searches for novel projects.
 - `scout-2` using the explorer profile: searches for deployed workflows.
 - `skeptic` using the explorer profile: challenges the strongest prior finding.
-- `chronicler` using the yapper profile: produces internal round digests.
+- `chronicler` using the writer profile: produces internal round digests.
 
 **Rules:**
 

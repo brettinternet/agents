@@ -72,10 +72,10 @@ persistent = true
 capacity = 3
 
 [[actors]]
-slug = "yapper"
+slug = "writer"
 kind = "agent"
 reports_to = "elder"
-profile_template = "yapper"
+profile_template = "writer"
 specialty = "publishing"
 persistent = true
 capacity = 3
@@ -95,8 +95,8 @@ message = "Wander one public web, repository, or memory thread with curiosity; m
 overlap = "skip"
 
 [[schedules]]
-slug = "yapper-campfire-round"
+slug = "writer-editorial-round"
 every = "12h"
-to = "@yapper"
-message = "Host one small campfire: invite a bounded, reversible, public-safe conversation or playful synthesis connecting an agent or loose end; keep public posting authorized, and say `nothing worth doing` if no spark is worth pursuing."
+to = "@writer"
+message = "Review current publishing requests and take one bounded writing assignment. Produce clear, well-structured copy from supplied evidence; return the draft to elder unless the account and venue are explicitly authorized, and say `nothing worth doing` if no request is ready."
 overlap = "skip"

@@ -167,10 +167,10 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
                 "capacity": 3,
             },
             {
-                "slug": "yapper",
+                "slug": "writer",
                 "kind": "agent",
                 "reports_to": "elder",
-                "profile_template": "yapper",
+                "profile_template": "writer",
                 "specialty": "publishing",
                 "persistent": True,
                 "capacity": 1,
@@ -348,10 +348,10 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
             {
                 ("elder", "persistent", "elder"),
                 ("explorer", "persistent", "explorer"),
-                ("yapper", "persistent", "yapper"),
+                ("writer", "persistent", "writer"),
             },
         )
-        for actor in ("elder", "explorer", "yapper"):
+        for actor in ("elder", "explorer", "writer"):
             self.assertEqual(
                 self.connection.execute(
                     "SELECT COUNT(*) FROM actor_leases WHERE actor_slug=? AND released_at IS NULL", (actor,)
@@ -704,16 +704,16 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         persistent = reserve_terminal(
             self.connection,
             self.config,
-            actor="yapper",
+            actor="writer",
             purpose_kind="persistent",
-            purpose_id="yapper",
+            purpose_id="writer",
             working_directory=self.config.project.path,
             budget_exempt=True,
         )
         work_run = reserve_terminal(
             self.connection,
             self.config,
-            actor="yapper",
+            actor="writer",
             purpose_kind="work",
             purpose_id=work_id,
             working_directory=self.config.project.path,
@@ -723,7 +723,7 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         self.connection.execute(
             "UPDATE terminal_runs SET state='live',profile_state='installed',backend_run_id=?,"
             "backend_terminal_id=?,updated_at=? WHERE id=?",
-            (f"workspace-{persistent['id']}", "yapper-persistent", now, persistent["id"]),
+            (f"workspace-{persistent['id']}", "writer-persistent", now, persistent["id"]),
         )
         execution = self.connection.execute(
             "INSERT INTO executions(work_id,number,base_sha,branch,worktree_path,state,created_at,updated_at)"
@@ -738,7 +738,7 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         self.connection.execute(
             "INSERT INTO assignments(work_id,execution_id,actor_slug,terminal_run_id,state,created_at,updated_at)"
             "VALUES(?,?,?,?,'open',?,?)",
-            (work_id, execution, "yapper", work_run["id"], now, now),
+            (work_id, execution, "writer", work_run["id"], now, now),
         )
         conversation = self.connection.execute(
             "SELECT id FROM conversations WHERE address=?", (f"work:{work_id}",)
@@ -751,14 +751,14 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         ).lastrowid
         assignment_delivery = self.connection.execute(
             "INSERT INTO deliveries(message_id,actor_slug,terminal_run_id,state,attempts,next_attempt_at)"
-            "VALUES(?,'yapper',?,'pending',0,?)",
+            "VALUES(?,'writer',?,'pending',0,?)",
             (assignment_message, work_run["id"], now),
         ).lastrowid
         self.assertIsNotNone(assignment_delivery)
         persisted = self.connection.execute(
             "SELECT actor_slug,terminal_run_id FROM deliveries WHERE id=?", (assignment_delivery,)
         ).fetchone()
-        self.assertEqual((persisted["actor_slug"], persisted["terminal_run_id"]), ("yapper", work_run["id"]))
+        self.assertEqual((persisted["actor_slug"], persisted["terminal_run_id"]), ("writer", work_run["id"]))
 
         await self.reconciler._wake(cast(int, assignment_delivery))
         delivery = self.connection.execute(
@@ -773,11 +773,11 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         self.connection.execute(
             "UPDATE terminal_runs SET state='live',profile_state='installed',backend_run_id=?,"
             "backend_terminal_id=?,updated_at=? WHERE id=?",
-            (f"workspace-{work_run['id']}", "yapper-work", utc_now(), work_run["id"]),
+            (f"workspace-{work_run['id']}", "writer-work", utc_now(), work_run["id"]),
         )
         await self.reconciler._wake(cast(int, assignment_delivery))
         self.assertEqual(self.fake.wakes, 1)
-        self.assertEqual(self.fake.wake_targets, ["yapper-work"])
+        self.assertEqual(self.fake.wake_targets, ["writer-work"])
         delivery = self.connection.execute(
             "SELECT state,attempts FROM deliveries WHERE id=?", (assignment_delivery,)
         ).fetchone()
@@ -811,7 +811,7 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
             ).fetchone()[0]
         )
         await self.reconciler._wake(cast(int, participant_delivery))
-        self.assertEqual(self.fake.wake_targets, ["yapper-work", "elder-persistent"])
+        self.assertEqual(self.fake.wake_targets, ["writer-work", "elder-persistent"])
         participant_wake = self.connection.execute(
             "SELECT terminal_run_id,result FROM wake_attempts WHERE delivery_id=?",
             (participant_delivery,),

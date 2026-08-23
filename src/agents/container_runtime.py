@@ -76,7 +76,11 @@ class ContainerRuntime:
     def validate_colima_version(self) -> None:
         result = _completed(("colima", "version"))
         first_line = result.stdout.splitlines()[0].split() if result.stdout.splitlines() else []
-        if first_line != ["colima", "version", "0.10.3"]:
+        if (
+            len(first_line) != 3
+            or first_line[:2] != ["colima", "version"]
+            or first_line[2].removeprefix("v") != "0.10.3"
+        ):
             raise ContainerRuntimeError(
                 "Colima 0.10.3 is required; operator action: install the pinned version with `mise install colima@0.10.3`"
             )
@@ -368,7 +372,7 @@ class ContainerRuntime:
         chain = f"AGENTS-{instance[:12].upper()}"
         if create:
             self._ssh("sudo", "iptables", "-N", chain)
-            self._ssh("sudo", "iptables", "-N", f"AGENTS6-{instance[:12].upper()}")
+            self._ssh("sudo", "ip6tables", "-N", f"AGENTS6-{instance[:12].upper()}")
         elif (
             self._ssh("sudo", "iptables", "-S", chain, check=False).returncode
             or self._ssh("sudo", "ip6tables", "-S", f"AGENTS6-{instance[:12].upper()}", check=False).returncode
@@ -529,10 +533,30 @@ class ContainerRuntime:
                     parsed.append(tuple(tokens[2:]))
             return parsed
 
-        if chain_rules("iptables", chain) != rules:
+        def signature(rule: tuple[str, ...]) -> tuple[str, str, str, str, str]:
+            def value(option: str) -> str:
+                try:
+                    return rule[rule.index(option) + 1]
+                except ValueError, IndexError:
+                    return ""
+
+            return value("-s"), value("-d"), value("--dport"), value("--ctstate"), value("-j")
+
+        def owned(rule: tuple[str, ...]) -> bool:
+            try:
+                return rule[rule.index("--comment") + 1] == comment
+            except ValueError, IndexError:
+                return False
+
+        actual_chain = chain_rules("iptables", chain)
+        if (
+            len(actual_chain) != len(rules)
+            or not all(owned(rule) for rule in actual_chain)
+            or [signature(rule) for rule in actual_chain] != [signature(rule) for rule in rules]
+        ):
             raise ContainerRuntimeError("existing Colima profile has an unexpected Agents IPv4 firewall chain")
         docker_user = chain_rules("iptables", "DOCKER-USER")
-        if not docker_user or docker_user[0] != ipv4_jump:
+        if not docker_user or not owned(docker_user[0]) or signature(docker_user[0]) != signature(ipv4_jump):
             raise ContainerRuntimeError("existing Colima profile has an unsafe DOCKER-USER firewall order")
         expected_input = [
             (
@@ -574,12 +598,18 @@ class ContainerRuntime:
                 "REJECT",
             ),
         ]
-        if chain_rules("iptables", "INPUT")[:3] != expected_input:
+        actual_input = chain_rules("iptables", "INPUT")[:3]
+        if (
+            len(actual_input) != 3
+            or not all(owned(rule) for rule in actual_input)
+            or [signature(rule) for rule in actual_input] != [signature(rule) for rule in expected_input]
+        ):
             raise ContainerRuntimeError("existing Colima profile has an unsafe INPUT firewall order")
-        if chain_rules("ip6tables", ipv6_chain) != [("-m", "comment", "--comment", comment, "-j", "REJECT")]:
+        ipv6_rules = chain_rules("ip6tables", ipv6_chain)
+        if len(ipv6_rules) != 1 or not owned(ipv6_rules[0]) or signature(ipv6_rules[0])[-1] != "REJECT":
             raise ContainerRuntimeError("existing Colima profile has an unexpected Agents IPv6 firewall chain")
         ip6_user = chain_rules("ip6tables", "DOCKER-USER")
-        if not ip6_user or ip6_user[0] != ipv6_jump:
+        if not ip6_user or not owned(ip6_user[0]) or signature(ip6_user[0]) != signature(ipv6_jump):
             raise ContainerRuntimeError("existing Colima profile has an unsafe IPv6 DOCKER-USER firewall order")
 
 
@@ -1041,6 +1071,8 @@ class ContainerizedHerdrBackend:
         if existing is not None:
             if existing != manifest:
                 raise ExecutionConflict("container_manifest", "existing container manifest identity differs")
+            if self.runtime.inspect_container(name) is not None:
+                self._verify(existing)
         else:
             if self.runtime.inspect_container(name) is not None:
                 raise ExecutionConflict(

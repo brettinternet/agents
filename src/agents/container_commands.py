@@ -468,7 +468,18 @@ def gc(config: AgentsConfig) -> dict[str, object]:
     connection = connect(config.db_path)
     try:
         migrate(connection)
-        return ContainerGarbageCollector(config, connection).collect()
+        result = ContainerGarbageCollector(config, connection).collect()
+        for message in result.get("cleanup_errors", []):
+            now = utc_now()
+            connection.execute(
+                "INSERT INTO incidents(kind,entity_kind,entity_id,severity,state,summary,details_json,"
+                "created_at,updated_at) VALUES('container_gc_refused','container','gc','high','open',?,'{}',?,?) "
+                "ON CONFLICT(kind,entity_kind,entity_id) WHERE state='open' "
+                "DO UPDATE SET summary=excluded.summary,updated_at=excluded.updated_at",
+                (str(message), now, now),
+            )
+        connection.commit()
+        return result
     finally:
         connection.close()
 

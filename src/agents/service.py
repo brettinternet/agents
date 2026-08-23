@@ -150,12 +150,18 @@ def _owned(path: Path) -> tuple[int, dict[str, object]] | None:
         raise ServiceError(f"cannot read service ownership record {path}: {exc}") from exc
     try:
         record = json.loads(raw_record)
-        pid = int(record["pid"])
-        if pid <= 0:
-            raise ValueError("pid must be positive")
-        expected = str(record["executable"])
-        started = str(record["started"])
-    except (TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+        if not isinstance(record, dict):
+            raise TypeError("record must be a JSON object")
+        pid = record["pid"]
+        expected = record["executable"]
+        started = record["started"]
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            raise TypeError("pid must be a positive integer")
+        if not isinstance(expected, str) or not expected or not Path(expected).is_absolute():
+            raise TypeError("executable must be an absolute path")
+        if not isinstance(started, str) or not started:
+            raise TypeError("started must be a non-empty string")
+    except (TypeError, KeyError, json.JSONDecodeError) as exc:
         raise ServiceError(f"invalid service ownership record {path}: {exc}") from exc
     try:
         os.kill(pid, 0)

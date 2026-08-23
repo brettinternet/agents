@@ -155,6 +155,24 @@ class ServiceTests(unittest.TestCase):
             finally:
                 first.close()
 
+    def test_owned_rejects_malformed_field_types_before_inspecting_process(self) -> None:
+        invalid_records = (
+            {"pid": "123", "executable": "/missing", "started": "old"},
+            {"pid": 123, "executable": "", "started": "old"},
+            {"pid": 123, "executable": "/missing", "started": ""},
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            pidfile = Path(temporary) / "service.pid"
+            for record in invalid_records:
+                with self.subTest(record=record):
+                    pidfile.write_text(json.dumps(record))
+                    with (
+                        patch("agents.service.os.kill") as inspect,
+                        self.assertRaisesRegex(ServiceError, "invalid service ownership record"),
+                    ):
+                        _owned(pidfile)
+                    inspect.assert_not_called()
+
     def test_owned_returns_none_when_recorded_process_is_gone(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             pidfile = Path(temporary) / "service.pid"

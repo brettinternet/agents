@@ -6,6 +6,7 @@ Agents credentials through its process environment. Each wake is acknowledged
 only after the role's fenced HTTP action has a definitive response; repeated
 wakes replay the same request IDs and are therefore harmless.
 """
+
 from __future__ import annotations
 
 import json
@@ -49,11 +50,65 @@ def _request(method: str, path: str, body: dict[str, Any] | None = None) -> tupl
     except urllib.error.HTTPError as exc:
         try:
             value = json.loads(exc.read())
-        except (json.JSONDecodeError, UnicodeDecodeError):
+        except json.JSONDecodeError, UnicodeDecodeError:
             value = {"error": str(exc)}
         return exc.code, value
     except (OSError, ValueError) as exc:
         return 0, {"error": str(exc)}
+
+
+def _secret_boundary() -> None:
+    if "TEST_SECRET" in os.environ:
+        raise RuntimeError("managed secret leaked into provider environment")
+    status, value = _request("POST", "/agent/v1/secrets/list", {})
+    names = _data(value).get("names", []) if isinstance(_data(value), dict) else []
+    if status != 200 or names != ["TEST_SECRET"]:
+        raise RuntimeError(f"secret list failed: HTTP {status}")
+    invalid_status, _ = _request("POST", "/agent/v1/secrets/reveal", {"name": "UNDECLARED_SECRET"})
+    if invalid_status != 403:
+        raise RuntimeError(f"undeclared secret was not rejected: HTTP {invalid_status}")
+    request = urllib.request.Request(
+        f"{BASE}/agent/v1/secrets/list",
+        data=b"{}",
+        method="POST",
+        headers={
+            "Authorization": "Bearer wrong-token",
+            "X-Agents-Execution-ID": EXECUTION_ID,
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        urllib.request.urlopen(request, timeout=10)
+    except urllib.error.HTTPError as exc:
+        if exc.code != 401:
+            raise RuntimeError(f"wrong secret token returned HTTP {exc.code}") from exc
+    else:
+        raise RuntimeError("wrong secret token was accepted")
+    result = subprocess.run(
+        [
+            "task",
+            "--taskfile",
+            "/opt/agents/Taskfile.dist.yaml",
+            "secrets:run",
+            "--",
+            "TEST_SECRET",
+            "--",
+            "/opt/agents/.venv/bin/python",
+            "-c",
+            (
+                "import os,sys;"
+                "sys.stdout.write('secret-child-ok' if os.environ.get('TEST_SECRET')=='smoke-only-secret' else 'bad');"
+                "raise SystemExit(0 if os.environ.get('TEST_SECRET')=='smoke-only-secret' else 1)"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0 or result.stdout != "secret-child-ok":
+        raise RuntimeError(f"secret child failed with exit {result.returncode}")
+    if "TEST_SECRET" in os.environ:
+        raise RuntimeError("managed secret persisted in provider environment")
 
 
 def _data(value: Any) -> Any:
@@ -187,6 +242,8 @@ def _work_step(assignment: dict[str, Any]) -> list[str]:
         return []
     marker = worktree / "smoke-delivery.txt"
     if not marker.exists():
+        if os.environ.get("AGENTS_SECRETS_TRANSPORT") == "agent-api":
+            _secret_boundary()
         marker.write_text("deterministic mock provider delivery\n", encoding="utf-8")
         _git(str(worktree), "add", marker.name)
         _git(

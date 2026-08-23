@@ -245,6 +245,7 @@ def _initialize_standalone(
 ) -> bool:
     """Create or adopt an isolated shallow repository; return whether created."""
     _assert_nonsymlinked(path, label="isolated repository")
+    restore_empty = False
     if path.exists():
         if not path.is_dir():
             raise GitError("isolated repository path is not a directory")
@@ -258,21 +259,29 @@ def _initialize_standalone(
             elif _current_branch(path) != branch:
                 raise GitError("isolated repository is on the wrong branch")
             return False
+        restore_empty = True
     else:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.mkdir()
-    git(path, "init")
-    _copy_local_identity(project, path)
-    git(path, "fetch", "--depth=1", "--no-tags", str(project), target_sha)
-    if branch is None:
-        git(path, "checkout", "--detach", target_sha)
-    else:
-        git(path, "checkout", "-b", branch, target_sha)
-    _standalone_git_dir(path)
-    if head_sha(path) != target_sha:
-        raise GitError("isolated repository does not match expected HEAD")
-    if branch is not None and _current_branch(path) != branch:
-        raise GitError("isolated repository is on the wrong branch")
+    try:
+        git(path, "init")
+        _copy_local_identity(project, path)
+        git(path, "fetch", "--depth=1", "--no-tags", str(project), target_sha)
+        if branch is None:
+            git(path, "checkout", "--detach", target_sha)
+        else:
+            git(path, "checkout", "-b", branch, target_sha)
+        _standalone_git_dir(path)
+        if head_sha(path) != target_sha:
+            raise GitError("isolated repository does not match expected HEAD")
+        if branch is not None and _current_branch(path) != branch:
+            raise GitError("isolated repository is on the wrong branch")
+    except GitError, OSError:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+            if restore_empty:
+                path.mkdir()
+        raise
     return True
 
 
@@ -296,6 +305,17 @@ def _assert_managed_workspace(config: Any, project: Path, path: Path) -> None:
         candidate.relative_to(root)
     except ValueError as exc:
         raise GitError("refusing to remove unmanaged workspace") from exc
+    raw_root = Path(getattr(config, "root", root)).absolute()
+    raw_candidate = path.absolute()
+    try:
+        raw_candidate.relative_to(raw_root)
+    except ValueError as exc:
+        raise GitError("recorded workspace is outside the managed root") from exc
+    current = raw_candidate
+    while current != raw_root:
+        if current.is_symlink():
+            raise GitError("recorded workspace has a symlinked ancestor")
+        current = current.parent
 
 
 def reserve_execution_workspace(
@@ -313,7 +333,7 @@ def reserve_execution_workspace(
     base = branch_sha(project, default_branch)
     branch = f"agents/{item_id.lower()}/{number}"
     branch_ref = f"refs/heads/{branch}"
-    _assert_nonsymlinked(path, label="recorded workspace")
+    _assert_managed_workspace(config, project, path)
     existing_branch_sha = _ref_sha(project, branch_ref)
     if existing_branch_sha is not None and existing_branch_sha != base:
         raise GitError("recorded branch exists at unexpected base")
@@ -335,6 +355,7 @@ def add_agent_snapshot(config: Any, project: Path, target_sha: str, path: Path) 
     if not _container_mode(config):
         add_detached(project, target_sha, path)
         return
+    _assert_managed_workspace(config, project, path)
     _initialize_standalone(project, target_sha, path)
 
 

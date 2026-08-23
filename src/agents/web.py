@@ -9,6 +9,7 @@ import json
 import os
 import pty
 import sqlite3
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -37,7 +38,6 @@ from .container_runtime import (
     ContainerizedHerdrBackend,
     ContainerRuntimeError,
     build_execution_backend,
-    container_name,
 )
 from .db import MutationConflict, canonical_json, connect, migrate, mutation, utc_now
 from .delivery import Delivery
@@ -138,6 +138,8 @@ def _agent(
         raise HTTPException(401, detail=error("unauthenticated", "agent credentials required"))
     connection: sqlite3.Connection = request.app.state.connection
     project = connection.execute("SELECT instance_id FROM project WHERE id=1").fetchone()
+    if project is None:
+        raise HTTPException(401, detail=error("unauthenticated", "agent project identity is unavailable"))
     try:
         key = getattr(request.app.state, "agent_auth_key", None)
         if key is None:
@@ -161,6 +163,34 @@ AgentAuth = Annotated[AgentContext, Depends(_agent)]
 def _require_secret_access(context: AgentContext) -> None:
     if context.purpose_kind not in {"work", "review"}:
         raise HTTPException(403, detail=error("unauthorized", "execution is not authorized to access managed secrets"))
+
+
+def _verify_secret_container(request: Request, context: AgentContext) -> None:
+    config = request.app.state.config
+    if str(config.execution.isolation) != "container":
+        return
+    row = request.app.state.connection.execute(
+        "SELECT execution_name,generation,execution_backend,container_image_id FROM terminal_runs WHERE id=?",
+        (context.terminal_run_id,),
+    ).fetchone()
+    try:
+        if (
+            row is None
+            or row["execution_backend"] != "herdr-container"
+            or not str(row["container_image_id"]).startswith("sha256:")
+        ):
+            raise AuthenticationError("container execution identity is unavailable")
+        candidate = build_execution_backend(config)
+        if not isinstance(candidate, ContainerizedHerdrBackend):
+            raise AuthenticationError("container execution backend is unavailable")
+        candidate.verified_container_name(
+            str(row["execution_name"]),
+            context.terminal_run_id,
+            int(row["generation"]),
+            str(row["container_image_id"]),
+        )
+    except (AuthenticationError, ExecutionError, OSError, ValueError) as exc:
+        raise HTTPException(401, detail=error("unauthenticated", str(exc))) from exc
 
 
 def _sensitive_names(root: Path) -> set[str]:
@@ -280,15 +310,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     failures = [failure for failure in failures if failure]
                     if failures:
                         raise ContainerRuntimeError("; ".join(failures))
-                except (ContainerRuntimeError, OSError, ValueError) as exc:
+                except Exception as exc:
                     now = utc_now()
-                    connection.execute(
-                        "INSERT INTO incidents("
-                        "kind,entity_kind,entity_id,severity,state,summary,details_json,created_at,updated_at"
-                        ") VALUES('container_gc_failed','container','global','high','open',?,'{}',?,?)",
-                        (str(exc), now, now),
-                    )
-                    connection.commit()
+                    try:
+                        connection.execute(
+                            "INSERT INTO incidents("
+                            "kind,entity_kind,entity_id,severity,state,summary,details_json,created_at,updated_at"
+                            ") VALUES('container_gc_failed','container','global','high','open',?,'{}',?,?)",
+                            (str(exc), now, now),
+                        )
+                        connection.commit()
+                    except sqlite3.Error as report_error:
+                        print(f"container GC failed: {exc}; incident reporting failed: {report_error}", file=sys.stderr)
                 await asyncio.sleep(gc_interval)
 
         gc_task = asyncio.create_task(collect_containers())
@@ -475,6 +508,7 @@ def create_app(config: AgentsConfig | None = None, connection: sqlite3.Connectio
     @app.post("/agent/v1/secrets/list")
     async def agent_secret_list(request: Request, context: AgentAuth):
         _require_secret_access(context)
+        _verify_secret_container(request, context)
         if await _json_body(request) != {}:
             raise HTTPException(400, detail=error("malformed_json", "request body must be exactly {}"))
         try:
@@ -487,6 +521,7 @@ def create_app(config: AgentsConfig | None = None, connection: sqlite3.Connectio
     @app.post("/agent/v1/secrets/check")
     async def agent_secret_check(request: Request, context: AgentAuth):
         _require_secret_access(context)
+        _verify_secret_container(request, context)
         if await _json_body(request) != {}:
             raise HTTPException(400, detail=error("malformed_json", "request body must be exactly {}"))
         try:
@@ -498,7 +533,10 @@ def create_app(config: AgentsConfig | None = None, connection: sqlite3.Connectio
     @app.post("/agent/v1/secrets/reveal")
     async def agent_secret_reveal(request: Request, context: AgentAuth):
         _require_secret_access(context)
+        _verify_secret_container(request, context)
         body = await _json_body(request)
+        if set(body) != {"name"}:
+            raise HTTPException(400, detail=error("malformed_json", "request body must contain exactly name"))
         name = _declared_secret(request, body.get("name"))
         try:
             value = broker_values(resolve_secret_paths(request.app.state.config.root), [name])[name]
@@ -509,7 +547,13 @@ def create_app(config: AgentsConfig | None = None, connection: sqlite3.Connectio
     @app.post("/agent/v1/secrets/set")
     async def agent_secret_set(request: Request, context: AgentAuth):
         _require_secret_access(context)
+        _verify_secret_container(request, context)
         body = await _json_body(request)
+        if set(body) != {"name", "value_base64"}:
+            raise HTTPException(
+                400,
+                detail=error("malformed_json", "request body must contain exactly name and value_base64"),
+            )
         name = _declared_secret(request, body.get("name"))
         encoded = body.get("value_base64")
         if not isinstance(encoded, str):
@@ -524,7 +568,10 @@ def create_app(config: AgentsConfig | None = None, connection: sqlite3.Connectio
     @app.post("/agent/v1/secrets/unset")
     async def agent_secret_unset(request: Request, context: AgentAuth):
         _require_secret_access(context)
+        _verify_secret_container(request, context)
         body = await _json_body(request)
+        if set(body) != {"name"}:
+            raise HTTPException(400, detail=error("malformed_json", "request body must contain exactly name"))
         name = _declared_secret(request, body.get("name"))
         try:
             unset_secret(resolve_secret_paths(request.app.state.config.root), name)
@@ -554,7 +601,8 @@ def create_app(config: AgentsConfig | None = None, connection: sqlite3.Connectio
             if context.purpose_kind not in {"work", "review"}:
                 raise AuthenticationError("execution is not authorized to access managed secrets")
             row = connection.execute(
-                "SELECT execution_name,generation,working_directory FROM terminal_runs WHERE id=?",
+                "SELECT execution_name,generation,working_directory,execution_backend,container_image_id "
+                "FROM terminal_runs WHERE id=?",
                 (context.terminal_run_id,),
             ).fetchone()
             if row is None:
@@ -562,17 +610,20 @@ def create_app(config: AgentsConfig | None = None, connection: sqlite3.Connectio
             docker_backend: ContainerizedHerdrBackend | None = None
             docker_container = ""
             if str(websocket.app.state.config.execution.isolation) == "container":
+                if row["execution_backend"] != "herdr-container" or not str(row["container_image_id"]).startswith(
+                    "sha256:"
+                ):
+                    raise AuthenticationError("container execution identity is unavailable")
                 candidate = build_execution_backend(websocket.app.state.config)
                 if not isinstance(candidate, ContainerizedHerdrBackend):
                     raise AuthenticationError("container execution backend is unavailable")
-                if candidate.find_run(str(row["execution_name"])) is None:
-                    raise AuthenticationError("container execution identity is unavailable")
-                docker_backend = candidate
-                docker_container = container_name(
-                    str(project[0]),
+                docker_container = candidate.verified_container_name(
+                    str(row["execution_name"]),
                     context.terminal_run_id,
                     int(row["generation"]),
+                    str(row["container_image_id"]),
                 )
+                docker_backend = candidate
             child_cwd = Path(str(row["working_directory"]))
             if child_cwd.is_symlink() or not child_cwd.is_dir():
                 raise AuthenticationError("execution workspace is unsafe")
@@ -587,7 +638,9 @@ def create_app(config: AgentsConfig | None = None, connection: sqlite3.Connectio
             argv = initial.get("argv") if isinstance(initial, dict) else None
             tty = initial.get("tty") if isinstance(initial, dict) else None
             if (
-                not isinstance(names, list)
+                not isinstance(initial, dict)
+                or set(initial) != {"names", "argv", "tty"}
+                or not isinstance(names, list)
                 or not names
                 or not all(isinstance(name, str) for name in names)
                 or len(names) != len(set(names))

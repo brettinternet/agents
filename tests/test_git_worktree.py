@@ -232,10 +232,9 @@ class GitWorktreeTests(unittest.TestCase):
 
         outside_config = self._config(root=self.root / "managed")
         outside = self.root / "outside"
-        reserve_execution_workspace(outside_config, self.repo, "main", "OUTSIDE", 1, outside)
-        with self.assertRaises(GitError):
-            remove_recorded_workspace(outside_config, self.repo, outside, self.base)
-        self.assertTrue(outside.exists())
+        with self.assertRaisesRegex(GitError, "unmanaged workspace"):
+            reserve_execution_workspace(outside_config, self.repo, "main", "OUTSIDE", 1, outside)
+        self.assertFalse(outside.exists())
 
         real = self.root / "managed" / "real"
         reserve_execution_workspace(config, self.repo, "main", "REAL", 1, real)

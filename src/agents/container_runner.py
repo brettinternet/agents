@@ -20,9 +20,15 @@ def _required(name: str) -> str:
 
 def _write_secret(path: Path, value: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if path.exists() and path.is_symlink():
+    if path.is_symlink() or path.parent.is_symlink():
         raise ContainerRuntimeError(f"unsafe credential path: {path}")
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise ContainerRuntimeError(f"unsafe credential path: {path}") from exc
     try:
         os.write(descriptor, value.encode())
     finally:
@@ -57,6 +63,10 @@ def _metadata() -> tuple[ContainerRuntime, dict[str, Any]]:
     return runtime, {"labels": labels, "env_names": env_names}
 
 
+def _path_has_symlink(path: Path) -> bool:
+    return path.is_symlink() or path.parent.is_symlink()
+
+
 def run(argv: tuple[str, ...] | None = None) -> int:
     arguments = tuple(sys.argv if argv is None else argv)
     agent = Path(arguments[0]).name
@@ -67,11 +77,18 @@ def run(argv: tuple[str, ...] | None = None) -> int:
     runtime, metadata = _metadata()
     name = _required("AGENTS_CONTAINER_NAME")
     image_id = _required("AGENTS_CONTAINER_IMAGE_ID")
-    cwd = Path(_required("AGENTS_CONTAINER_CWD")).resolve()
-    runtime_dir = Path(_required("AGENTS_CONTAINER_RUNTIME")).resolve()
-    user = _required("AGENTS_CONTAINER_USER")
-    if cwd.is_symlink() or not cwd.is_dir() or runtime_dir.is_symlink() or not runtime_dir.is_dir():
+    raw_cwd = Path(_required("AGENTS_CONTAINER_CWD"))
+    raw_runtime_dir = Path(_required("AGENTS_CONTAINER_RUNTIME"))
+    if (
+        _path_has_symlink(raw_cwd)
+        or not raw_cwd.is_dir()
+        or _path_has_symlink(raw_runtime_dir)
+        or not raw_runtime_dir.is_dir()
+    ):
         raise ContainerRuntimeError("container bind path is unsafe")
+    cwd = raw_cwd.resolve()
+    runtime_dir = raw_runtime_dir.resolve()
+    user = _required("AGENTS_CONTAINER_USER")
 
     home = runtime_dir / "home"
     provider_dir = runtime_dir / "provider"
@@ -128,7 +145,16 @@ def run(argv: tuple[str, ...] | None = None) -> int:
     for name_to_pass in sorted(set(metadata["env_names"]) - blocked):
         if name_to_pass in os.environ:
             docker.extend(("--env", name_to_pass))
-    docker.extend(("--env", f"HOME={home}", "--env", "AGENTS_SECRETS_TRANSPORT=agent-api"))
+    docker.extend(
+        (
+            "--env",
+            f"HOME={home}",
+            "--env",
+            "AGENTS_SECRETS_TRANSPORT=agent-api",
+            "--env",
+            "AGENTS_SECRETS_CLI=/opt/agents/.venv/bin/python -m agents.secret_store",
+        )
+    )
     if agent == "claude":
         docker.extend(("--env", f"AGENTS_CLAUDE_TOKEN_FILE={provider_dir / 'claude-token'}"))
     command = {"opencode": "opencode", "claude": "/opt/agents/bin/claude-entrypoint", "mock_cli": "mock_cli"}[agent]

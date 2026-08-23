@@ -12,7 +12,7 @@ from typing import Any
 
 from .auth import derive_agent_token, read_private_secret, token_digest
 from .config import AgentsConfig, IsolationMode
-from .container_runtime import ContainerRuntime, build_execution_backend
+from .container_runtime import ContainerizedHerdrBackend, ContainerRuntime, build_execution_backend
 from .db import canonical_json, utc_now
 from .execution import (
     ExecutionBackend,
@@ -28,7 +28,7 @@ from .execution import (
     RunSnapshot,
     RunSpec,
 )
-from .git_worktree import GitError, head_sha, remove_recorded_workspace
+from .git_worktree import GitError, remove_recorded_workspace
 from .profiles import (
     PROVIDER_CAPABILITIES,
     ProfileError,
@@ -272,6 +272,7 @@ class Reconciler:
         self._inflight: dict[str, asyncio.Task[Any]] = {}
         self._launch_locks: dict[int, asyncio.Lock] = {}
         self._profile_lock = asyncio.Lock()
+        self._backend_launch_lock = asyncio.Lock()
         self._recovered_checks = False
 
     def _spawn(self, key: str, coro: Any) -> None:
@@ -562,6 +563,7 @@ class Reconciler:
                 mcp_command=(
                     "/opt/agents/.venv/bin/agents-mcp-server"
                     if self.config.execution.isolation is IsolationMode.CONTAINER
+                    or os.environ.get("AGENTS_SYSTEM_CONTAINER") == "1"
                     else None
                 ),
             )
@@ -659,7 +661,8 @@ class Reconciler:
                 str(run["container_image_id"] or ""),
             )
             posted = True
-            snapshot = await asyncio.to_thread(self.backend.create_run, spec)
+            async with self._backend_launch_lock:
+                snapshot = await asyncio.to_thread(self.backend.create_run, spec)
             if not self._snapshot_matches(run, snapshot, agent_name=agent_name, agent_kind=kind, mock=mock):
                 raise ExecutionConflict("identity_mismatch", "backend created a mismatched run")
             now = utc_now()
@@ -931,6 +934,9 @@ class Reconciler:
     async def _spec_for_uncertain_run(self, run: sqlite3.Row) -> RunSpec:
         run_id = int(run["id"])
         generation = int(run["generation"])
+        container_image_id = str(run["container_image_id"] or "")
+        if self.config.execution.isolation is IsolationMode.CONTAINER and not container_image_id.startswith("sha256:"):
+            raise ExecutionConflict("container_image", "uncertain container run has no immutable image identity")
         key = bytes.fromhex(read_private_secret(self.config.state_dir / "agent-auth-key"))
         token = derive_agent_token(key, str(run["instance_id"]), run_id, generation)
         materialized = await asyncio.to_thread(
@@ -950,6 +956,7 @@ class Reconciler:
             mcp_command=(
                 "/opt/agents/.venv/bin/agents-mcp-server"
                 if self.config.execution.isolation is IsolationMode.CONTAINER
+                or os.environ.get("AGENTS_SYSTEM_CONTAINER") == "1"
                 else None
             ),
         )
@@ -990,7 +997,7 @@ class Reconciler:
             tuple(sorted(environment.items())),
             provider,
             provider == "mock_cli",
-            str(run["container_image_id"] or ""),
+            container_image_id,
         )
 
     async def _adopt(self, run_id: int) -> None:
@@ -1034,7 +1041,8 @@ class Reconciler:
             if empty_shell:
                 try:
                     spec = await self._spec_for_uncertain_run(run)
-                    snapshot = await asyncio.to_thread(self.backend.create_run, spec)
+                    async with self._backend_launch_lock:
+                        snapshot = await asyncio.to_thread(self.backend.create_run, spec)
                 except ExecutionUnavailable, ExecutionBusy, ExecutionTimeout:
                     return
                 except ExecutionError as exc:
@@ -1326,11 +1334,23 @@ class Reconciler:
                             "backend run cwd changed; cleanup is unsafe",
                         )
                         return
+                    self._record_backend_handle(run_id, snapshot.handle, snapshot.revision)
                     handle = snapshot.handle
-                    self._record_backend_handle(run_id, handle, snapshot.revision)
             if handle is not None:
                 try:
                     await asyncio.to_thread(self.backend.delete_run, handle)
+                except ExecutionUnavailable, ExecutionBusy, ExecutionTimeout:
+                    return
+                except ExecutionError as exc:
+                    self._incident("terminal_cleanup_failed", "terminal", str(run_id), str(exc))
+                    return
+            elif isinstance(self.backend, ContainerizedHerdrBackend):
+                try:
+                    await asyncio.to_thread(
+                        self.backend.cleanup_run,
+                        str(row["execution_name"]),
+                        remove_runtime=False,
+                    )
                 except ExecutionUnavailable, ExecutionBusy, ExecutionTimeout:
                     return
                 except ExecutionError as exc:
@@ -1362,6 +1382,26 @@ class Reconciler:
             except (OSError, ProfileError) as exc:
                 self._incident("profile_cleanup_failed", "terminal", str(run_id), str(exc))
                 return
+            if row["purpose_kind"] == "consultation":
+                consultation = self.connection.execute(
+                    "SELECT target_sha FROM consultations WHERE id=? AND terminal_run_id=?",
+                    (row["purpose_id"], run_id),
+                ).fetchone()
+                target_sha = str(consultation["target_sha"] or "") if consultation is not None else ""
+                workspace = Path(str(row["working_directory"]))
+                if target_sha and workspace.exists():
+                    try:
+                        await asyncio.to_thread(
+                            remove_recorded_workspace,
+                            self.config,
+                            self.config.project.path,
+                            workspace,
+                            target_sha,
+                            allow_dirty=True,
+                        )
+                    except (GitError, OSError) as exc:
+                        self._incident("consultation_cleanup_mismatch", "worktree", str(workspace), str(exc))
+                        return
             now = utc_now()
             self.connection.execute(
                 "UPDATE terminal_artifacts SET state='removed',updated_at=? "
@@ -1647,14 +1687,22 @@ class Reconciler:
             self._spawn(f"cleanup:{run_id}", self._cleanup_terminal(run_id))
         try:
             for row in self.connection.execute(
-                "SELECT e.worktree_path FROM executions e JOIN work_items w ON w.id=e.work_id "
+                "SELECT e.worktree_path,COALESCE(("
+                "SELECT s.commit_sha FROM submissions s WHERE s.execution_id=e.id "
+                "ORDER BY s.id DESC LIMIT 1),e.base_sha) AS recorded_sha "
+                "FROM executions e JOIN work_items w ON w.id=e.work_id "
                 "WHERE w.status IN ('delivered','cancelled') AND e.updated_at<=?",
                 (cutoff_text,),
             ):
                 path = Path(str(row["worktree_path"]))
                 if path.exists():
                     try:
-                        remove_recorded_workspace(self.config, self.config.project.path, path, head_sha(path))
+                        remove_recorded_workspace(
+                            self.config,
+                            self.config.project.path,
+                            path,
+                            str(row["recorded_sha"]),
+                        )
                     except (GitError, OSError) as exc:
                         self._incident("worktree_cleanup_mismatch", "worktree", str(path), str(exc))
             for row in self.connection.execute(

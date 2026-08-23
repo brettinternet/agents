@@ -26,13 +26,19 @@ import httpx
 from agents import service
 from agents.cli import doctor
 from agents.config import AgentsConfig, load
-from agents.container_runtime import ContainerRuntime, build_execution_backend, container_name
+from agents.container_runtime import (
+    ContainerizedHerdrBackend,
+    ContainerRuntime,
+    build_execution_backend,
+    container_name,
+)
 from agents.db import connect, migrate
 from agents.reconciler import bootstrap_persistent_agents
 from agents.store import Store
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_BIN = ROOT / "tests" / "fixtures" / "bin"
+TOOL_HOME = Path.home()
 ORIGIN_URL = "git@github.com:brettinternet/agents.git"
 
 
@@ -114,7 +120,8 @@ def _assert_container_boundary(config: AgentsConfig) -> None:
     backend = build_execution_backend(config)
     rows = _db_rows(
         config,
-        "SELECT id,execution_name,generation,container_image_id FROM terminal_runs WHERE state='live' ORDER BY id",
+        "SELECT id,execution_name,generation,container_image_id,working_directory,agent_auth_id "
+        "FROM terminal_runs WHERE state='live' ORDER BY id",
     )
     if not rows:
         raise SmokeFailure("container boundary", "no live container run exists")
@@ -147,39 +154,76 @@ def _assert_container_boundary(config: AgentsConfig) -> None:
         ):
             raise SmokeFailure("container boundary", f"{name} has unexpected immutable identity or hardening")
         mounts = inspect.get("Mounts", ())
-        bind_destinations = {
-            str(mount.get("Destination")) for mount in mounts if isinstance(mount, dict) and mount.get("Type") == "bind"
+        binds = {
+            str(mount.get("Destination")): str(mount.get("Source"))
+            for mount in mounts
+            if isinstance(mount, dict) and mount.get("Type") == "bind"
         }
-        if len(bind_destinations) != 2 or any(
-            destination in bind_destinations
-            for destination in (
-                str(config.root.resolve()),
-                str(config.state_dir.resolve()),
-                str(Path.home()),
-                "/var/run/docker.sock",
-            )
-        ):
+        cwd = str(Path(str(row["working_directory"])).resolve())
+        runtime_dir = str((config.state_dir / "runtime" / str(row["agent_auth_id"])).resolve())
+        if binds != {cwd: cwd, runtime_dir: runtime_dir}:
             raise SmokeFailure("container boundary", f"{name} has an unexpected bind mount")
+        sentinel = f"agents-{instance[:12]}-network-smoke"
         runtime.docker(
-            "exec",
-            name,
-            "python",
+            "run",
+            "--detach",
+            "--name",
+            sentinel,
+            "--network",
+            "agents-system",
+            "--ip",
+            "172.30.1.3",
+            "--label",
+            f"dev.agents.instance={instance}",
+            "--label",
+            "dev.agents.smoke=network-sentinel",
+            expected_image,
+            "/opt/agents/.venv/bin/python",
             "-c",
-            (
-                "import socket,urllib.request\n"
-                f"urllib.request.urlopen('http://host.docker.internal:{config.web.port}/health',timeout=2).read()\n"
-                "def denied(address):\n"
-                "    sock=socket.socket()\n"
-                "    sock.settimeout(0.5)\n"
-                "    try:\n"
-                "        return sock.connect_ex(address)!=0\n"
-                "    finally:\n"
-                "        sock.close()\n"
-                "blocked=[('172.30.0.1',22),('172.30.1.3',8765),('169.254.169.254',80)]\n"
-                "results={address:denied(address) for address in blocked}\n"
-                "assert all(results.values()),results\n"
-            ),
+            "import socket;s=socket.socket();s.bind(('0.0.0.0',9891));s.listen();exec('while True:\\n c,_=s.accept();c.close()')",
         )
+        try:
+            runtime.docker(
+                "exec",
+                name,
+                "python",
+                "-c",
+                (
+                    "import os,socket,urllib.request\n"
+                    f"urllib.request.urlopen('http://host.docker.internal:{config.web.port}/health',timeout=2).read()\n"
+                    "urllib.request.urlopen('https://example.com/',timeout=5).read(1)\n"
+                    f"assert os.path.isdir({cwd!r}+'/.git')\n"
+                    f"assert not os.path.exists({str(config.root / '.env.sops-age')!r})\n"
+                    f"assert not os.path.exists({str(config.root / '.sops-isolated-home')!r})\n"
+                    "assert 'SSH_AUTH_SOCK' not in os.environ\n"
+                    "assert not os.path.exists('/var/run/docker.sock')\n"
+                    "def denied(address):\n"
+                    "    sock=socket.socket()\n"
+                    "    sock.settimeout(0.5)\n"
+                    "    try:\n"
+                    "        return sock.connect_ex(address)!=0\n"
+                    "    finally:\n"
+                    "        sock.close()\n"
+                    "blocked=[('172.30.0.1',22),('172.30.1.3',9891),('169.254.169.254',80)]\n"
+                    "results={address:denied(address) for address in blocked}\n"
+                    "assert all(results.values()),results\n"
+                ),
+            )
+        finally:
+            sentinel_inspect = runtime.inspect_container(sentinel)
+            sentinel_labels = (
+                sentinel_inspect.get("Config", {}).get("Labels", {}) if sentinel_inspect is not None else {}
+            )
+            if (
+                sentinel_inspect is None
+                or sentinel_labels.get("dev.agents.instance") != instance
+                or sentinel_labels.get("dev.agents.smoke") != "network-sentinel"
+            ):
+                raise SmokeFailure("container boundary", "network sentinel identity changed; refusing cleanup")
+            sentinel_id = sentinel_inspect.get("Id")
+            if not isinstance(sentinel_id, str) or not sentinel_id:
+                raise SmokeFailure("container boundary", "network sentinel has no immutable identity")
+            runtime.remove_container(sentinel, sentinel_id)
     original_image = expected_image
     alternate_image = runtime.resolve_image_id("agents-system-mock:local")
     if alternate_image == original_image:
@@ -194,6 +238,74 @@ def _assert_container_boundary(config: AgentsConfig) -> None:
     if runtime.resolve_image_id(container.image) != original_image:
         raise SmokeFailure("container retag", "configured image tag was not restored")
     _stage("container identity, hardening, network policy, and immutable retag adoption validated")
+
+
+def _assert_live_identity_conflict(config: AgentsConfig) -> None:
+    container = config.execution.container
+    if container is None:
+        raise SmokeFailure("identity conflict", "container configuration is absent")
+    instance_row = _db_row(config, "SELECT instance_id FROM project WHERE id=1")
+    row = _db_row(
+        config,
+        "SELECT id,execution_name,generation,container_image_id FROM terminal_runs "
+        "WHERE state='live' ORDER BY id LIMIT 1",
+    )
+    if instance_row is None or row is None:
+        raise SmokeFailure("identity conflict", "no live container identity is available")
+    instance = str(instance_row["instance_id"])
+    name = container_name(instance, int(row["id"]), int(row["generation"]))
+    runtime = ContainerRuntime(container)
+    backend = build_execution_backend(config)
+    if not isinstance(backend, ContainerizedHerdrBackend):
+        raise SmokeFailure("identity conflict", "container execution backend is unavailable")
+    backend.verified_container_name(
+        str(row["execution_name"]),
+        int(row["id"]),
+        int(row["generation"]),
+        str(row["container_image_id"]),
+    )
+    original_inspect = runtime.inspect_container(name)
+    original_id = original_inspect.get("Id") if original_inspect is not None else None
+    if not isinstance(original_id, str) or not original_id:
+        raise SmokeFailure("identity conflict", "live fixture has no immutable container identity")
+    runtime.remove_container(name, original_id)
+    runtime.docker(
+        "run",
+        "--detach",
+        "--name",
+        name,
+        "--label",
+        f"dev.agents.instance={instance}",
+        "--label",
+        "dev.agents.smoke=identity-conflict",
+        str(row["container_image_id"]),
+        "sleep",
+        "300",
+    )
+    try:
+        _wait(
+            "identity conflict revocation",
+            lambda: bool(
+                _db_row(
+                    config,
+                    "SELECT 1 FROM terminal_runs WHERE id=? AND token_revoked_at IS NOT NULL",
+                    (row["id"],),
+                )
+            ),
+        )
+        inspect = runtime.inspect_container(name)
+        labels = inspect.get("Config", {}).get("Labels", {}) if inspect is not None else {}
+        if labels.get("dev.agents.smoke") != "identity-conflict":
+            raise SmokeFailure("identity conflict", "reconciliation adopted or deleted the unverified fixture")
+    finally:
+        inspect = runtime.inspect_container(name)
+        labels = inspect.get("Config", {}).get("Labels", {}) if inspect is not None else {}
+        if labels.get("dev.agents.smoke") == "identity-conflict":
+            replacement_id = inspect.get("Id") if inspect is not None else None
+            if not isinstance(replacement_id, str) or not replacement_id:
+                raise SmokeFailure("identity conflict", "replacement fixture has no immutable container identity")
+            runtime.remove_container(name, replacement_id)
+    _stage("live wrong-label container was revoked and left untouched")
 
 
 def _wait(stage: str, predicate: Callable[[], bool], timeout: float = 60.0) -> None:
@@ -226,9 +338,14 @@ def _isolated_environment(config_path: Path, home: Path, xdg: Path) -> Iterator[
         "AGENTS_EXECUTION_ID",
         "AGENTS_ISOLATION",
         "AGENTS_CONTAINER_IMAGE",
+        "AGENTS_BROKER_SECRETS_ROOT",
+        "AGENTS_SECRETS_API_URL",
+        "AGENTS_SECRETS_TRANSPORT",
     ):
         os.environ.pop(name, None)
     fixture_path = str(FIXTURE_BIN)
+    broker_root = xdg / "broker"
+    broker_root.mkdir(parents=True, mode=0o700)
     os.environ.update(
         {
             "AGENTS_CONFIG": str(config_path),
@@ -239,6 +356,8 @@ def _isolated_environment(config_path: Path, home: Path, xdg: Path) -> Iterator[
             "PATH": fixture_path + os.pathsep + old.get("PATH", ""),
         }
     )
+    if config_path.is_file() and 'isolation = "container"' in config_path.read_text(encoding="utf-8"):
+        os.environ["AGENTS_BROKER_SECRETS_ROOT"] = str(broker_root)
     try:
         yield
     finally:
@@ -264,6 +383,43 @@ def _prepare_runtime(runtime: Path, config_path: Path) -> AgentsConfig:
         )
         executable.chmod(0o755)
     config = load(config_path, env={"AGENTS_PROVIDER": "mock"})
+    if str(config.execution.isolation) == "container":
+        (runtime / ".env.schema").write_text(
+            "# @defaultSensitive=false @defaultRequired=false\n# ---\n# @sensitive\nTEST_SECRET=\n",
+            encoding="utf-8",
+        )
+        (runtime / ".env.local").write_text("", encoding="utf-8")
+        (runtime / ".env.local").chmod(0o600)
+        tool_environment = {
+            "AGENTS_BROKER_SECRETS_ROOT": os.environ["AGENTS_BROKER_SECRETS_ROOT"],
+            "HOME": str(TOOL_HOME),
+            "PATH": os.environ["PATH"],
+        }
+        prepared = subprocess.run(
+            [
+                "mise",
+                "exec",
+                "age",
+                "sops",
+                "varlock",
+                "--",
+                sys.executable,
+                "-c",
+                (
+                    "import sys;"
+                    "from agents.secret_store import init_store,resolve_paths,set_secret_value;"
+                    f"paths=resolve_paths(__import__('pathlib').Path({str(runtime)!r}));"
+                    "init_store(paths);set_secret_value(paths,'TEST_SECRET',sys.stdin.buffer.read())"
+                ),
+            ],
+            input=b"smoke-only-secret",
+            capture_output=True,
+            env=tool_environment,
+            check=False,
+        )
+        if prepared.returncode != 0:
+            detail = prepared.stderr.decode("utf-8", errors="replace").strip()
+            raise SmokeFailure("secret fixture", detail or "unable to initialize isolated managed secret")
     config.state_dir.mkdir(parents=True, mode=0o700)
     config.state_dir.chmod(0o700)
     from agents.profiles import ensure_secret, validate_templates
@@ -386,7 +542,9 @@ def run(isolation: str = "host") -> None:
     config: AgentsConfig | None = None
     parent = ROOT if isolation == "container" else Path("/tmp")
     with (
-        tempfile.TemporaryDirectory(prefix=".agents-smoke-", dir=parent) as temporary,
+        tempfile.TemporaryDirectory(
+            prefix=".agents-smoke-" if isolation == "container" else "agents-smoke-", dir=parent
+        ) as temporary,
         tempfile.TemporaryDirectory(prefix="agents-smoke-home-", dir="/tmp") as private_temporary,
     ):
         runtime = Path(temporary)
@@ -634,6 +792,8 @@ def run(isolation: str = "host") -> None:
                         == "delivered"
                     ),
                 )
+                if isolation == "container":
+                    _assert_live_identity_conflict(config)
                 _assert_evidence(config, item_id)
                 _stage("delivery evidence complete", item_id)
             except SmokeFailure:

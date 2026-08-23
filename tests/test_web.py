@@ -312,6 +312,14 @@ class WebAuthTests(unittest.TestCase):
                 self.client.post(
                     "/agent/v1/secrets/reveal",
                     headers=headers("work"),
+                    json={"name": "TEST_SECRET", "extra": True},
+                ).status_code,
+                400,
+            )
+            self.assertEqual(
+                self.client.post(
+                    "/agent/v1/secrets/reveal",
+                    headers=headers("work"),
                     json={"name": "PUBLIC"},
                 ).status_code,
                 403,
@@ -340,6 +348,20 @@ class WebAuthTests(unittest.TestCase):
             self.assertEqual(listed.status_code, 200)
             self.assertEqual(listed.json()["data"]["names"], ["TEST_SECRET"])
         self.assertEqual(broker.call_count, 2)
+
+    def test_secret_run_rejects_extra_initial_fields(self):
+        (self.config.root / ".env.schema").write_text("# @sensitive\nTEST_SECRET=\n")
+        run_id = self._terminal_run("work", "AGENT-0001", "researcher-work-secret-ws")
+        context = AgentContext(run_id, "researcher", "work", "AGENT-0001", False)
+        with (
+            patch("agents.web.authenticate_agent", return_value=context),
+            self.client.websocket_connect(
+                "/agent/v1/secrets/run",
+                headers={"Authorization": "Bearer valid", "X-Agents-Execution-ID": "execution"},
+            ) as websocket,
+        ):
+            websocket.send_json({"names": ["TEST_SECRET"], "argv": ["python"], "tty": False, "extra": True})
+            self.assertEqual(websocket.receive_json(), {"error": "invalid run request"})
 
     def test_container_secret_run_passes_only_secret_names_to_docker(self):
         command = _container_secret_command(

@@ -104,7 +104,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.connection.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
         self.assertEqual(
             [row[0] for row in self.connection.execute("SELECT version FROM schema_migrations ORDER BY version")],
-            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
         )
         terminal_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(terminal_runs)")}
         self.assertTrue(
@@ -120,6 +120,8 @@ class DatabaseTests(unittest.TestCase):
             }
             <= terminal_columns
         )
+        consultation_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(consultations)")}
+        self.assertIn("target_sha", consultation_columns)
 
     def test_project_identity_is_immutable(self) -> None:
         first = initialize_project(self.connection, self.config)

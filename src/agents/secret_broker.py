@@ -12,6 +12,8 @@ from .web import create_secret_broker_app
 
 
 def main() -> None:
+    if os.environ.get("AGENTS_TOPOLOGY") != "compose" or os.environ.get("AGENTS_SYSTEM_CONTAINER") != "1":
+        raise RuntimeError("secret broker requires the marked whole-system Compose topology")
     config = load()
     db_path = Path(os.environ.get("AGENTS_BROKER_DB_PATH", config.db_path))
     auth_source = Path(os.environ.get("AGENTS_BROKER_AUTH_KEY_PATH", config.state_dir / "agent-auth-key"))

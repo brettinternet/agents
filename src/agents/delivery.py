@@ -134,29 +134,44 @@ class Delivery:
 
     def _persistent_terminal(self, actor: str) -> sqlite3.Row | None:
         return self.connection.execute(
-            "SELECT id FROM terminal_runs WHERE actor_slug=? AND purpose_kind='persistent' "
+            "SELECT id,working_directory FROM terminal_runs WHERE actor_slug=? AND purpose_kind='persistent' "
             "AND state='live' AND token_revoked_at IS NULL ORDER BY generation DESC LIMIT 1",
             (actor,),
         ).fetchone()
 
     def dispatch_consultation_next(self) -> dict[str, Any] | None:
         """Atomically assign one queued consultation and its terminal lease."""
+        created_workspaces: list[tuple[Path, str]] = []
         self.connection.execute("SAVEPOINT dispatch_consultation")
         try:
-            result = self._dispatch_consultation_next()
+            result = self._dispatch_consultation_next(created_workspaces)
             self.connection.execute("RELEASE SAVEPOINT dispatch_consultation")
             return result
         except _ReservationConflict:
             self.connection.execute("ROLLBACK TO SAVEPOINT dispatch_consultation")
             self.connection.execute("RELEASE SAVEPOINT dispatch_consultation")
+            self._remove_created_workspaces(created_workspaces)
             return None
         except BaseException:
             self.connection.execute("ROLLBACK TO SAVEPOINT dispatch_consultation")
             self.connection.execute("RELEASE SAVEPOINT dispatch_consultation")
+            self._remove_created_workspaces(created_workspaces)
             raise
 
-    def _dispatch_consultation_next(self) -> dict[str, Any] | None:
+    def _remove_created_workspaces(self, workspaces: list[tuple[Path, str]]) -> None:
+        for path, target_sha in reversed(workspaces):
+            if path.exists():
+                remove_recorded_workspace(
+                    self.config,
+                    self.config.project.path,
+                    path,
+                    target_sha,
+                    allow_dirty=False,
+                )
+
+    def _dispatch_consultation_next(self, created_workspaces: list[tuple[Path, str]]) -> dict[str, Any] | None:
         """Assign one queued consultation while respecting the global capacity."""
+        target_sha = ""
         active = int(self.connection.execute("SELECT COUNT(*) FROM consultations WHERE state='assigned'").fetchone()[0])
         if active >= self.config.runtime.max_consultations:
             return None
@@ -208,14 +223,10 @@ class Delivery:
                 terminal_run_id = int(persistent["id"])
             else:
                 working_directory = self.config.project.path
+                target_sha = ""
                 if str(self.config.execution.isolation) == "container":
                     working_directory = self.config.root / ".worktrees/consultation" / str(consultation["id"])
-                    add_agent_snapshot(
-                        self.config,
-                        self.config.project.path,
-                        branch_sha(self.config.project.path, self.config.project.default_branch),
-                        working_directory,
-                    )
+                    target_sha = branch_sha(self.config.project.path, self.config.project.default_branch)
                 run = reserve_terminal(
                     self.connection,
                     self.config,
@@ -225,11 +236,19 @@ class Delivery:
                     working_directory=working_directory,
                 )
                 terminal_run_id = int(run["id"])
+                if target_sha:
+                    add_agent_snapshot(
+                        self.config,
+                        self.config.project.path,
+                        target_sha,
+                        working_directory,
+                    )
+                    created_workspaces.append((working_directory, target_sha))
         now = utc_now()
         changed = self.connection.execute(
-            "UPDATE consultations SET responder=?,state='assigned',terminal_run_id=?,"
+            "UPDATE consultations SET responder=?,state='assigned',terminal_run_id=?,target_sha=?,"
             "version=version+1,updated_at=? WHERE id=? AND state='queued'",
-            (actor_slug, terminal_run_id, now, consultation["id"]),
+            (actor_slug, terminal_run_id, target_sha or None, now, consultation["id"]),
         )
         if changed.rowcount != 1:
             raise _ReservationConflict
@@ -798,10 +817,7 @@ class Delivery:
                 if actor is None or persistent is None:
                     self.connection.execute("RELEASE SAVEPOINT assign_review")
                     return False
-                reviewtree = self.config.root / ".worktrees/review" / f"{submission_id}-{gate}"
-                self._prepare_review_worktree(str(submission["commit_sha"]), reviewtree)
-
-                worktree_path = reviewtree
+                worktree_path = Path(str(persistent["working_directory"]))
                 terminal_run_id = int(persistent["id"])
             else:
                 actor = self.connection.execute(

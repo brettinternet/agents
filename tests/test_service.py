@@ -1,13 +1,24 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from agents.config import AgentsConfig, ExecutionConfig, ModelChoice, ProjectConfig, RuntimeConfig, WebConfig
+from agents.config import (
+    AgentsConfig,
+    ContainerConfig,
+    ExecutionConfig,
+    IsolationMode,
+    ModelChoice,
+    ProjectConfig,
+    RuntimeConfig,
+    WebConfig,
+)
 from agents.service import (
     ServiceError,
     _close_mapped_workspaces,
@@ -52,6 +63,58 @@ class ServiceTests(unittest.TestCase):
             ):
                 start(config)
             launch.assert_not_called()
+
+    def test_start_host_mode_does_not_probe_colima_when_container_config_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = _config(Path(temporary))
+            config = replace(
+                config,
+                execution=replace(
+                    config.execution,
+                    container=ContainerConfig("agents", "agents:test", 1, 512, 64, 60, 60, 24),
+                ),
+            )
+            config.state_dir.mkdir(mode=0o700)
+            config.db_path.touch()
+            with (
+                patch("agents.service._owned", return_value=(123, {})),
+                patch("agents.service._herdr_health", return_value=True),
+                patch("agents.service._web_health_ready", return_value=True),
+                patch("agents.service.shutil.which", return_value="/usr/local/bin/tool"),
+                patch("agents.container_runtime.ContainerRuntime") as runtime,
+            ):
+                start(config)
+            runtime.assert_not_called()
+
+    def test_start_container_mode_requires_runtime_prerequisites(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = _config(Path(temporary))
+            config = replace(
+                config,
+                execution=replace(
+                    config.execution,
+                    isolation=IsolationMode.CONTAINER,
+                    container=ContainerConfig("agents", "agents:test", 1, 512, 64, 60, 60, 24),
+                ),
+            )
+            config.state_dir.mkdir(mode=0o700)
+            connection = sqlite3.connect(config.db_path)
+            connection.execute("CREATE TABLE project(id INTEGER PRIMARY KEY, instance_id TEXT NOT NULL)")
+            connection.execute("INSERT INTO project VALUES(1,'instance')")
+            connection.commit()
+            connection.close()
+            runtime = Mock()
+            runtime.profile_state.return_value = "Running"
+            runtime.docker.return_value = ""
+            with (
+                patch("agents.container_runtime.ContainerRuntime", return_value=runtime),
+                patch("agents.service._owned", return_value=(123, {})),
+                patch("agents.service._herdr_health", return_value=True),
+                patch("agents.service._web_health_ready", return_value=True),
+            ):
+                start(config)
+            runtime.initialize.assert_called_once_with(config.root, "instance", config.web.port)
+            runtime.resolve_image_id.assert_called_once_with("agents:test")
 
     def test_start_accepts_running_herdr_and_starts_only_agentsd(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

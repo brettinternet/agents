@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 from collections.abc import Generator
 from dataclasses import dataclass
 from pathlib import Path
@@ -183,6 +184,9 @@ def _sops_env(paths: Paths) -> dict[str, str]:
             "SOPS_AGE_KEY_FILE": str(paths.key),
             "SOPS_DECRYPTION_ORDER": "age",
             "HOME": str(paths.isolated_home),
+            "SOPS_CONFIG": str(paths.config)
+            if paths.config.is_file() and not paths.config.is_symlink()
+            else "/dev/null",
             "XDG_CONFIG_HOME": str(paths.isolated_home),
         }
     )
@@ -208,9 +212,11 @@ def _config_text(recipient: str) -> str:
     )
 
 
-def _atomic_write(path: Path, data: bytes, *, mode: int = 0o644) -> None:
-    if _kind(path) != "missing":
-        raise SecretStoreError(f"refusing to replace existing path: {path}")
+def _atomic_write(path: Path, data: bytes, *, mode: int = 0o644, replace: bool = False) -> None:
+    kind = _kind(path)
+    if (not replace and kind != "missing") or (replace and kind != "file"):
+        action = "replace" if not replace else "update"
+        raise SecretStoreError(f"refusing to {action} existing path: {path}")
     old = os.umask(0o077)
     temporary: str | None = None
     try:
@@ -539,6 +545,11 @@ def set_secret_value(paths: Paths, name: str, value: bytes) -> None:
             input_bytes=json.dumps(decoded).encode("utf-8"),
             failure="unable to update the encrypted secret store",
         )
+        try:
+            normalized = _json_bytes(_parse_json(paths.store.read_bytes(), "updated encrypted secret store"))
+        except OSError as exc:
+            raise SecretStoreError(f"unable to read updated encrypted secret store: {exc.strerror}") from None
+        _atomic_write(paths.store, normalized, replace=True)
         _validate_schema(paths, _decrypt(paths))
 
 
@@ -624,11 +635,14 @@ def _agent_api_run(names: list[str], command: list[str]) -> int:
     try:
         with websocket_connect(url, additional_headers=_agent_api_headers()) as socket:
             socket.send(json.dumps({"names": names, "argv": command, "tty": sys.stdin.isatty()}))
-            if not sys.stdin.isatty():
-                data = sys.stdin.buffer.read()
-                if data:
-                    socket.send(data)
-            socket.send(json.dumps({"stdin_eof": True}))
+
+            def send_stdin() -> None:
+                while chunk := os.read(sys.stdin.fileno(), 65536):
+                    socket.send(chunk)
+                socket.send(json.dumps({"stdin_eof": True}))
+
+            sender = threading.Thread(target=send_stdin, name="agents-secret-stdin", daemon=True)
+            sender.start()
             for message in socket:
                 if isinstance(message, bytes):
                     if message[:1] == b"\x01":

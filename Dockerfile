@@ -40,6 +40,8 @@ WORKDIR /opt/agents
 COPY pyproject.toml uv.lock ./
 COPY src ./src
 COPY agents ./agents
+COPY agents.toml .env.schema Taskfile.dist.yaml ./
+COPY tests ./tests
 RUN uv sync --frozen --no-dev
 ENV PATH=/opt/agents/.venv/bin:/opt/agents/bin:/usr/local/bin:/usr/bin:/bin \
     PYTHONDONTWRITEBYTECODE=1 \

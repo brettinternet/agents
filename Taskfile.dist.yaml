@@ -8,7 +8,7 @@ vars:
   AGENTS_STATE_DIR: "{{.ROOT_DIR}}/.agents"
   PYTHON: "{{.ROOT_DIR}}/.venv/bin/python"
   ENV_RUN: mise exec varlock -- varlock run -p .env.schema -p .env.local --
-  SECRETS_CLI: mise exec python age sops varlock -- python src/agents/secret_store.py
+  SECRETS_CLI: '{{default "mise exec python age sops varlock -- python src/agents/secret_store.py" .AGENTS_SECRETS_CLI}}'
 
 env:
   UV_TOOL_DIR: "{{.UV_TOOL_DIR}}"

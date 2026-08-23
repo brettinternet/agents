@@ -7,14 +7,16 @@ import socket
 import sqlite3
 import sys
 import time
-import urllib.error
-import urllib.request
 import uuid
 from pathlib import Path
+from typing import Any
 
+import httpx
+
+from .auth import derive_agent_token, read_agent_auth_key, token_digest
 from .config import AgentsConfig
 from .container_runtime import ContainerGarbageCollector, ContainerRuntime, ContainerRuntimeError, _completed
-from .db import connect, migrate
+from .db import connect, migrate, utc_now
 from .git_worktree import identity as git_identity
 
 
@@ -42,8 +44,7 @@ def _runtime(config: AgentsConfig) -> ContainerRuntime:
 
 
 def _mount_root(config: AgentsConfig) -> Path:
-    common_dir = git_identity(config.project.path)[1]
-    return Path(os.path.commonpath((config.root.resolve(), common_dir.resolve())))
+    return config.root.resolve()
 
 
 def runtime_init(config: AgentsConfig) -> None:
@@ -119,37 +120,57 @@ def _secret_source_environment(config: AgentsConfig, provider: str, auth_file: P
     if root.is_symlink():
         raise ContainerCommandError("mock broker source path is unsafe")
     root.mkdir(mode=0o700, exist_ok=True)
-    age_key = root / "age-key"
-    store = root / "store"
-    sops_home = root / "sops-home"
-    sops_home.mkdir(mode=0o700, exist_ok=True)
-    for path, content in ((age_key, b"# mock broker has no age identity\n"), (store, b"{}\n")):
-        if path.is_symlink():
-            raise ContainerCommandError("mock broker source file is unsafe")
-        if not path.exists():
-            path.write_bytes(content)
-            path.chmod(0o600)
+    worktree = root / "worktree"
+    worktree.mkdir(mode=0o700, exist_ok=True)
+    schema = worktree / ".env.schema"
+    schema.write_text(
+        "# @defaultSensitive=false @defaultRequired=false\n# ---\n# @sensitive\nTEST_SECRET=\n",
+        encoding="utf-8",
+    )
+    from .secret_store import Paths, init_store, set_secret_value
+
+    paths = Paths(
+        worktree=worktree,
+        common_root=root,
+        config=root / "sops-config",
+        store=root / "store",
+        key=root / "age-key",
+        isolated_home=root / "sops-home",
+        lock=root / "lock",
+    )
+    if not paths.store.exists():
+        init_store(paths)
+        set_secret_value(paths, "TEST_SECRET", b"smoke-only-secret")
     return {
         **common,
-        "AGENTS_AGE_KEY_PATH": str(age_key),
-        "AGENTS_SOPS_HOME_PATH": str(sops_home),
-        "AGENTS_SECRET_STORE_PATH": str(store),
+        "AGENTS_ENV_SCHEMA_PATH": str(schema),
+        "AGENTS_SOPS_CONFIG_PATH": str(paths.config),
+        "AGENTS_AGE_KEY_PATH": str(paths.key),
+        "AGENTS_SOPS_HOME_PATH": str(paths.isolated_home),
+        "AGENTS_SECRET_STORE_PATH": str(paths.store),
     }
 
 
 def _compose_environment(config: AgentsConfig, topology_id: str, auth_file: Path) -> dict[str, str]:
     instance = _instance(config)
     provider = _provider(config)
+    repository = config.root.resolve()
+    common_dir = git_identity(config.project.path)[1].resolve()
+    try:
+        common_dir.relative_to(repository)
+    except ValueError as exc:
+        raise ContainerCommandError(
+            "whole-system Compose requires a standalone repository whose Git common directory is inside its root"
+        ) from exc
     environment = {
         **_runtime(config).docker_environment(),
         "AGENTS_INSTANCE_ID": instance,
         "AGENTS_TOPOLOGY_ID": topology_id,
-        "AGENTS_REPO_PATH": str(config.root.resolve()),
+        "AGENTS_REPO_PATH": str(repository),
         "AGENTS_UID": str(os.getuid()),
         "AGENTS_GID": str(os.getgid()),
         "AGENTS_PROVIDER": provider,
         "AGENTS_WEB_PORT": str(config.web.port),
-        "AGENTS_GIT_COMMON_DIR": str(git_identity(config.project.path)[1]),
         "AGENTS_SYSTEM_IMAGE": f"agents-system-{provider}:local",
         "AGENTS_SECRETS_IMAGE": "agents-secrets:local",
         "AGENTS_PROVIDER_AUTH_FILE": str(auth_file.resolve()),
@@ -175,7 +196,49 @@ def _topology_record(config: AgentsConfig) -> Path:
     return config.state_dir / "container-topology.json"
 
 
+def _write_topology_record(path: Path, value: dict[str, object], *, replace: bool = False) -> None:
+    data = json.dumps(value).encode()
+    if not replace:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(descriptor, data)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        return
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(descriptor, data)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.replace(temporary, path)
+
+
+def _verify_compose_project_scope(config: AgentsConfig, topology_id: str) -> None:
+    runtime = _runtime(config)
+    instance = _instance(config)
+    project = f"agents-{instance}"
+    names = runtime.docker(
+        "container",
+        "ls",
+        "--all",
+        "--filter",
+        f"label=com.docker.compose.project={project}",
+        "--format",
+        "{{.Names}}",
+    )
+    for name in names.splitlines():
+        inspect = runtime.inspect_container(name)
+        labels = inspect.get("Config", {}).get("Labels", {}) if inspect is not None else {}
+        if labels.get("dev.agents.instance") != instance or labels.get("dev.agents.topology") != topology_id:
+            raise ContainerCommandError("Compose project contains a container from a different topology")
+
+
 def _recover_dead_topology(config: AgentsConfig) -> None:
+    from . import service
+
     record = _topology_record(config)
     if record.exists() or record.is_symlink():
         if not record.is_file() or record.is_symlink():
@@ -184,8 +247,18 @@ def _recover_dead_topology(config: AgentsConfig) -> None:
             value = json.loads(record.read_text())
             topology_id = str(value["topology_id"])
             auth_file = Path(str(value["auth_file"]))
+            owner_pid = int(value["owner_pid"])
+            owner_started = str(value["owner_started"])
         except (OSError, KeyError, ValueError, json.JSONDecodeError) as exc:
             raise ContainerCommandError("whole-system topology ownership record is malformed") from exc
+        try:
+            owner_alive = service._process_started(owner_pid) == owner_started
+            if owner_alive:
+                os.kill(owner_pid, 0)
+        except OSError, service.ServiceError:
+            owner_alive = False
+        if owner_alive:
+            raise ContainerCommandError("whole-system topology owner is still running")
         runtime = _runtime(config)
         names = runtime.docker(
             "container",
@@ -198,43 +271,47 @@ def _recover_dead_topology(config: AgentsConfig) -> None:
             "--format",
             "{{.Names}}",
         )
-        if any(
-            bool(inspect.get("State", {}).get("Running"))
-            for name in names.splitlines()
-            if (inspect := runtime.inspect_container(name)) is not None
-        ):
-            raise ContainerCommandError("whole-system topology ownership record belongs to live containers")
+        for name in names.splitlines():
+            inspect = runtime.inspect_container(name)
+            labels = inspect.get("Config", {}).get("Labels") if inspect is not None else None
+            if (
+                not isinstance(labels, dict)
+                or labels.get("dev.agents.instance") != _instance(config)
+                or labels.get("dev.agents.topology") != topology_id
+            ):
+                raise ContainerCommandError("whole-system topology container identity is unsafe")
         expected = (config.state_dir / "runtime" / "system-auth").resolve()
         if auth_file.is_symlink() or auth_file.parent.resolve() != expected:
             raise ContainerCommandError("whole-system credential path is unsafe")
+        _verify_compose_project_scope(config, topology_id)
         _completed(
             ("docker", "compose", "-f", str(config.root / "compose.yaml"), "down", "--remove-orphans"),
             env=_compose_environment(config, topology_id, auth_file),
         )
         auth_file.unlink(missing_ok=True)
         record.unlink()
-
-    directory = config.state_dir / "runtime" / "system-auth"
-    if not directory.is_dir() or directory.is_symlink():
-        return
-    runtime = _runtime(config)
-    instance = _instance(config)
-    for candidate in directory.iterdir():
-        if candidate.is_symlink() or not candidate.is_file():
-            continue
-        containers = runtime.docker(
+    else:
+        runtime = _runtime(config)
+        remnants = runtime.docker(
             "container",
             "ls",
             "--all",
             "--filter",
-            f"label=dev.agents.instance={instance}",
+            f"label=dev.agents.instance={_instance(config)}",
             "--filter",
-            f"label=dev.agents.topology={candidate.name}",
+            "label=dev.agents.topology",
             "--format",
             "{{.Names}}",
         )
-        if not containers:
-            candidate.unlink()
+        if remnants:
+            raise ContainerCommandError("whole-system containers exist without an ownership record")
+
+    directory = config.state_dir / "runtime" / "system-auth"
+    if not directory.is_dir() or directory.is_symlink():
+        return
+    candidates = [candidate for candidate in directory.iterdir() if candidate.is_file() and not candidate.is_symlink()]
+    if candidates:
+        raise ContainerCommandError("whole-system credential files exist without provably dead ownership records")
 
 
 def _web_port_available(port: int) -> bool:
@@ -273,15 +350,26 @@ def start(config: AgentsConfig) -> None:
         os.write(descriptor, auth_value)
     finally:
         os.close(descriptor)
-    environment = _compose_environment(config, topology_id, auth_file)
+    try:
+        environment = _compose_environment(config, topology_id, auth_file)
+        _write_topology_record(
+            record,
+            {
+                "topology_id": topology_id,
+                "auth_file": str(auth_file),
+                "owner_pid": os.getpid(),
+                "owner_started": service._process_started(os.getpid()),
+            },
+        )
+    except BaseException:
+        auth_file.unlink(missing_ok=True)
+        raise
     janitor_process = None
     try:
         _completed(
             ("docker", "compose", "-f", str(config.root / "compose.yaml"), "up", "--detach", "--wait"),
             env=environment,
         )
-        record.write_text(json.dumps({"topology_id": topology_id, "auth_file": str(auth_file)}))
-        record.chmod(0o600)
         executable = config.root / ".venv" / "bin" / "python"
         janitor_process = service._launch_process(
             config,
@@ -289,6 +377,16 @@ def start(config: AgentsConfig) -> None:
             executable,
             ["-m", "agents.cli", "container", "janitor"],
             environment,
+        )
+        _write_topology_record(
+            record,
+            {
+                "topology_id": topology_id,
+                "auth_file": str(auth_file),
+                "owner_pid": janitor_process.pid,
+                "owner_started": service._process_started(janitor_process.pid),
+            },
+            replace=True,
         )
     except BaseException:
         try:
@@ -312,6 +410,7 @@ def start(config: AgentsConfig) -> None:
         if janitor_process is not None:
             service._stop_started_process(config, "container-janitor", janitor_process)
         with contextlib.suppress(ContainerRuntimeError):
+            _verify_compose_project_scope(config, topology_id)
             _completed(
                 ("docker", "compose", "-f", str(config.root / "compose.yaml"), "down", "--remove-orphans"),
                 env=environment,
@@ -337,10 +436,13 @@ def stop(config: AgentsConfig) -> None:
     if auth_file.is_symlink() or auth_file.parent.resolve() != expected:
         raise ContainerCommandError("whole-system credential path is unsafe")
     service._stop_named(config, "container-janitor")
+    _verify_compose_project_scope(config, topology_id)
     _completed(
         ("docker", "compose", "-f", str(config.root / "compose.yaml"), "down", "--remove-orphans"),
         env=_compose_environment(config, topology_id, auth_file),
     )
+    auth_file.unlink(missing_ok=True)
+    record.unlink(missing_ok=True)
     deadline = time.monotonic() + 10
     while not _web_port_available(config.web.port):
         if time.monotonic() >= deadline:
@@ -348,8 +450,6 @@ def stop(config: AgentsConfig) -> None:
                 f"web port 127.0.0.1:{config.web.port} remained occupied after whole-system shutdown"
             )
         time.sleep(0.1)
-    auth_file.unlink(missing_ok=True)
-    record.unlink(missing_ok=True)
 
 
 def status(config: AgentsConfig) -> str:
@@ -407,7 +507,10 @@ def _remove_stopped_topology_containers(config: AgentsConfig) -> list[str]:
             and labels.get("dev.agents.retention") == "ephemeral"
             and not bool(state.get("Running"))
         ):
-            runtime.remove_container(name)
+            container_id = inspect.get("Id")
+            if not isinstance(container_id, str) or not container_id:
+                raise ContainerCommandError(f"whole-system container {name!r} has no immutable identity")
+            runtime.remove_container(name, container_id)
             removed.append(name)
     return removed
 
@@ -423,25 +526,7 @@ def janitor(config: AgentsConfig) -> None:
                 print(result["trim_error"], flush=True)
         except (ContainerRuntimeError, OSError, sqlite3.Error, ValueError) as exc:
             print(f"container janitor: {exc}", flush=True)
-        time.sleep(3600)
-
-
-def reset(config: AgentsConfig) -> None:
-    from . import service
-
-    if _topology_record(config).exists() or any(service.status(config).values()):
-        raise ContainerCommandError("all Agents topologies must be stopped before container:reset")
-    runtime = _runtime(config)
-    environment = _compose_environment(
-        config,
-        "reset",
-        config.state_dir / "runtime" / "system-auth" / "reset",
-    )
-    _completed(
-        ("docker", "compose", "-f", str(config.root / "compose.yaml"), "down", "--volumes", "--remove-orphans"),
-        env=environment,
-    )
-    _completed(("colima", "--profile", runtime.config.colima_profile, "delete", "--force"))
+        time.sleep(config.execution.container.gc_interval_seconds)
 
 
 def smoke(config: AgentsConfig, topology: str = "system") -> None:
@@ -487,16 +572,304 @@ def smoke(config: AgentsConfig, topology: str = "system") -> None:
         finally:
             runtime.initialize(_mount_root(config), instance, config.web.port)
         return
+
     runtime_init(config)
     if status(config) == "stopped":
         raise ContainerCommandError("whole-system topology is not running")
+    instance = _instance(config)
+    before_project = instance
+    before_volume = _verify_system_topology(config)
+    _verify_system_http(config)
+    runtime = _runtime(config)
+    agents_name = runtime.docker(
+        "container",
+        "ls",
+        "--filter",
+        f"label=dev.agents.instance={instance}",
+        "--filter",
+        "label=com.docker.compose.service=agents",
+        "--format",
+        "{{.Names}}",
+    )
+    if len(agents_name.splitlines()) != 1:
+        raise ContainerCommandError("whole-system Agents service identity is ambiguous")
+    runtime.docker(
+        "exec",
+        "--env",
+        "AGENTS_SECRETS_TRANSPORT=",
+        agents_name,
+        "/opt/agents/.venv/bin/python",
+        "-m",
+        "tests.smoke_e2e",
+        "--backend",
+        "herdr",
+        "--isolation",
+        "host",
+    )
+    _verify_system_secret_roundtrip(config, runtime, agents_name)
+    stop(config)
+    if _instance(config) != before_project:
+        raise ContainerCommandError("whole-system SQLite project identity changed while stopped")
+    start(config)
+    if _verify_system_topology(config) != before_volume:
+        raise ContainerCommandError("whole-system persistent Herdr volume changed across restart")
+    _verify_system_http(config)
+
+
+def _verify_system_secret_roundtrip(config: AgentsConfig, runtime: ContainerRuntime, agents_name: str) -> None:
+    connection = connect(config.db_path)
+    run_id: int | None = None
+    try:
+        actor = connection.execute("SELECT slug FROM actors WHERE kind='agent' ORDER BY slug LIMIT 1").fetchone()
+        project = connection.execute("SELECT instance_id FROM project WHERE id=1").fetchone()
+        if actor is None or project is None:
+            raise ContainerCommandError("whole-system secret smoke has no initialized agent identity")
+        now = utc_now()
+        purpose_id = f"system-secret-smoke-{uuid.uuid4().hex}"
+        cursor = connection.execute(
+            "INSERT INTO terminal_runs("
+            "execution_name,execution_backend,profile_name,mcp_name,profile_sha256,provider,model,"
+            "generation,actor_slug,purpose_kind,purpose_id,working_directory,token_digest,profile_state,state,"
+            "output_tail,launch_count,created_at,updated_at"
+            ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'',0,?,?)",
+            (
+                "reserved",
+                "herdr",
+                "reserved",
+                "reserved",
+                "",
+                config.execution.provider_id,
+                "",
+                1,
+                str(actor["slug"]),
+                "work",
+                purpose_id,
+                str(config.root),
+                "",
+                "installed",
+                "live",
+                now,
+                now,
+            ),
+        )
+        if cursor.lastrowid is None:
+            raise ContainerCommandError("whole-system secret smoke could not reserve an execution")
+        run_id = int(cursor.lastrowid)
+        execution_id = f"agents-{str(project['instance_id'])[:8]}-system-secret-smoke-{run_id}"
+        token = derive_agent_token(
+            read_agent_auth_key(config.state_dir / "agent-auth-key"),
+            str(project["instance_id"]),
+            run_id,
+            1,
+        )
+        connection.execute(
+            "UPDATE terminal_runs SET execution_name=?,profile_name=?,mcp_name=?,agent_auth_id=?,token_digest=? "
+            "WHERE id=?",
+            (execution_id, execution_id, execution_id, execution_id, token_digest(token), run_id),
+        )
+        connection.execute(
+            "INSERT INTO actor_leases(actor_slug,purpose_kind,purpose_id,terminal_run_id,acquired_at)VALUES(?,?,?,?,?)",
+            (str(actor["slug"]), "work", purpose_id, run_id, now),
+        )
+        connection.commit()
+        command_environment = runtime.docker_environment()
+        command_environment.update(
+            {
+                "AGENTS_AGENT_TOKEN": token,
+                "AGENTS_EXECUTION_ID": execution_id,
+            }
+        )
+        result = _completed(
+            (
+                "docker",
+                "exec",
+                "--env",
+                "AGENTS_AGENT_TOKEN",
+                "--env",
+                "AGENTS_EXECUTION_ID",
+                agents_name,
+                "task",
+                "--taskfile",
+                "/opt/agents/Taskfile.dist.yaml",
+                "secrets:run",
+                "--",
+                "TEST_SECRET",
+                "--",
+                "/opt/agents/.venv/bin/python",
+                "-c",
+                "import os,sys;sys.stdout.write('system-secret-ok' if os.environ.get('TEST_SECRET')=='smoke-only-secret' else 'bad');raise SystemExit(0 if os.environ.get('TEST_SECRET')=='smoke-only-secret' else 1)",
+            ),
+            env=command_environment,
+        )
+        if result.stdout.strip() != "system-secret-ok":
+            raise ContainerCommandError("whole-system secret broker returned an unexpected child result")
+    finally:
+        if run_id is not None:
+            connection.execute("DELETE FROM actor_leases WHERE terminal_run_id=?", (run_id,))
+            connection.execute("DELETE FROM launch_attempts WHERE terminal_run_id=?", (run_id,))
+            connection.execute("DELETE FROM terminal_runs WHERE id=?", (run_id,))
+            connection.commit()
+        connection.close()
+
+
+def _verify_system_http(config: AgentsConfig) -> None:
     deadline = time.monotonic() + 30
-    url = f"http://127.0.0.1:{config.web.port}/health"
+    base_url = f"http://127.0.0.1:{config.web.port}"
     while time.monotonic() < deadline:
         try:
-            with urllib.request.urlopen(url, timeout=2) as response:
-                if 200 <= response.status < 300:
-                    return
-        except urllib.error.URLError, OSError, TimeoutError:
-            time.sleep(0.25)
-    raise ContainerCommandError("whole-system health endpoint did not become ready")
+            with httpx.Client(base_url=base_url, timeout=2.0) as client:
+                health = client.get("/health")
+                if health.status_code < 300:
+                    token = (config.state_dir / "web-token").read_text(encoding="utf-8").strip()
+                    login = client.post(
+                        "/auth/login",
+                        data={"token": token},
+                        headers={"Origin": base_url},
+                        follow_redirects=False,
+                    )
+                    dashboard = client.get("/")
+                    if login.status_code == 303 and dashboard.status_code == 200:
+                        return
+        except httpx.HTTPError, OSError:
+            pass
+        time.sleep(0.25)
+    raise ContainerCommandError("whole-system authenticated dashboard did not become ready")
+
+
+def _verify_system_topology(config: AgentsConfig, *, exercise_janitor: bool = True) -> str:
+    runtime = _runtime(config)
+    instance = _instance(config)
+    record = _topology_record(config)
+    if not record.is_file() or record.is_symlink():
+        raise ContainerCommandError("whole-system topology ownership record is absent")
+    try:
+        topology_id = str(json.loads(record.read_text())["topology_id"])
+    except (OSError, KeyError, ValueError, json.JSONDecodeError) as exc:
+        raise ContainerCommandError("whole-system topology ownership record is malformed") from exc
+    names = runtime.docker(
+        "container",
+        "ls",
+        "--all",
+        "--filter",
+        f"label=dev.agents.instance={instance}",
+        "--format",
+        "{{.Names}}",
+    )
+    services: dict[str, dict[str, Any]] = {}
+    service_names: dict[str, str] = {}
+    for name in names.splitlines():
+        inspect = runtime.inspect_container(name)
+        if inspect is None:
+            continue
+        labels = inspect.get("Config", {}).get("Labels", {})
+        service_name = labels.get("com.docker.compose.service") if isinstance(labels, dict) else None
+        if not isinstance(service_name, str):
+            continue
+        if labels.get("dev.agents.topology") != topology_id:
+            raise ContainerCommandError(f"whole-system {service_name} service has mismatched topology identity")
+        if service_name in services:
+            raise ContainerCommandError(f"whole-system {service_name} service identity is duplicated")
+        services[service_name] = inspect
+        service_names[service_name] = name
+    for service_name in ("agents", "secrets"):
+        inspect = services.get(service_name)
+        if inspect is None:
+            raise ContainerCommandError(f"whole-system {service_name} service is absent")
+        state = inspect.get("State", {})
+        health = state.get("Health", {}) if isinstance(state, dict) else {}
+        if not state.get("Running") or not isinstance(health, dict) or health.get("Status") != "healthy":
+            raise ContainerCommandError(f"whole-system {service_name} service is not healthy")
+        if "docker.sock" in json.dumps(inspect.get("Mounts", [])):
+            raise ContainerCommandError(f"whole-system {service_name} service exposes a Docker socket")
+    agents = services["agents"]
+    agents_network = agents.get("NetworkSettings", {}).get("Networks", {}).get("agents-system", {})
+    agents_ports = agents.get("HostConfig", {}).get("PortBindings", {})
+    published = [binding for bindings in agents_ports.values() or [] for binding in bindings or []]
+    if (
+        agents_network.get("IPAddress") != "172.30.1.2"
+        or not published
+        or any(binding.get("HostIp") != "127.0.0.1" for binding in published)
+    ):
+        raise ContainerCommandError("whole-system Agents address or published-port boundary is incorrect")
+    agent_mounts = {
+        str(mount.get("Destination")): (str(mount.get("Type")), str(mount.get("Source")))
+        for mount in agents.get("Mounts", [])
+        if isinstance(mount, dict)
+    }
+    for masked in (config.root / ".env.sops-age", config.root / "agent-secrets.sops.json"):
+        if agent_mounts.get(str(masked)) != ("bind", "/dev/null"):
+            raise ContainerCommandError(f"whole-system Agents service exposes secret identity path {masked}")
+    for private_tmpfs in (
+        config.root / ".sops-isolated-home",
+        config.state_dir / "runtime" / "system-auth",
+        Path("/home/agents/.local/share/opencode"),
+        Path("/home/agents/bin"),
+    ):
+        if agent_mounts.get(str(private_tmpfs), ("", ""))[0] != "tmpfs":
+            raise ContainerCommandError(f"whole-system private path is not tmpfs-backed: {private_tmpfs}")
+    secrets = services["secrets"]
+    secrets_network = secrets.get("NetworkSettings", {}).get("Networks", {}).get("agents-system", {})
+    if secrets_network.get("IPAddress") != "172.30.1.3" or secrets.get("HostConfig", {}).get("PortBindings"):
+        raise ContainerCommandError("whole-system secret broker address or publication boundary is incorrect")
+    secret_mounts = {
+        str(mount.get("Destination")): str(mount.get("Type"))
+        for mount in secrets.get("Mounts", [])
+        if isinstance(mount, dict)
+    }
+    if secret_mounts.get(str(config.root / ".agents")) != "tmpfs":
+        raise ContainerCommandError("whole-system secret broker exposes the repository control plane")
+    runtime.docker(
+        "exec",
+        service_names["agents"],
+        "/opt/agents/.venv/bin/python",
+        "-c",
+        "import urllib.request;urllib.request.urlopen('http://172.30.1.3:9891/health',timeout=2)",
+    )
+    volumes = runtime.docker(
+        "volume",
+        "ls",
+        "--filter",
+        f"label=dev.agents.instance={instance}",
+        "--filter",
+        "label=dev.agents.retention=persistent",
+        "--format",
+        "{{.Name}}",
+    ).splitlines()
+    if len(volumes) != 1:
+        raise ContainerCommandError("whole-system persistent Herdr volume identity is ambiguous")
+    if exercise_janitor:
+        before = set(names.splitlines())
+        _remove_stopped_topology_containers(config)
+        after = set(
+            runtime.docker(
+                "container",
+                "ls",
+                "--all",
+                "--filter",
+                f"label=dev.agents.instance={instance}",
+                "--format",
+                "{{.Names}}",
+            ).splitlines()
+        )
+        if not before.issubset(after):
+            raise ContainerCommandError("whole-system janitor removed an active service")
+    return volumes[0]
+
+
+def reset(config: AgentsConfig) -> None:
+    from . import service
+
+    if _topology_record(config).exists() or any(service.status(config).values()):
+        raise ContainerCommandError("all Agents topologies must be stopped before container:reset")
+    runtime = _runtime(config)
+    environment = _compose_environment(
+        config,
+        "reset",
+        config.state_dir / "runtime" / "system-auth" / "reset",
+    )
+    _verify_compose_project_scope(config, "reset")
+    _completed(
+        ("docker", "compose", "-f", str(config.root / "compose.yaml"), "down", "--volumes", "--remove-orphans"),
+        env=environment,
+    )
+    _completed(("colima", "--profile", runtime.config.colima_profile, "delete", "--force"))

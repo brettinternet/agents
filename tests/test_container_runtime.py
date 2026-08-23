@@ -9,14 +9,17 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import ANY, MagicMock, call, patch
 
 from agents.config import AgentsConfig, ContainerConfig, IsolationMode
+from agents.container_runner import _write_secret
 from agents.container_runner import run as run_container
 from agents.container_runtime import (
     ContainerGarbageCollector,
     ContainerizedHerdrBackend,
+    ContainerRuntime,
     ContainerRuntimeError,
+    _completed,
 )
 from agents.execution import ExecutionConflict, RunHandle
 
@@ -65,6 +68,7 @@ class ContainerRuntimeTests(unittest.TestCase):
             "labels": labels,
         }
         inspect = {
+            "Id": "sha256:container",
             "Image": "sha256:image",
             "Config": {"User": f"{os.getuid()}:{os.getgid()}", "WorkingDir": cwd, "Labels": labels},
             "HostConfig": {
@@ -89,6 +93,89 @@ class ContainerRuntimeTests(unittest.TestCase):
         }
         return manifest, inspect
 
+    def test_colima_version_is_exact_and_missing_binary_is_actionable(self) -> None:
+        runtime = ContainerRuntime(self.container)
+        with patch(
+            "agents.container_runtime._completed",
+            return_value=SimpleNamespace(stdout="colima version 0.10.3\ngit commit: fixture\n"),
+        ):
+            runtime.validate_colima_version()
+        with (
+            patch(
+                "agents.container_runtime._completed",
+                return_value=SimpleNamespace(stdout="colima version 0.10.2\n"),
+            ),
+            self.assertRaisesRegex(ContainerRuntimeError, "Colima 0.10.3.*mise install"),
+        ):
+            runtime.validate_colima_version()
+        with (
+            patch("agents.container_runtime.subprocess.run", side_effect=FileNotFoundError(2, "missing")),
+            self.assertRaisesRegex(ContainerRuntimeError, "colima is unavailable"),
+        ):
+            _completed(("colima", "version"))
+
+    def test_wrapper_directory_symlink_is_rejected(self) -> None:
+        runtime_root = self.config.state_dir / "runtime"
+        runtime_root.mkdir(parents=True)
+        outside = self.root / "outside"
+        outside.mkdir()
+        (runtime_root / "bin").symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(ExecutionConflict, "runtime root is unsafe|wrapper directory is unsafe"):
+            self.backend._prepare_wrappers()
+
+    def test_docker_environment_ignores_active_context(self) -> None:
+        runtime = ContainerRuntime(self.container)
+        with (
+            patch.object(runtime, "status", return_value={"docker_socket": "/tmp/agents.sock"}),
+            patch.dict(os.environ, {"DOCKER_CONTEXT": "desktop-linux", "UNCHANGED": "yes"}, clear=True),
+        ):
+            environment = runtime.docker_environment()
+        self.assertNotIn("DOCKER_CONTEXT", environment)
+        self.assertEqual(environment["DOCKER_HOST"], "unix:///tmp/agents.sock")
+        self.assertEqual(environment["UNCHANGED"], "yes")
+
+    def test_initialize_starts_existing_stopped_profile_before_validation(self) -> None:
+        runtime = ContainerRuntime(self.container)
+        status = {
+            "driver": "macOS Virtualization.Framework",
+            "arch": "aarch64",
+            "runtime": "docker",
+            "mount_type": "virtiofs",
+            "kubernetes": False,
+            "docker_socket": "/tmp/agents.sock",
+        }
+        with (
+            patch.object(runtime, "validate_colima_version"),
+            patch.object(runtime, "profile_state", return_value="Stopped"),
+            patch.object(runtime, "status", return_value=status),
+            patch.object(runtime, "_ssh", return_value=SimpleNamespace(returncode=1, stdout="")),
+            patch("agents.container_runtime._completed") as completed,
+            self.assertRaisesRegex(ContainerRuntimeError, "does not mount"),
+        ):
+            runtime.initialize(self.root, "instance", 9890)
+        completed.assert_called_once_with(
+            (
+                "colima",
+                "--profile",
+                "agents",
+                "start",
+                "--activate=false",
+                "--ssh-agent=false",
+                "--network-address=false",
+                "--save-config=false",
+            )
+        )
+
+    def test_secret_writer_rejects_dangling_symlink(self) -> None:
+        provider = self.root / "provider"
+        provider.mkdir()
+        destination = self.root / "outside-secret"
+        secret_path = provider / "auth.json"
+        secret_path.symlink_to(destination)
+        with self.assertRaisesRegex(ContainerRuntimeError, "unsafe credential path"):
+            _write_secret(secret_path, "secret")
+        self.assertFalse(destination.exists())
+
     def test_identity_verification_accepts_only_exact_hardened_container(self) -> None:
         manifest, inspect = self._identity()
         self.runtime.inspect_container.return_value = inspect
@@ -105,6 +192,7 @@ class ContainerRuntimeTests(unittest.TestCase):
             ("HostConfig.NetworkMode", "bridge"),
             ("HostConfig.CapDrop", []),
             ("HostConfig.SecurityOpt", []),
+            ("HostConfig.SecurityOpt", ["no-new-privileges", "seccomp=/custom/profile"]),
             ("HostConfig.Tmpfs", {}),
             ("HostConfig.Privileged", True),
             ("HostConfig.Devices", [{"PathOnHost": "/dev/null"}]),
@@ -154,6 +242,23 @@ class ContainerRuntimeTests(unittest.TestCase):
                 changed_manifest["labels"][key] = value
                 with self.assertRaises(ExecutionConflict):
                     self.backend._verify(changed_manifest)
+
+    def test_secret_exec_identity_must_match_database_run_and_generation(self) -> None:
+        manifest, inspect = self._identity()
+        path = self.backend._manifest_path("execution")
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(manifest))
+        self.runtime.inspect_container.return_value = inspect
+        self.assertEqual(self.backend.verified_container_name("execution", 1, 2), "agents-instance-r1-g2")
+        for run_id, generation in ((9, 2), (1, 9)):
+            with self.subTest(run_id=run_id, generation=generation), self.assertRaises(ExecutionConflict):
+                self.backend.verified_container_name("execution", run_id, generation)
+
+    def test_delete_rejects_missing_manifest_without_closing_herdr(self) -> None:
+        with self.assertRaisesRegex(ExecutionConflict, "manifest.*absent"):
+            self.backend.delete_run(RunHandle("execution", "workspace", "pane"))
+        self.runtime.remove_container.assert_not_called()
+        self.inner.delete_run.assert_not_called()
 
     def test_delete_does_not_close_herdr_when_verified_container_removal_fails(self) -> None:
         manifest, inspect = self._identity()
@@ -207,6 +312,8 @@ class ContainerRuntimeTests(unittest.TestCase):
             "\n".join(
                 (
                     json.dumps({"Names": "stale"}),
+                    json.dumps({"Names": "stale-running"}),
+                    json.dumps({"Names": "wrong-instance"}),
                     json.dumps({"Names": "active"}),
                     json.dumps({"Names": "compose-init"}),
                     json.dumps({"Names": "uncertain"}),
@@ -242,33 +349,80 @@ class ContainerRuntimeTests(unittest.TestCase):
             "",
         ]
         stale = {
-            "Config": {"Labels": {"dev.agents.execution": "old", "dev.agents.retention": "ephemeral"}},
+            "Id": "sha256:stale",
+            "Config": {
+                "Labels": {
+                    "dev.agents.instance": "instance",
+                    "dev.agents.execution": "old",
+                    "dev.agents.retention": "ephemeral",
+                }
+            },
             "State": {"Running": False, "FinishedAt": "2000-01-01T00:00:00Z"},
         }
+        stale_running = {
+            "Id": "sha256:stale-running",
+            "Created": "2000-01-01T00:00:00Z",
+            "Config": {
+                "Labels": {
+                    "dev.agents.instance": "instance",
+                    "dev.agents.execution": "old-running",
+                    "dev.agents.retention": "ephemeral",
+                }
+            },
+            "State": {"Running": True, "FinishedAt": ""},
+        }
+        wrong_instance = {
+            "Created": "2000-01-01T00:00:00Z",
+            "Config": {
+                "Labels": {
+                    "dev.agents.instance": "other",
+                    "dev.agents.execution": "old-other",
+                    "dev.agents.retention": "ephemeral",
+                }
+            },
+            "State": {"Running": True, "FinishedAt": ""},
+        }
         active = {
-            "Config": {"Labels": {"dev.agents.execution": "active", "dev.agents.retention": "ephemeral"}},
+            "Config": {
+                "Labels": {
+                    "dev.agents.instance": "instance",
+                    "dev.agents.execution": "active",
+                    "dev.agents.retention": "ephemeral",
+                }
+            },
             "State": {"Running": False, "FinishedAt": "2000-01-01T00:00:00Z"},
         }
         uncertain = {
-            "Config": {"Labels": {"dev.agents.execution": "uncertain", "dev.agents.retention": "ephemeral"}},
+            "Config": {
+                "Labels": {
+                    "dev.agents.instance": "instance",
+                    "dev.agents.execution": "uncertain",
+                    "dev.agents.retention": "ephemeral",
+                }
+            },
             "State": {"Running": False, "FinishedAt": "2000-01-01T00:00:00Z"},
         }
         compose = {
             "Config": {
                 "Labels": {
+                    "dev.agents.instance": "instance",
                     "dev.agents.topology": "topology",
                     "dev.agents.retention": "ephemeral",
                 }
             },
             "State": {"Running": False, "FinishedAt": "2000-01-01T00:00:00Z"},
         }
-        runtime.inspect_container.side_effect = [stale, active, compose, uncertain]
+        runtime.inspect_container.side_effect = [stale, stale_running, wrong_instance, active, compose, uncertain]
         runtime.trim.side_effect = ContainerRuntimeError("trim unavailable")
         with patch("agents.container_runtime._instance_id", return_value="instance"):
             collector = ContainerGarbageCollector(self.config, connection, runtime)
         result = collector.collect()
-        runtime.remove_container.assert_called_once_with("stale")
-        self.assertNotIn(call("compose-init"), runtime.remove_container.call_args_list)
+        runtime.remove_container.assert_has_calls(
+            [call("stale", "sha256:stale"), call("stale-running", "sha256:stale-running")]
+        )
+        self.assertEqual(runtime.remove_container.call_count, 2)
+        self.assertNotIn(call("compose-init", ANY), runtime.remove_container.call_args_list)
+        self.assertNotIn(call("wrong-instance", ANY), runtime.remove_container.call_args_list)
         self.assertNotIn(call("uncertain"), runtime.remove_container.call_args_list)
         self.assertEqual(result["volumes"], ["ephemeral-volume"])
         runtime.docker.assert_any_call(

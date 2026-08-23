@@ -55,12 +55,15 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _config_file(source: Path, destination: Path, web_port: int) -> None:
+def _config_file(source: Path, destination: Path, web_port: int, isolation: str = "host") -> None:
     text = source.read_text(encoding="utf-8")
     text = text.replace('verify = [["task", "check"], ["task", "test"]]', 'verify = [["git", "status", "--porcelain"]]')
     text = text.replace("poll_seconds = 5", "poll_seconds = 1")
     text = text.replace('provider = "opencode"', 'provider = "mock"')
     text = re.sub(r"(?m)^port = \d+$", f"port = {web_port}", text, count=1)
+    if isolation == "container":
+        text = text.replace('isolation = "host"', 'isolation = "container"')
+        text = text.replace('image = "agents-agent-opencode:local"', 'image = "agents-agent-mock:local"')
     destination.write_text(text, encoding="utf-8")
     destination.chmod(0o600)
 
@@ -126,6 +129,8 @@ def _isolated_environment(config_path: Path, home: Path, xdg: Path) -> Iterator[
         "AGENTS_AGENT_TOKEN",
         "AGENTS_API_URL",
         "AGENTS_EXECUTION_ID",
+        "AGENTS_ISOLATION",
+        "AGENTS_CONTAINER_IMAGE",
     ):
         os.environ.pop(name, None)
     fixture_path = str(FIXTURE_BIN)
@@ -135,6 +140,7 @@ def _isolated_environment(config_path: Path, home: Path, xdg: Path) -> Iterator[
             "AGENTS_PROVIDER": "mock",
             "HOME": str(home),
             "XDG_STATE_HOME": str(xdg),
+            "COLIMA_HOME": old.get("COLIMA_HOME", str(Path(old["HOME"]) / ".colima")),
             "PATH": fixture_path + os.pathsep + old.get("PATH", ""),
         }
     )
@@ -281,18 +287,23 @@ def _cleanup(config: AgentsConfig | None) -> list[str]:
     return errors
 
 
-def run() -> None:
+def run(isolation: str = "host") -> None:
     config: AgentsConfig | None = None
-    with tempfile.TemporaryDirectory(prefix="agents-smoke-", dir="/tmp") as temporary:
+    parent = ROOT if isolation == "container" else Path("/tmp")
+    with (
+        tempfile.TemporaryDirectory(prefix=".agents-smoke-", dir=parent) as temporary,
+        tempfile.TemporaryDirectory(prefix="agents-smoke-home-", dir="/tmp") as private_temporary,
+    ):
         runtime = Path(temporary)
         project = runtime / "project"
         config_path = runtime / "agents.toml"
-        home = runtime / "home"
-        xdg = runtime / "xdg"
+        home = Path(private_temporary) / "home"
+        xdg = Path(private_temporary) / "xdg"
         home.mkdir(mode=0o700)
         xdg.mkdir(mode=0o700)
         _make_project(project)
-        _config_file(ROOT / "agents.toml", config_path, _free_port())
+        web_port = int(os.environ["AGENTS_SMOKE_API_PORT"]) if isolation == "container" else _free_port()
+        _config_file(ROOT / "agents.toml", config_path, web_port, isolation)
         # The copied config's relative project path now points at runtime/project.
         config_path.write_text(
             config_path.read_text(encoding="utf-8").replace('path = "."', 'path = "project"'), encoding="utf-8"
@@ -572,9 +583,10 @@ def run() -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", choices=("herdr",), default="herdr")
-    parser.parse_args()
+    parser.add_argument("--isolation", choices=("host", "container"), default="host")
+    args = parser.parse_args()
     try:
-        run()
+        run(args.isolation)
     except SmokeFailure as exc:
         print(f"[smoke] FAIL {exc}", file=sys.stderr, flush=True)
         return 1

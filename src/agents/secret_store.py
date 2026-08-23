@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import fcntl
 import getpass
@@ -15,6 +16,9 @@ from collections.abc import Generator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
+
+import httpx
+from websockets.sync.client import connect as websocket_connect
 
 FORMAT_KEY = "AGENTS_SECRET_STORE_VERSION"
 FORMAT_VERSION = "1"
@@ -75,6 +79,18 @@ def _git(args: list[str], *, cwd: Path) -> Path:
 
 def resolve_paths(cwd: Path | None = None) -> Paths:
     current = (cwd or Path.cwd()).resolve(strict=True)
+    broker_root = os.environ.get("AGENTS_BROKER_SECRETS_ROOT")
+    if broker_root:
+        private = Path(broker_root).resolve(strict=True)
+        return Paths(
+            worktree=current,
+            common_root=private,
+            config=private / "sops-config",
+            store=private / "store",
+            key=private / "age-key",
+            isolated_home=private / "sops-home",
+            lock=private / "lock",
+        )
     worktree = _git(["rev-parse", "--show-toplevel"], cwd=current)
     common_dir = _git(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=current)
     common_root = common_dir.parent
@@ -491,6 +507,41 @@ def list_secrets(paths: Paths) -> None:
         print(name)
 
 
+def broker_values(paths: Paths, names: list[str] | None = None) -> dict[str, str]:
+    values = _decrypt(paths)
+    _validate_schema(paths, values)
+    if names is None:
+        return values
+    for name in names:
+        _validate_name(name)
+    unknown = [name for name in names if name not in values]
+    if unknown:
+        raise SecretStoreError(f"unknown managed secret name: {unknown[0]}")
+    return {name: values[name] for name in names}
+
+
+def set_secret_value(paths: Paths, name: str, value: bytes) -> None:
+    _validate_name(name)
+    try:
+        decoded = value.decode("utf-8")
+    except UnicodeDecodeError:
+        raise SecretStoreError("secret value must be valid UTF-8") from None
+    if "\0" in decoded:
+        raise SecretStoreError("secret value cannot contain a NUL byte")
+    with _exclusive_lock(paths.lock):
+        values = _decrypt(paths)
+        proposed = {**values, name: decoded}
+        _validate_schema(paths, proposed)
+        _run(
+            ["sops", "set", "--value-stdin", str(paths.store), json.dumps([name])],
+            cwd=paths.worktree,
+            env=_sops_env(paths),
+            input_bytes=json.dumps(decoded).encode("utf-8"),
+            failure="unable to update the encrypted secret store",
+        )
+        _validate_schema(paths, _decrypt(paths))
+
+
 def _parse_run_args(arguments: list[str]) -> tuple[list[str], list[str]]:
     try:
         separator = arguments.index("--")
@@ -537,6 +588,96 @@ def run_command(paths: Paths, names: list[str], command: list[str]) -> NoReturn:
         raise SecretStoreError(f"unable to run command through Varlock: {exc.strerror}") from None
 
 
+def _agent_api_headers() -> dict[str, str]:
+    token = os.environ.get("AGENTS_AGENT_TOKEN")
+    execution_id = os.environ.get("AGENTS_EXECUTION_ID")
+    if not token or not execution_id:
+        raise SecretStoreError("agent API credentials are unavailable")
+    return {"Authorization": f"Bearer {token}", "X-Agents-Execution-ID": execution_id}
+
+
+def _agent_api_request(action: str, body: dict[str, str] | None = None) -> dict[str, object]:
+    base = os.environ.get("AGENTS_SECRETS_API_URL") or os.environ.get("AGENTS_API_URL")
+    if not base:
+        raise SecretStoreError("AGENTS_API_URL is unavailable")
+    try:
+        response = httpx.post(
+            f"{base.rstrip('/')}/agent/v1/secrets/{action}",
+            headers=_agent_api_headers(),
+            json=body or {},
+            timeout=30,
+        )
+        response.raise_for_status()
+        envelope = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise SecretStoreError(f"agent secret broker request failed: {exc}") from None
+    if not isinstance(envelope, dict) or envelope.get("ok") is not True or not isinstance(envelope.get("data"), dict):
+        raise SecretStoreError("agent secret broker returned a malformed response")
+    return envelope["data"]
+
+
+def _agent_api_run(names: list[str], command: list[str]) -> int:
+    base = os.environ.get("AGENTS_SECRETS_API_URL") or os.environ.get("AGENTS_API_URL")
+    if not base:
+        raise SecretStoreError("AGENTS_API_URL is unavailable")
+    url = f"{base.rstrip('/')}/agent/v1/secrets/run".replace("http://", "ws://", 1).replace("https://", "wss://", 1)
+    try:
+        with websocket_connect(url, additional_headers=_agent_api_headers()) as socket:
+            socket.send(json.dumps({"names": names, "argv": command, "tty": sys.stdin.isatty()}))
+            if not sys.stdin.isatty():
+                data = sys.stdin.buffer.read()
+                if data:
+                    socket.send(data)
+            socket.send(json.dumps({"stdin_eof": True}))
+            for message in socket:
+                if isinstance(message, bytes):
+                    if message[:1] == b"\x01":
+                        sys.stdout.buffer.write(message[1:])
+                        sys.stdout.buffer.flush()
+                    elif message[:1] == b"\x02":
+                        sys.stderr.buffer.write(message[1:])
+                        sys.stderr.buffer.flush()
+                    continue
+                frame = json.loads(message)
+                if isinstance(frame, dict) and isinstance(frame.get("exit_code"), int):
+                    return int(frame["exit_code"])
+                if isinstance(frame, dict) and frame.get("error"):
+                    raise SecretStoreError(str(frame["error"]))
+    except OSError as exc:
+        raise SecretStoreError(f"agent secret broker connection failed: {exc}") from None
+    raise SecretStoreError("agent secret broker closed without an exit status")
+
+
+def _agent_api_main(args: argparse.Namespace) -> int:
+    if args.action == "check":
+        _agent_api_request("check")
+    elif args.action == "list":
+        data = _agent_api_request("list")
+        names = data.get("names")
+        if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+            raise SecretStoreError("agent secret broker returned malformed names")
+        for name in names:
+            print(name)
+    elif args.action == "reveal":
+        data = _agent_api_request("reveal", {"name": args.name})
+        encoded = data.get("value_base64")
+        if not isinstance(encoded, str):
+            raise SecretStoreError("agent secret broker returned a malformed value")
+        sys.stdout.buffer.write(base64.b64decode(encoded, validate=True))
+        sys.stdout.buffer.flush()
+    elif args.action == "set":
+        value = sys.stdin.buffer.read()
+        _agent_api_request("set", {"name": args.name, "value_base64": base64.b64encode(value).decode()})
+    elif args.action == "unset":
+        _agent_api_request("unset", {"name": args.name})
+    elif args.action == "run":
+        names, command = _parse_run_args(args.arguments)
+        return _agent_api_run(names, command)
+    else:
+        raise SecretStoreError("secret store initialization is unavailable through the agent API")
+    return 0
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Manage the repository agent secret store")
     subparsers = parser.add_subparsers(dest="action", required=True)
@@ -554,6 +695,8 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        if os.environ.get("AGENTS_SECRETS_TRANSPORT") == "agent-api":
+            return _agent_api_main(args)
         if args.action == "init":
             init_store(resolve_paths())
         else:

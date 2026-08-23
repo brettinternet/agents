@@ -22,6 +22,8 @@ dev = ["ruff==0.16.2", "pyright==1.1.411"]
 agents = "agents.cli:main"
 agentsd = "agents.web:main"
 agents-mcp-server = "agents.mcp_server:main"
+agents-container-runner = "agents.container_runner:main"
+agents-secrets-broker = "agents.secret_broker:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agents"]

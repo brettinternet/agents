@@ -13,7 +13,16 @@ from types import SimpleNamespace
 from typing import cast
 from unittest.mock import patch
 
-from agents.config import AgentsConfig, ExecutionConfig, ModelChoice, ProjectConfig, RuntimeConfig, WebConfig
+from agents.config import (
+    AgentsConfig,
+    ContainerConfig,
+    ExecutionConfig,
+    IsolationMode,
+    ModelChoice,
+    ProjectConfig,
+    RuntimeConfig,
+    WebConfig,
+)
 from agents.db import connect, migrate, utc_now
 from agents.delivery import Delivery
 from agents.execution import (
@@ -210,6 +219,30 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
             working_directory=self.config.project.path,
             budget_exempt=True,
         )
+
+    def test_container_reservation_persists_backend_and_immutable_image_id(self):
+        container = ContainerConfig("agents", "image:local", 2.0, 4096, 512, 3600, 3600, 168)
+        config = replace(
+            self.config,
+            execution=replace(
+                self.config.execution,
+                isolation=IsolationMode.CONTAINER,
+                container=container,
+            ),
+        )
+        with patch("agents.reconciler.ContainerRuntime.resolve_image_id", return_value="sha256:image") as resolve:
+            run = reserve_terminal(
+                self.connection,
+                config,
+                actor="manager",
+                purpose_kind="persistent",
+                purpose_id="container-manager",
+                working_directory=config.project.path,
+                budget_exempt=True,
+            )
+        resolve.assert_called_once_with("image:local")
+        self.assertEqual(run["execution_backend"], "herdr-container")
+        self.assertEqual(run["container_image_id"], "sha256:image")
 
     def git_base_sha(self) -> str:
         repo = self.config.project.path

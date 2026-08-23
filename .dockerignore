@@ -1,0 +1,16 @@
+.git
+.agents
+.worktrees
+.env*
+!.env.schema
+.env.sops-age
+.sops-isolated-home
+agent-secrets.sops.json
+.venv
+.tools
+.pytest_cache
+.ruff_cache
+__pycache__
+*.pyc
+*.log
+memory/journal

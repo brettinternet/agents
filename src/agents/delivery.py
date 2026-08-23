@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import AgentsConfig
+from .container_runtime import build_execution_backend
 from .db import utc_now
 from .execution import (
     ExecutionBackend,
@@ -22,16 +23,17 @@ from .execution import (
     RunHandle,
 )
 from .git_worktree import (
-    add_detached,
+    GitError,
+    add_agent_snapshot,
     branch_sha,
     discard_execution_reservation,
     head_sha,
+    import_isolated_submission,
     is_ancestor,
     is_clean,
-    remove_recorded_worktree,
-    reserve_execution,
+    remove_recorded_workspace,
+    reserve_execution_workspace,
 )
-from .herdr_client import HerdrBackend
 from .policy import CONSULTATION_SPECIALTIES, DomainError, validate_text, validate_title
 from .reconciler import reserve_terminal
 from .store import Store
@@ -102,7 +104,7 @@ class Delivery:
     ) -> None:
         self.config = config
         self.connection = connection
-        self.backend = backend or HerdrBackend.from_config(config)
+        self.backend = backend or build_execution_backend(config)
 
     def request_consultation(
         self, actor: str, item_id: str, expected_version: int, specialty: str, question: str
@@ -447,7 +449,8 @@ class Delivery:
             current = branch_sha(self.config.project.path, self.config.project.default_branch)
             if current != row["base_sha"]:
                 raise DomainError("base_changed", "default branch advanced before dispatch")
-            base, branch = reserve_execution(
+            base, branch = reserve_execution_workspace(
+                self.config,
                 self.config.project.path,
                 self.config.project.default_branch,
                 str(row["work_id"]),
@@ -524,6 +527,14 @@ class Delivery:
         except BaseException:
             self.connection.execute("ROLLBACK")
             raise
+        path = Path(str(row["worktree_path"]))
+        if path.exists() or path.is_symlink():
+            remove_recorded_workspace(
+                self.config,
+                self.config.project.path,
+                path,
+                str(row["base_sha"]),
+            )
         discard_execution_reservation(
             self.config.project.path,
             Path(str(row["worktree_path"])),
@@ -544,6 +555,17 @@ class Delivery:
         if assignment is None or work["status"] != "in_progress":
             raise DomainError("stale_generation", "implementation assignment changed")
         path = Path(str(assignment["worktree_path"]))
+        if str(self.config.execution.isolation) == "container":
+            try:
+                import_isolated_submission(
+                    self.config.project.path,
+                    path,
+                    str(assignment["branch"]),
+                    str(assignment["base_sha"]),
+                    commit_sha,
+                )
+            except GitError as exc:
+                raise DomainError("invalid_submission", str(exc)) from exc
         default = branch_sha(self.config.project.path, self.config.project.default_branch)
         if default != assignment["base_sha"]:
             raise DomainError("base_changed", "default branch advanced")
@@ -566,7 +588,7 @@ class Delivery:
             (assignment["execution_id"], revision, commit_sha, summary, now, now),
         ).lastrowid
         checktree = self.config.root / ".worktrees/check" / str(submission)
-        add_detached(self.config.project.path, commit_sha, checktree)
+        add_agent_snapshot(self.config, self.config.project.path, commit_sha, checktree)
         for position, argv in enumerate(self.config.project.verify, 1):
             self.connection.execute(
                 "INSERT INTO checks(submission_id,scope,target_sha,position,command,worktree_path,state,created_at,updated_at)VALUES(?,'submission',?,?,?,?, 'queued',?,?)",
@@ -743,13 +765,14 @@ class Delivery:
 
     def _prepare_review_worktree(self, commit_sha: str, reviewtree: Path) -> None:
         if reviewtree.exists() and any(reviewtree.iterdir()):
-            remove_recorded_worktree(
+            remove_recorded_workspace(
+                self.config,
                 self.config.project.path,
                 reviewtree,
                 commit_sha,
                 allow_dirty=True,
             )
-        add_detached(self.config.project.path, commit_sha, reviewtree)
+        add_agent_snapshot(self.config, self.config.project.path, commit_sha, reviewtree)
 
     def _assign_review(self, submission: sqlite3.Row, submission_id: int, gate: str, now: str) -> bool:
         self.connection.execute("SAVEPOINT assign_review")
@@ -821,7 +844,8 @@ class Delivery:
             self.connection.execute("ROLLBACK TO SAVEPOINT assign_review")
             self.connection.execute("RELEASE SAVEPOINT assign_review")
             if reviewtree is not None and reviewtree.exists():
-                remove_recorded_worktree(
+                remove_recorded_workspace(
+                    self.config,
                     self.config.project.path,
                     reviewtree,
                     str(submission["commit_sha"]),
@@ -1008,7 +1032,7 @@ class Delivery:
         if existing:
             return True
         tree = self.config.root / ".worktrees/check" / f"integration-{submission['id']}-{default[:12]}"
-        add_detached(self.config.project.path, default, tree)
+        add_agent_snapshot(self.config, self.config.project.path, default, tree)
         now = utc_now()
         for position, argv in enumerate(self.config.project.verify, 1):
             self.connection.execute(

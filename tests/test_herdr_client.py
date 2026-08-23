@@ -296,6 +296,71 @@ class HerdrClientTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "agent_start_mismatch")
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.1, 0.4, 1.0, 2.0, 3.0, 4.0])
 
+    def test_mock_create_waits_for_shell_exec_to_become_foreground(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.snapshots = 0
+                self.process_checks = 0
+
+            def snapshot(self) -> dict[str, Any]:
+                self.snapshots += 1
+                if self.snapshots == 1:
+                    return {"workspaces": [], "panes": [], "agents": []}
+                return {
+                    "workspaces": [{"workspace_id": "w1", "label": "agents-test"}],
+                    "panes": [{"pane_id": "p1", "workspace_id": "w1", "cwd": "/tmp", "revision": 1}],
+                    "agents": [],
+                }
+
+            def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+                if method == "workspace.create":
+                    return {
+                        "type": "workspace_created",
+                        "workspace": {"workspace_id": "w1", "label": "agents-test"},
+                        "tab": {"tab_id": "t1"},
+                        "root_pane": {"pane_id": "p1", "workspace_id": "w1"},
+                    }
+                if method == "pane.send_input":
+                    return {"type": "ok"}
+                if method == "pane.get":
+                    return {
+                        "type": "pane_info",
+                        "pane": {"pane_id": "p1", "workspace_id": "w1", "cwd": "/tmp", "revision": 1},
+                    }
+                if method == "pane.process_info":
+                    self.process_checks += 1
+                    foreground = (
+                        []
+                        if self.process_checks < 3
+                        else [{"name": "mock_cli", "argv0": "mock_cli", "argv": ["mock_cli"]}]
+                    )
+                    return {
+                        "type": "pane_process_info",
+                        "process_info": {"foreground_processes": foreground},
+                    }
+                raise AssertionError((method, params))
+
+        spec = RunSpec(
+            "agents-test",
+            1,
+            1,
+            Path("/tmp"),
+            "worker",
+            "mock_cli",
+            ("mock_cli",),
+            (),
+            "mock_cli",
+            True,
+        )
+        with patch("agents.herdr_client.time.sleep") as sleep:
+            run = HerdrBackend(
+                cast(Any, FakeClient()),
+                provider_id="mock_cli",
+                mock_command=("mock_cli",),
+            ).create_run(spec)
+        sleep.assert_called_once_with(0.1)
+        self.assertEqual(run.handle, RunHandle("agents-test", "w1", "p1"))
+
     def test_create_run_rejects_missing_authoritative_workspace_ids(self) -> None:
         class FakeClient:
             def snapshot(self) -> dict[str, Any]:

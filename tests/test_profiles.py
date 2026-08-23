@@ -34,6 +34,8 @@ class ProfileTests(unittest.TestCase):
         purpose_kind: str = "persistent",
         run_id: int = 1,
         reasoning_effort: str = "",
+        mcp_command: str | None = None,
+        api_url: str = "http://127.0.0.1:9890",
     ):
         return materialize_profile(
             root,
@@ -46,9 +48,22 @@ class ProfileTests(unittest.TestCase):
             purpose_kind=purpose_kind,
             specialty="research" if purpose_kind == "work" else "",
             token="secret-token",
-            api_url="http://127.0.0.1:9890",
+            api_url=api_url,
             reasoning_effort=reasoning_effort,
+            mcp_command=mcp_command,
         )
+
+    def test_container_materialization_uses_image_mcp_and_host_gateway_api(self):
+        repository = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            profile = self._materialize(
+                repository,
+                Path(directory),
+                mcp_command="/opt/agents/.venv/bin/agents-mcp-server",
+                api_url="http://host.docker.internal:9890",
+            )
+        self.assertEqual(profile.mcp_command, "/opt/agents/.venv/bin/agents-mcp-server")
+        self.assertEqual(profile.api_url, "http://host.docker.internal:9890")
 
     def test_repository_templates_validate(self):
         validate_templates(Path(__file__).resolve().parents[1])

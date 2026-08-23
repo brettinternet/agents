@@ -406,11 +406,24 @@ class HerdrBackend:
                 raise ExecutionProtocolError("agent_start_shape", "Herdr returned a malformed agent.start result")
             if agent["workspace_id"] != run.handle.run_id or agent["pane_id"] != run.handle.terminal_id:
                 raise ExecutionConflict("agent_start_mismatch", "Herdr started an unexpected workspace occupant")
-        adopted = self.get_run(run.handle)
         if spec.mock:
-            if adopted.cwd != spec.cwd.resolve():
-                raise ExecutionConflict("agent_start_mismatch", "Herdr started an unexpected workspace occupant")
-            return adopted
+            failure: ExecutionTerminated | None = None
+            for delay in (0.0, 0.1, 0.4, 1.0, 2.0, 3.0, 4.0):
+                if delay:
+                    time.sleep(delay)
+                try:
+                    adopted = self.get_run(run.handle)
+                except ExecutionTerminated as exc:
+                    if exc.code != "mock_process_exited":
+                        raise
+                    failure = exc
+                    continue
+                if adopted.cwd != spec.cwd.resolve():
+                    raise ExecutionConflict("agent_start_mismatch", "Herdr started an unexpected workspace occupant")
+                return adopted
+            assert failure is not None
+            raise failure
+        adopted = self.get_run(run.handle)
         for delay in (0.0, 0.1, 0.4, 1.0, 2.0, 3.0, 4.0):
             if delay:
                 time.sleep(delay)

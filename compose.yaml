@@ -1,0 +1,179 @@
+name: agents-${AGENTS_INSTANCE_ID}
+services:
+  agents:
+    image: ${AGENTS_SYSTEM_IMAGE}
+    user: ${AGENTS_UID}:${AGENTS_GID}
+    working_dir: ${AGENTS_REPO_PATH}
+    command: ["agents", "service", "foreground"]
+    environment:
+      AGENTS_CONFIG: ${AGENTS_REPO_PATH}/agents.toml
+      AGENTS_ISOLATION: host
+      AGENTS_PROVIDER: ${AGENTS_PROVIDER}
+      AGENTS_TOPOLOGY: compose
+      AGENTS_PROVIDER_AUTH_FILE: /run/secrets/provider-auth
+      AGENTS_SECRETS_API_URL: http://172.30.1.3:9891
+      AGENTS_SYSTEM_CONTAINER: "1"
+      AGENTS_WEB_LISTEN_HOST: 0.0.0.0
+      HOME: /home/agents
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: safe.directory
+      GIT_CONFIG_VALUE_0: "*"
+    depends_on:
+      secrets:
+        condition: service_healthy
+      herdr-init:
+        condition: service_completed_successfully
+    volumes:
+      - type: bind
+        source: ${AGENTS_REPO_PATH}
+        target: ${AGENTS_REPO_PATH}
+      - type: bind
+        source: ${AGENTS_GIT_COMMON_DIR}
+        target: ${AGENTS_GIT_COMMON_DIR}
+      - type: volume
+        source: herdr-home
+        target: /home/agents/.config/herdr
+      - type: bind
+        source: /dev/null
+        target: ${AGENTS_REPO_PATH}/.env.local
+        read_only: true
+      - type: bind
+        source: /dev/null
+        target: ${AGENTS_REPO_PATH}/.env.sops-age
+        read_only: true
+      - type: bind
+        source: /dev/null
+        target: ${AGENTS_REPO_PATH}/agent-secrets.sops.json
+        read_only: true
+      - type: tmpfs
+        target: ${AGENTS_REPO_PATH}/.sops-isolated-home
+      - type: tmpfs
+        target: ${AGENTS_REPO_PATH}/.agents/runtime/system-auth
+      - type: bind
+        source: ${AGENTS_PROVIDER_AUTH_FILE}
+        target: /run/secrets/provider-auth
+        read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev
+      - /run:rw,noexec,nosuid,nodev
+    ports:
+      - 127.0.0.1:${AGENTS_WEB_PORT}:${AGENTS_WEB_PORT}
+    networks:
+      agents-system:
+        ipv4_address: 172.30.1.2
+    labels:
+      dev.agents.instance: ${AGENTS_INSTANCE_ID}
+      dev.agents.topology: ${AGENTS_TOPOLOGY_ID}
+      dev.agents.retention: persistent
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "/opt/agents/.venv/bin/python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${AGENTS_WEB_PORT}/health', timeout=2)",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  herdr-init:
+    image: ${AGENTS_SYSTEM_IMAGE}
+    user: "0:0"
+    command: ["sh", "-c", "chown -R ${AGENTS_UID}:${AGENTS_GID} /herdr"]
+    volumes:
+      - type: volume
+        source: herdr-home
+        target: /herdr
+    network_mode: none
+    labels:
+      dev.agents.instance: ${AGENTS_INSTANCE_ID}
+      dev.agents.topology: ${AGENTS_TOPOLOGY_ID}
+      dev.agents.retention: ephemeral
+
+  secrets:
+    image: ${AGENTS_SECRETS_IMAGE}
+    user: "0:0"
+    working_dir: /opt/agents
+    command: ["agents-secrets-broker"]
+    environment:
+      AGENTS_CONFIG: /run/agents.toml
+      AGENTS_BROKER_HOST: 172.30.1.3
+      AGENTS_BROKER_PORT: "9891"
+      AGENTS_BROKER_CHILD_UID: ${AGENTS_UID}
+      AGENTS_BROKER_CHILD_GID: ${AGENTS_GID}
+      AGENTS_BROKER_SECRETS_ROOT: /run/agents-secrets
+      AGENTS_BROKER_ENV_SCHEMA: /run/agents-secrets/env-schema
+      AGENTS_BROKER_DB_PATH: /run/agents-secrets/agents.db
+      AGENTS_BROKER_AUTH_KEY_PATH: /run/agents-secrets/agent-auth-key
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETUID
+      - SETGID
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - type: bind
+        source: ${AGENTS_BROKER_CONFIG_PATH}
+        target: /run/agents.toml
+        read_only: true
+      - type: bind
+        source: ${AGENTS_ENV_SCHEMA_PATH}
+        target: /run/agents-secrets/env-schema
+        read_only: true
+      - type: bind
+        source: ${AGENTS_SOPS_CONFIG_PATH}
+        target: /run/agents-secrets/sops-config
+        read_only: true
+      - type: bind
+        source: ${AGENTS_AGE_KEY_PATH}
+        target: /run/agents-secrets/age-key
+        read_only: true
+      - type: bind
+        source: ${AGENTS_SOPS_HOME_PATH}
+        target: /run/agents-secrets/sops-home
+        read_only: true
+      - type: bind
+        source: ${AGENTS_SECRET_STORE_PATH}
+        target: /run/agents-secrets/store
+      - type: bind
+        source: ${AGENTS_REPO_PATH}/.agents/agents.db
+        target: /run/agents-secrets/agents.db
+        read_only: true
+      - type: bind
+        source: ${AGENTS_REPO_PATH}/.agents/agent-auth-key
+        target: /run/agents-secrets/agent-auth-key
+        read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev
+      - /run:rw,noexec,nosuid,nodev
+    networks:
+      agents-system:
+        ipv4_address: 172.30.1.3
+    labels:
+      dev.agents.instance: ${AGENTS_INSTANCE_ID}
+      dev.agents.topology: ${AGENTS_TOPOLOGY_ID}
+      dev.agents.retention: ephemeral
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "/opt/agents/.venv/bin/python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://172.30.1.3:9891/health', timeout=2)",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+networks:
+  agents-system:
+    external: true
+    name: agents-system
+
+volumes:
+  herdr-home:
+    labels:
+      dev.agents.instance: ${AGENTS_INSTANCE_ID}
+      dev.agents.retention: persistent

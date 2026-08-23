@@ -499,14 +499,14 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
 
     def test_dispatch_failure_releases_capacity_and_removes_git_artifacts(self):
         item, _ = self.ready_item()
-        from agents.git_worktree import reserve_execution as real_reserve
+        from agents.git_worktree import reserve_execution_workspace as real_reserve
 
         def fail_after_git(*args, **kwargs):
             real_reserve(*args, **kwargs)
             raise RuntimeError("injected dispatch failure")
 
         with (
-            patch("agents.delivery.reserve_execution", side_effect=fail_after_git),
+            patch("agents.delivery.reserve_execution_workspace", side_effect=fail_after_git),
             self.assertRaisesRegex(RuntimeError, "injected dispatch failure"),
         ):
             self.delivery.dispatch_next()

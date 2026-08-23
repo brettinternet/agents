@@ -156,6 +156,7 @@ def materialize_profile(
     token: str,
     api_url: str,
     reasoning_effort: str = "",
+    mcp_command: str | None = None,
 ) -> MaterializedProfile:
     if provider not in PROVIDER_CAPABILITIES:
         raise ProfileError("unsupported provider capability")
@@ -180,8 +181,8 @@ def materialize_profile(
         if reasoning_effort:
             meta += f"reasoningEffort: {json.dumps(reasoning_effort)}\n"
         meta += "allowedTools:\n" + "".join(f"  - {json.dumps(tool)}\n" for tool in (*tools, f"@{mcp}"))
-        mcp_command = str(root / ".venv/bin/agents-mcp-server")
-        meta += f"mcpServers:\n  {mcp}:\n    type: stdio\n    command: {mcp_command}\n"
+        command = mcp_command or str(root / ".venv/bin/agents-mcp-server")
+        meta += f"mcpServers:\n  {mcp}:\n    type: stdio\n    command: {command}\n"
         meta += (
             f"    env:\n      AGENTS_AGENT_TOKEN: {json.dumps(token)}\n      AGENTS_API_URL: {json.dumps(api_url)}\n"
         )
@@ -206,7 +207,7 @@ def materialize_profile(
             allowed_tools=tools,
             reasoning_effort=reasoning_effort,
             secret_values=(("AGENTS_AGENT_TOKEN", token),),
-            mcp_command=mcp_command,
+            mcp_command=command,
             api_url=api_url,
         )
     finally:

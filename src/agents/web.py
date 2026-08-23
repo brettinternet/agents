@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import errno
 import hashlib
 import json
 import os
+import pty
 import sqlite3
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -12,7 +15,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 import uvicorn
-from fastapi import Depends, FastAPI, Form, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Form, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -29,11 +32,22 @@ from .auth import (
     verify_human_session,
 )
 from .config import AgentsConfig, load
+from .container_runtime import ContainerGarbageCollector, ContainerRuntimeError
 from .db import MutationConflict, canonical_json, connect, migrate, mutation, utc_now
 from .delivery import Delivery
 from .messages import Messages, Messaging
 from .policy import DomainError, validate_request_id, validate_text
 from .reconciler import Reconciler
+from .secret_store import (
+    SecretStoreError,
+    broker_values,
+    check_store,
+    set_secret_value,
+    unset_secret,
+)
+from .secret_store import (
+    resolve_paths as resolve_secret_paths,
+)
 from .service import acquire_daemon_lock
 from .store import Store
 from .workflow import Workflow
@@ -137,6 +151,51 @@ HumanMutation = Annotated[HumanSession, Depends(_human_mutation)]
 AgentAuth = Annotated[AgentContext, Depends(_agent)]
 
 
+def _require_secret_access(context: AgentContext) -> None:
+    if context.purpose_kind not in {"work", "review"}:
+        raise HTTPException(403, detail=error("unauthorized", "execution is not authorized to access managed secrets"))
+
+
+def _sensitive_names(root: Path) -> set[str]:
+    names: set[str] = set()
+    sensitive = False
+    schema = Path(os.environ.get("AGENTS_BROKER_ENV_SCHEMA", root / ".env.schema"))
+    for line in schema.read_text().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            sensitive = "@sensitive" in stripped or (sensitive and stripped.startswith("#"))
+            continue
+        if "=" in stripped:
+            name = stripped.split("=", 1)[0]
+            if sensitive:
+                names.add(name)
+        sensitive = False
+    return names
+
+
+def _declared_secret(request: Request, name: object) -> str:
+    if not isinstance(name, str) or name not in _sensitive_names(request.app.state.config.root):
+        raise HTTPException(403, detail=error("unauthorized", "secret name is not declared sensitive"))
+    return name
+
+
+def _broker_child_identity() -> dict[str, int]:
+    uid_value = os.environ.get("AGENTS_BROKER_CHILD_UID")
+    gid_value = os.environ.get("AGENTS_BROKER_CHILD_GID")
+    if uid_value is None and gid_value is None:
+        return {}
+    if (
+        uid_value is None
+        or gid_value is None
+        or not uid_value.isdecimal()
+        or not gid_value.isdecimal()
+        or int(uid_value) <= 0
+        or int(gid_value) <= 0
+    ):
+        raise OSError("broker child UID/GID must both be positive integers")
+    return {"user": int(uid_value), "group": int(gid_value)}
+
+
 def _domain(call):
     try:
         return call()
@@ -169,10 +228,37 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.config = config
     app.state.connection = connection
     app.state.agent_auth_key = agent_auth_key
-    reconciler_task = asyncio.create_task(Reconciler(config, connection).run())
+    reconciler = Reconciler(config, connection)
+    await reconciler.run_once()
+    reconciler_task = asyncio.create_task(reconciler.run())
+    gc_task: asyncio.Task[None] | None = None
+    if str(config.execution.isolation) == "container" and config.execution.container is not None:
+        collector = ContainerGarbageCollector(config, connection)
+        gc_interval = config.execution.container.gc_interval_seconds
+
+        async def collect_containers() -> None:
+            while True:
+                try:
+                    await asyncio.to_thread(collector.collect)
+                except (ContainerRuntimeError, OSError, ValueError) as exc:
+                    now = utc_now()
+                    connection.execute(
+                        "INSERT INTO incidents("
+                        "kind,entity_kind,entity_id,severity,state,summary,details_json,created_at,updated_at"
+                        ") VALUES('container_gc_failed','container','global','high','open',?,'{}',?,?)",
+                        (str(exc), now, now),
+                    )
+                    connection.commit()
+                await asyncio.sleep(gc_interval)
+
+        gc_task = asyncio.create_task(collect_containers())
     try:
         yield
     finally:
+        if gc_task is not None:
+            gc_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await gc_task
         reconciler_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await reconciler_task
@@ -345,6 +431,213 @@ def create_app(config: AgentsConfig | None = None, connection: sqlite3.Connectio
     @app.get("/agent/v1/health")
     async def agent_health(context: AgentAuth):
         return ok({"actor": context.actor_slug, "purpose_kind": context.purpose_kind, "purpose_id": context.purpose_id})
+
+    @app.post("/agent/v1/secrets/list")
+    async def agent_secret_list(request: Request, context: AgentAuth):
+        _require_secret_access(context)
+        try:
+            values = broker_values(resolve_secret_paths(request.app.state.config.root))
+        except SecretStoreError as exc:
+            raise HTTPException(409, detail=error("secret_store", str(exc))) from exc
+        declared = _sensitive_names(request.app.state.config.root)
+        return ok({"names": sorted(name for name in values if name in declared)})
+
+    @app.post("/agent/v1/secrets/check")
+    async def agent_secret_check(request: Request, context: AgentAuth):
+        _require_secret_access(context)
+        try:
+            check_store(resolve_secret_paths(request.app.state.config.root))
+        except SecretStoreError as exc:
+            raise HTTPException(409, detail=error("secret_store", str(exc))) from exc
+        return ok({})
+
+    @app.post("/agent/v1/secrets/reveal")
+    async def agent_secret_reveal(request: Request, context: AgentAuth):
+        _require_secret_access(context)
+        body = await _json_body(request)
+        name = _declared_secret(request, body.get("name"))
+        try:
+            value = broker_values(resolve_secret_paths(request.app.state.config.root), [name])[name]
+        except SecretStoreError as exc:
+            raise HTTPException(409, detail=error("secret_store", str(exc))) from exc
+        return ok({"value_base64": base64.b64encode(value.encode()).decode()})
+
+    @app.post("/agent/v1/secrets/set")
+    async def agent_secret_set(request: Request, context: AgentAuth):
+        _require_secret_access(context)
+        body = await _json_body(request)
+        name = _declared_secret(request, body.get("name"))
+        encoded = body.get("value_base64")
+        if not isinstance(encoded, str):
+            raise HTTPException(400, detail=error("malformed_json", "value_base64 must be a string"))
+        try:
+            value = base64.b64decode(encoded, validate=True)
+            set_secret_value(resolve_secret_paths(request.app.state.config.root), name, value)
+        except (ValueError, SecretStoreError) as exc:
+            raise HTTPException(409, detail=error("secret_store", str(exc))) from exc
+        return ok({})
+
+    @app.post("/agent/v1/secrets/unset")
+    async def agent_secret_unset(request: Request, context: AgentAuth):
+        _require_secret_access(context)
+        body = await _json_body(request)
+        name = _declared_secret(request, body.get("name"))
+        try:
+            unset_secret(resolve_secret_paths(request.app.state.config.root), name)
+        except SecretStoreError as exc:
+            raise HTTPException(409, detail=error("secret_store", str(exc))) from exc
+        return ok({})
+
+    @app.websocket("/agent/v1/secrets/run")
+    async def agent_secret_run(websocket: WebSocket):
+        authorization = websocket.headers.get("authorization", "")
+        execution_id = websocket.headers.get("x-agents-execution-id", "")
+        connection: sqlite3.Connection = websocket.app.state.connection
+        project = connection.execute("SELECT instance_id FROM project WHERE id=1").fetchone()
+        try:
+            if not authorization.startswith("Bearer ") or not execution_id or project is None:
+                raise AuthenticationError("agent credentials required")
+            key = getattr(websocket.app.state, "agent_auth_key", None)
+            if key is None:
+                key = read_agent_auth_key(websocket.app.state.config.state_dir / "agent-auth-key")
+            context = authenticate_agent(
+                connection,
+                execution_id,
+                authorization.removeprefix("Bearer "),
+                key,
+                str(project[0]),
+            )
+            if context.purpose_kind not in {"work", "review"}:
+                raise AuthenticationError("execution is not authorized to access managed secrets")
+            row = connection.execute(
+                "SELECT working_directory FROM terminal_runs WHERE id=?",
+                (context.terminal_run_id,),
+            ).fetchone()
+            if row is None:
+                raise AuthenticationError("execution workspace is unavailable")
+            child_cwd = Path(str(row[0]))
+            if child_cwd.is_symlink() or not child_cwd.is_dir():
+                raise AuthenticationError("execution workspace is unsafe")
+            child_cwd = child_cwd.resolve(strict=True)
+        except AuthenticationError, OSError, ValueError:
+            await websocket.close(code=4401)
+            return
+        await websocket.accept()
+        try:
+            initial = await websocket.receive_json()
+            names = initial.get("names") if isinstance(initial, dict) else None
+            argv = initial.get("argv") if isinstance(initial, dict) else None
+            tty = initial.get("tty") if isinstance(initial, dict) else None
+            if (
+                not isinstance(names, list)
+                or not names
+                or not all(isinstance(name, str) for name in names)
+                or len(names) != len(set(names))
+                or not isinstance(argv, list)
+                or not argv
+                or not all(isinstance(value, str) for value in argv)
+                or not isinstance(tty, bool)
+            ):
+                await websocket.send_json({"error": "invalid run request"})
+                await websocket.close(code=4400)
+                return
+            declared = _sensitive_names(websocket.app.state.config.root)
+            if any(name not in declared for name in names):
+                await websocket.send_json({"error": "secret name is not declared sensitive"})
+                await websocket.close(code=4403)
+                return
+            values = broker_values(resolve_secret_paths(websocket.app.state.config.root), names)
+            environment = {
+                key: value
+                for key, value in os.environ.items()
+                if key in {"PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR"}
+            }
+            environment.update(values)
+            common = {
+                "cwd": child_cwd,
+                "env": environment,
+                "start_new_session": True,
+            }
+            master_fd: int | None = None
+            common.update(_broker_child_identity())
+            if tty:
+                master_fd, slave_fd = pty.openpty()
+                try:
+                    process = await asyncio.create_subprocess_exec(
+                        *argv,
+                        stdin=slave_fd,
+                        stdout=slave_fd,
+                        stderr=slave_fd,
+                        **common,
+                    )
+                finally:
+                    os.close(slave_fd)
+
+                async def tty_output() -> None:
+                    assert master_fd is not None
+                    while True:
+                        try:
+                            chunk = await asyncio.to_thread(os.read, master_fd, 65536)
+                        except OSError as exc:
+                            if exc.errno == errno.EIO:
+                                return
+                            raise
+                        if not chunk:
+                            return
+                        await websocket.send_bytes(b"\x01" + chunk)
+
+                readers = [asyncio.create_task(tty_output())]
+            else:
+                process = await asyncio.create_subprocess_exec(
+                    *argv,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    **common,
+                )
+
+                async def output(stream: asyncio.StreamReader | None, prefix: bytes) -> None:
+                    if stream is None:
+                        return
+                    while chunk := await stream.read(65536):
+                        await websocket.send_bytes(prefix + chunk)
+
+                readers = [
+                    asyncio.create_task(output(process.stdout, b"\x01")),
+                    asyncio.create_task(output(process.stderr, b"\x02")),
+                ]
+
+            async def input_frames() -> None:
+                while True:
+                    message = await websocket.receive()
+                    if message.get("bytes") is not None:
+                        chunk = message["bytes"]
+                        if master_fd is not None:
+                            await asyncio.to_thread(os.write, master_fd, chunk)
+                        elif process.stdin is not None:
+                            process.stdin.write(chunk)
+                            await process.stdin.drain()
+                    elif message.get("text"):
+                        frame = json.loads(message["text"])
+                        if isinstance(frame, dict) and frame.get("stdin_eof") is True:
+                            if master_fd is not None:
+                                await asyncio.to_thread(os.write, master_fd, b"\x04")
+                            elif process.stdin is not None:
+                                process.stdin.close()
+                            return
+
+            receiver = asyncio.create_task(input_frames())
+            exit_code = await process.wait()
+            await asyncio.gather(*readers)
+            receiver.cancel()
+            with contextlib.suppress(asyncio.CancelledError, WebSocketDisconnect):
+                await receiver
+            if master_fd is not None:
+                os.close(master_fd)
+            await websocket.send_json({"exit_code": exit_code})
+        except (SecretStoreError, OSError, ValueError, WebSocketDisconnect) as exc:
+            with contextlib.suppress(RuntimeError, WebSocketDisconnect):
+                await websocket.send_json({"error": str(exc)})
 
     @app.get("/agent/v1/backlog")
     async def backlog(
@@ -1301,9 +1594,33 @@ def create_app(config: AgentsConfig | None = None, connection: sqlite3.Connectio
     return app
 
 
+def create_secret_broker_app(config: AgentsConfig, connection: sqlite3.Connection) -> FastAPI:
+    app = create_app(config, connection)
+    app.router.routes = [
+        route for route in app.router.routes if getattr(route, "path", "").startswith("/agent/v1/secrets/")
+    ]
+
+    @app.get("/health")
+    async def broker_health():
+        return {"ok": True, "service": "agents-secrets"}
+
+    return app
+
+
+def _listen_host(config: AgentsConfig) -> str:
+    if os.environ.get("AGENTS_SYSTEM_CONTAINER") == "1":
+        override = os.environ.get("AGENTS_WEB_LISTEN_HOST", "")
+        if override != "0.0.0.0":
+            raise RuntimeError("whole-system container listener must be 0.0.0.0")
+        return override
+    if str(config.execution.isolation) == "container":
+        return "0.0.0.0"
+    return config.web.host
+
+
 app = create_app()
 
 
 def main() -> None:
     config = load()
-    uvicorn.run("agents.web:app", host=config.web.host, port=config.web.port, workers=1, access_log=False)
+    uvicorn.run("agents.web:app", host=_listen_host(config), port=config.web.port, workers=1, access_log=False)

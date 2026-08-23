@@ -10,7 +10,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from agents import secret_store
 
@@ -548,6 +548,37 @@ class SecretStoreTests(unittest.TestCase):
             self.assertNotIn("SOPS_AGE_KEY_FILE", command_env)
             self.assertNotIn("SOPS_KMS_ARN", command_env)
             self.assertEqual(command_env["DEMO_TOKEN"], "value")
+
+    def test_agent_api_transport_authenticates_and_keeps_secret_out_of_url_and_headers(self):
+        response = MagicMock()
+        response.json.return_value = {"ok": True, "data": {}}
+        environment = {
+            "AGENTS_SECRETS_TRANSPORT": "agent-api",
+            "AGENTS_API_URL": "http://host.docker.internal:9890",
+            "AGENTS_AGENT_TOKEN": "run-token",
+            "AGENTS_EXECUTION_ID": "execution-id",
+        }
+        secret = b"exact-secret-bytes"
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch.object(secret_store.httpx, "post", return_value=response) as post,
+        ):
+            secret_store._agent_api_request(
+                "set",
+                {"name": "DEMO_TOKEN", "value_base64": secret_store.base64.b64encode(secret).decode()},
+            )
+        call = post.call_args
+        self.assertEqual(call.args[0], "http://host.docker.internal:9890/agent/v1/secrets/set")
+        self.assertEqual(
+            call.kwargs["headers"],
+            {"Authorization": "Bearer run-token", "X-Agents-Execution-ID": "execution-id"},
+        )
+        self.assertNotIn(secret.decode(), call.args[0])
+        self.assertNotIn(secret.decode(), json.dumps(call.kwargs["headers"]))
+        self.assertEqual(
+            secret_store.base64.b64decode(call.kwargs["json"]["value_base64"]),
+            secret,
+        )
 
 
 if __name__ == "__main__":

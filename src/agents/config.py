@@ -6,6 +6,7 @@ import sqlite3
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -21,6 +22,8 @@ _ALLOWED_ENV = {
     "AGENTS_EFFORT",
     "AGENTS_WEB_PORT",
     "AGENTS_WEB_TOKEN",
+    "AGENTS_ISOLATION",
+    "AGENTS_CONTAINER_IMAGE",
 }
 _MODEL_ID = re.compile(r"^[A-Za-z0-9._:/-]{1,128}$")
 
@@ -28,6 +31,7 @@ _EFFORT = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
 _SCHEDULE_SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _SCHEDULE_DURATION = re.compile(r"^([1-9][0-9]*)([mhd])$")
 _SCHEDULE_CHANNELS = frozenset({"#general", "#findings", "#publishing", "#coordination", "#incidents"})
+_COLIMA_PROFILE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
 class ConfigError(ValueError):
@@ -58,6 +62,23 @@ class ModelChoice:
     effort: str = ""
 
 
+class IsolationMode(StrEnum):
+    HOST = "host"
+    CONTAINER = "container"
+
+
+@dataclass(frozen=True)
+class ContainerConfig:
+    colima_profile: str
+    image: str
+    cpus: float
+    memory_mb: int
+    pids_limit: int
+    gc_interval_seconds: int
+    gc_grace_seconds: int
+    build_cache_retention_hours: int
+
+
 @dataclass(frozen=True)
 class ExecutionConfig:
     backend: str
@@ -66,6 +87,8 @@ class ExecutionConfig:
     provider: str
     provider_id: str
     models: tuple[ModelChoice, ...]
+    isolation: IsolationMode = IsolationMode.HOST
+    container: ContainerConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -388,6 +411,50 @@ def load(path: Path | None = None, env: dict[str, str] | None = None) -> AgentsC
     except (TypeError, ValueError) as exc:
         raise ConfigError("configured ports must be integers") from exc
     host = str(web_raw.get("host", ""))
+    isolation_value = values.get("AGENTS_ISOLATION", execution_raw.get("isolation", IsolationMode.HOST.value))
+    try:
+        isolation = IsolationMode(isolation_value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("execution.isolation must be 'host' or 'container'") from exc
+    container_raw = execution_raw.get("container")
+    if container_raw is not None and not isinstance(container_raw, dict):
+        raise ConfigError("execution.container must be a table")
+    if isolation is IsolationMode.CONTAINER and container_raw is None:
+        raise ConfigError("execution.container is required in container mode")
+    container: ContainerConfig | None = None
+    if isinstance(container_raw, dict):
+        profile = container_raw.get("colima_profile")
+        if not isinstance(profile, str) or not _COLIMA_PROFILE.fullmatch(profile):
+            raise ConfigError("execution.container.colima_profile must be a simple profile name")
+        image = values.get("AGENTS_CONTAINER_IMAGE", container_raw.get("image"))
+        if not isinstance(image, str) or not image.strip() or any(character.isspace() for character in image):
+            raise ConfigError("execution.container.image must be a nonempty OCI image reference")
+        cpus_value = container_raw.get("cpus")
+        if isinstance(cpus_value, bool):
+            raise ConfigError("execution.container.cpus must be positive")
+        try:
+            cpus = float(cast(float | int | str, cpus_value))
+        except (TypeError, ValueError) as exc:
+            raise ConfigError("execution.container.cpus must be positive") from exc
+        if cpus <= 0:
+            raise ConfigError("execution.container.cpus must be positive")
+        container = ContainerConfig(
+            colima_profile=profile,
+            image=image,
+            cpus=cpus,
+            memory_mb=_integer(container_raw.get("memory_mb"), "execution.container.memory_mb"),
+            pids_limit=_integer(container_raw.get("pids_limit"), "execution.container.pids_limit"),
+            gc_interval_seconds=_integer(
+                container_raw.get("gc_interval_seconds"), "execution.container.gc_interval_seconds"
+            ),
+            gc_grace_seconds=_integer(container_raw.get("gc_grace_seconds"), "execution.container.gc_grace_seconds"),
+            build_cache_retention_hours=_integer(
+                container_raw.get("build_cache_retention_hours"),
+                "execution.container.build_cache_retention_hours",
+            ),
+        )
+    if isolation is IsolationMode.CONTAINER and host != "127.0.0.1":
+        raise ConfigError("web.host must be 127.0.0.1 in container mode")
     if host not in {"127.0.0.1", "localhost", "::1"}:
         raise ConfigError("web.host must be loopback")
     project_path = (root / str(project_raw.get("path", ""))).resolve()
@@ -424,6 +491,8 @@ def load(path: Path | None = None, env: dict[str, str] | None = None) -> AgentsC
             provider=provider,
             provider_id=_PROVIDER_MAP[provider],
             models=_models(execution_raw, values, provider),
+            isolation=isolation,
+            container=container,
         ),
         web=WebConfig(host, web_port),
         actors=actor_rows,

@@ -28,6 +28,7 @@ class RunSpec:
     env: tuple[tuple[str, str], ...]
     provider: str
     mock: bool = False
+    container_image_id: str = ""
 
     @property
     def environment(self) -> Mapping[str, str]:

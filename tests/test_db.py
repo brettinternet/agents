@@ -104,7 +104,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.connection.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
         self.assertEqual(
             [row[0] for row in self.connection.execute("SELECT version FROM schema_migrations ORDER BY version")],
-            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
         )
         terminal_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(terminal_runs)")}
         self.assertTrue(
@@ -112,6 +112,7 @@ class DatabaseTests(unittest.TestCase):
                 "reasoning_effort",
                 "execution_name",
                 "execution_backend",
+                "container_image_id",
                 "backend_run_id",
                 "backend_terminal_id",
                 "agent_auth_id",

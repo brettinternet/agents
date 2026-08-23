@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import os
 import secrets
 import sqlite3
 from datetime import UTC, datetime, timedelta
@@ -10,7 +11,8 @@ from pathlib import Path
 from typing import Any
 
 from .auth import derive_agent_token, read_private_secret, token_digest
-from .config import AgentsConfig
+from .config import AgentsConfig, IsolationMode
+from .container_runtime import ContainerRuntime, build_execution_backend
 from .db import canonical_json, utc_now
 from .execution import (
     ExecutionBackend,
@@ -26,8 +28,7 @@ from .execution import (
     RunSnapshot,
     RunSpec,
 )
-from .git_worktree import GitError, head_sha, remove_recorded_worktree
-from .herdr_client import HerdrBackend
+from .git_worktree import GitError, head_sha, remove_recorded_workspace
 from .profiles import (
     PROVIDER_CAPABILITIES,
     ProfileError,
@@ -43,6 +44,18 @@ _RETRY = (1, 5, 30, 120, 300)
 
 _COMPLETION_STATUSES = {"completed", "complete", "done", "exited", "stopped"}
 _STALE_CWD_REPLACED = "stale backend workspace replaced after cwd mismatch"
+
+
+def _api_url(config: AgentsConfig) -> str:
+    host = "host.docker.internal" if config.execution.isolation is IsolationMode.CONTAINER else "127.0.0.1"
+    return f"http://{host}:{config.web.port}"
+
+
+def _profile_runtime(config: AgentsConfig, agent_auth_id: str) -> tuple[Path | None, Path]:
+    if config.execution.isolation is IsolationMode.HOST:
+        return None, config.state_dir / "runtime"
+    root = config.state_dir / "runtime" / agent_auth_id
+    return root / "home", root / "provider"
 
 
 def _normalize_status(status: str | None) -> str:
@@ -112,12 +125,21 @@ def _reserve_terminal_unchecked(
     )
     now = utc_now()
     provider = config.execution.provider_id
+    execution_backend = "herdr-container" if config.execution.isolation is IsolationMode.CONTAINER else "herdr"
+    container_image_id: str | None = None
+    if config.execution.isolation is IsolationMode.CONTAINER:
+        if config.execution.container is None:
+            raise RuntimeError("container configuration is required")
+        container_image_id = ContainerRuntime(config.execution.container).resolve_image_id(
+            config.execution.container.image
+        )
     model = secrets.choice(config.models_for(actor))
     cursor = connection.execute(
-        "INSERT INTO terminal_runs(execution_name,execution_backend,profile_name,mcp_name,profile_sha256,provider,model,reasoning_effort,generation,actor_slug,purpose_kind,purpose_id,working_directory,token_digest,agent_auth_id,profile_state,state,output_tail,launch_count,created_at,updated_at)VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'',0,?,?)",
+        "INSERT INTO terminal_runs(execution_name,execution_backend,container_image_id,profile_name,mcp_name,profile_sha256,provider,model,reasoning_effort,generation,actor_slug,purpose_kind,purpose_id,working_directory,token_digest,agent_auth_id,profile_state,state,output_tail,launch_count,created_at,updated_at)VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'',0,?,?)",
         (
             "reserved",
-            config.execution.backend,
+            execution_backend,
+            container_image_id,
             "reserved",
             "reserved",
             "",
@@ -219,7 +241,7 @@ class Reconciler:
     ) -> None:
         self.config = config
         self.connection = connection
-        self.backend = backend or HerdrBackend.from_config(config)
+        self.backend = backend or build_execution_backend(config)
         self._dirty_runs: set[int] = set()
         self._terminated_runs: set[int] = set()
         self._event_task: asyncio.Task[Any] | None = None
@@ -310,6 +332,9 @@ class Reconciler:
 
     def _fence_stale_provider_runs(self) -> None:
         configured = self.config.execution.provider_id
+        configured_backend = (
+            "herdr-container" if self.config.execution.isolation is IsolationMode.CONTAINER else "herdr"
+        )
         for run in list(
             self.connection.execute(
                 "SELECT DISTINCT tr.* FROM terminal_runs tr LEFT JOIN launch_attempts la "
@@ -318,14 +343,16 @@ class Reconciler:
             )
         ):
             provider = str(run["provider"])
-            if provider == configured and provider in PROVIDER_CAPABILITIES:
+            stored_backend = str(run["execution_backend"])
+            if provider == configured and provider in PROVIDER_CAPABILITIES and stored_backend == configured_backend:
                 continue
             self._recover_terminal(
                 run,
-                f"stored provider {provider!r} is not the configured supported provider {configured!r}",
+                f"stored provider/backend {provider!r}/{stored_backend!r} does not match "
+                f"configured {configured!r}/{configured_backend!r}",
                 terminal_state="ending",
-                blocker_kind="provider_changed",
-                incident_kind="provider_changed",
+                blocker_kind="provider_or_backend_changed",
+                incident_kind="provider_or_backend_changed",
             )
 
     async def run_once(self) -> None:
@@ -507,19 +534,26 @@ class Reconciler:
                 purpose_kind=str(run["purpose_kind"]),
                 specialty=run["specialty"],
                 token=token,
-                api_url=f"http://127.0.0.1:{self.config.web.port}",
+                api_url=_api_url(self.config),
                 reasoning_effort=str(run["reasoning_effort"]),
+                mcp_command=(
+                    "/opt/agents/.venv/bin/agents-mcp-server"
+                    if self.config.execution.isolation is IsolationMode.CONTAINER
+                    else None
+                ),
             )
             if not self._launch_fence(run_id, {"reserved"}, {"reserved"}):
                 self._discard_profile(materialized, [])
                 return
+            provider_home, provider_runtime = _profile_runtime(self.config, str(run["agent_auth_id"]))
             async with self._profile_lock:
                 launch = await asyncio.to_thread(
                     install_profile,
                     materialized,
                     str(run["provider"]),
                     self.config.state_dir / "profiles.lock",
-                    runtime_dir=self.config.state_dir / "runtime",
+                    provider_home=provider_home,
+                    runtime_dir=provider_runtime,
                     agent_auth_id=str(run["agent_auth_id"]),
                     model=str(run["model"]),
                 )
@@ -579,10 +613,13 @@ class Reconciler:
             environment.update(
                 {
                     "AGENTS_AGENT_TOKEN": token,
-                    "AGENTS_API_URL": f"http://127.0.0.1:{self.config.web.port}",
+                    "AGENTS_API_URL": _api_url(self.config),
                     "AGENTS_EXECUTION_ID": str(run["agent_auth_id"]),
                 }
             )
+            if broker_url := os.environ.get("AGENTS_SECRETS_API_URL"):
+                environment["AGENTS_SECRETS_API_URL"] = broker_url
+                environment["AGENTS_SECRETS_TRANSPORT"] = "agent-api"
             spec = RunSpec(
                 str(run["execution_name"]),
                 run_id,
@@ -594,6 +631,7 @@ class Reconciler:
                 tuple(sorted(environment.items())),
                 provider,
                 mock,
+                str(run["container_image_id"] or ""),
             )
             posted = True
             snapshot = await asyncio.to_thread(self.backend.create_run, spec)
@@ -813,12 +851,16 @@ class Reconciler:
                     "secret_fields_json": "{}",
                 }
             ]
+            provider_home, provider_runtime = _profile_runtime(
+                self.config, str(row["agent_auth_id"]) if row is not None else ""
+            )
             remove_profile(
                 str(materialized.name),
                 Path(materialized.path),
                 managed_artifacts,
                 self.config.state_dir / "profiles.lock",
-                runtime_dir=self.config.state_dir / "runtime",
+                provider_home=provider_home,
+                runtime_dir=provider_runtime,
                 secret_values=dict(getattr(materialized, "secret_values", None) or {}),
             )
             if row is not None:
@@ -878,16 +920,23 @@ class Reconciler:
             purpose_kind=str(run["purpose_kind"]),
             specialty=run["specialty"],
             token=token,
-            api_url=f"http://127.0.0.1:{self.config.web.port}",
+            api_url=_api_url(self.config),
             reasoning_effort=str(run["reasoning_effort"]),
+            mcp_command=(
+                "/opt/agents/.venv/bin/agents-mcp-server"
+                if self.config.execution.isolation is IsolationMode.CONTAINER
+                else None
+            ),
         )
+        provider_home, provider_runtime = _profile_runtime(self.config, str(run["agent_auth_id"]))
         async with self._profile_lock:
             launch = await asyncio.to_thread(
                 install_profile,
                 materialized,
                 str(run["provider"]),
                 self.config.state_dir / "profiles.lock",
-                runtime_dir=self.config.state_dir / "runtime",
+                provider_home=provider_home,
+                runtime_dir=provider_runtime,
                 agent_auth_id=str(run["agent_auth_id"]),
                 model=str(run["model"]),
             )
@@ -896,10 +945,13 @@ class Reconciler:
         environment.update(
             {
                 "AGENTS_AGENT_TOKEN": token,
-                "AGENTS_API_URL": f"http://127.0.0.1:{self.config.web.port}",
+                "AGENTS_API_URL": _api_url(self.config),
                 "AGENTS_EXECUTION_ID": str(run["agent_auth_id"]),
             }
         )
+        if broker_url := os.environ.get("AGENTS_SECRETS_API_URL"):
+            environment["AGENTS_SECRETS_API_URL"] = broker_url
+            environment["AGENTS_SECRETS_TRANSPORT"] = "agent-api"
         return RunSpec(
             str(run["execution_name"]),
             run_id,
@@ -911,6 +963,7 @@ class Reconciler:
             tuple(sorted(environment.items())),
             provider,
             provider == "mock_cli",
+            str(run["container_image_id"] or ""),
         )
 
     async def _adopt(self, run_id: int) -> None:
@@ -1267,6 +1320,7 @@ class Reconciler:
             ]
             key = bytes.fromhex(read_private_secret(self.config.state_dir / "agent-auth-key"))
             token = derive_agent_token(key, str(row["instance_id"]), run_id, int(row["generation"]))
+            provider_home, provider_runtime = _profile_runtime(self.config, str(row["agent_auth_id"]))
             try:
                 await asyncio.to_thread(
                     remove_profile,
@@ -1274,7 +1328,8 @@ class Reconciler:
                     self.config.state_dir / "profiles" / f"{row['profile_name']}.md",
                     artifacts,
                     self.config.state_dir / "profiles.lock",
-                    runtime_dir=self.config.state_dir / "runtime",
+                    provider_home=provider_home,
+                    runtime_dir=provider_runtime,
                     secret_values={"AGENTS_AGENT_TOKEN": token},
                 )
             except (OSError, ProfileError) as exc:
@@ -1572,7 +1627,7 @@ class Reconciler:
                 path = Path(str(row["worktree_path"]))
                 if path.exists():
                     try:
-                        remove_recorded_worktree(self.config.project.path, path, head_sha(path))
+                        remove_recorded_workspace(self.config, self.config.project.path, path, head_sha(path))
                     except (GitError, OSError) as exc:
                         self._incident("worktree_cleanup_mismatch", "worktree", str(path), str(exc))
             for row in self.connection.execute(
@@ -1583,7 +1638,8 @@ class Reconciler:
                 path = Path(str(row["worktree_path"]))
                 if path.exists():
                     try:
-                        remove_recorded_worktree(
+                        remove_recorded_workspace(
+                            self.config,
                             self.config.project.path,
                             path,
                             str(row["target_sha"]),
@@ -1602,7 +1658,8 @@ class Reconciler:
                 path = Path(str(row["worktree_path"]))
                 if path.exists():
                     try:
-                        remove_recorded_worktree(
+                        remove_recorded_workspace(
+                            self.config,
                             self.config.project.path,
                             path,
                             str(row["commit_sha"]),

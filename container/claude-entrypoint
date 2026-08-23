@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+token_file=${AGENTS_CLAUDE_TOKEN_FILE:?missing AGENTS_CLAUDE_TOKEN_FILE}
+if [ -L "$token_file" ] || [ ! -f "$token_file" ]; then
+  echo "unsafe Claude credential file" >&2
+  exit 2
+fi
+CLAUDE_CODE_OAUTH_TOKEN=$(cat "$token_file")
+export CLAUDE_CODE_OAUTH_TOKEN
+unset AGENTS_CLAUDE_TOKEN_FILE
+exec claude "$@"

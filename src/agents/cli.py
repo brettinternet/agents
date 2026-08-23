@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shlex
 import shutil
 import sqlite3
@@ -16,7 +17,7 @@ from . import service
 from .auth import derive_agent_token, read_agent_auth_key
 from .config import AgentsConfig, load, resolve_execution_session
 from .db import connect, migrate, utc_now
-from .git_worktree import GitError, branch_sha, git, reserve_execution, validate_project
+from .git_worktree import GitError, branch_sha, git, reserve_execution_workspace, validate_project
 from .herdr_client import HerdrClient, herdr_executable, herdr_socket_path
 from .profiles import ensure_secret, validate_manifest_artifact, validate_templates
 from .reconciler import reserve_terminal
@@ -58,7 +59,8 @@ _PROVIDER_CLI = {
 def preflight(config: AgentsConfig) -> list[str]:
     errors: list[str] = []
     executable, action = _PROVIDER_CLI[config.execution.provider]
-    if shutil.which(executable) is None:
+    container_mode = str(config.execution.isolation) == "container"
+    if not container_mode and shutil.which(executable) is None:
         errors.append(f"configured provider executable `{executable}` is missing; operator action: {action}")
     if config.execution.backend != "herdr":
         errors.append(f"unsupported execution backend `{config.execution.backend}`")
@@ -68,6 +70,24 @@ def preflight(config: AgentsConfig) -> list[str]:
         herdr_executable()
     except (OSError, RuntimeError, ValueError) as exc:
         errors.append(f"Herdr executable is missing; operator action: install Herdr 0.8.2 ({exc})")
+    if container_mode:
+        if config.execution.container is None:
+            errors.append("[execution.container] is required in container mode")
+        else:
+            from .container_runtime import ContainerRuntime, ContainerRuntimeError
+
+            try:
+                runtime = ContainerRuntime(config.execution.container)
+                runtime.status()
+                runtime.resolve_image_id(config.execution.container.image)
+            except ContainerRuntimeError as exc:
+                errors.append(f"container runtime is unavailable: {exc}")
+        credential = {
+            "opencode": "OPENCODE_AUTH_JSON",
+            "claude": "CLAUDE_CODE_OAUTH_TOKEN",
+        }.get(config.execution.provider)
+        if credential and not os.environ.get(credential):
+            errors.append(f"{credential} is required for containerized {config.execution.provider}")
     for setting, placeholder in (("user.name", "Your Name"), ("user.email", "you@example.com")):
         try:
             value = git(config.project.path, "config", "--get", setting)
@@ -396,7 +416,8 @@ def _seed_development(connection: sqlite3.Connection, config: AgentsConfig) -> N
         (approval, "awaiting_approval", "pending"),
     ):
         worktree = config.root / ".worktrees" / "dev" / str(item["id"]).lower()
-        base_sha, branch = reserve_execution(
+        base_sha, branch = reserve_execution_workspace(
+            config,
             config.project.path,
             config.project.default_branch,
             str(item["id"]),
@@ -469,7 +490,13 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("migrate")
     sub.add_parser("doctor").add_argument("--offline", action="store_true")
     service_parser = sub.add_parser("service")
-    service_parser.add_argument("action", choices=("start", "stop", "status"))
+    service_parser.add_argument("action", choices=("start", "stop", "status", "foreground"))
+    container_parser = sub.add_parser("container")
+    container_parser.add_argument(
+        "action",
+        choices=("runtime-init", "build", "start", "stop", "status", "gc", "janitor", "reset", "smoke"),
+    )
+    container_parser.add_argument("topology", nargs="?", choices=("agent", "system"), default="system")
     for name in ("dashboard", "sessions", "smoke", "dev-mock", "shutdown"):
         sub.add_parser(name)
     args = parser.parse_args(argv)
@@ -500,8 +527,21 @@ def main(argv: list[str] | None = None) -> None:
             service.start(config)
         elif args.action == "stop":
             service.stop(config)
+        elif args.action == "foreground":
+            _prepare(config)
+            install_integration(config)
+            service.foreground(config)
         else:
             print(service.status(config))
+        errors = []
+    elif args.command == "container":
+        from . import container_commands
+
+        action = args.action.replace("-", "_")
+        command = getattr(container_commands, action)
+        result = command(config, args.topology) if args.action == "smoke" else command(config)
+        if result is not None:
+            print(json.dumps(result, sort_keys=True) if isinstance(result, dict) else result)
         errors = []
     elif args.command == "dashboard":
         print(config.state_dir / "web-token")

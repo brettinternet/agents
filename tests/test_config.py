@@ -206,6 +206,103 @@ models=[
             with self.assertRaises(ConfigError):
                 load(path, {})
 
+    def test_loads_container_isolation_and_environment_overrides(self) -> None:
+        configured = CONFIG.replace(
+            "provider='mock'",
+            """provider='mock'
+isolation='container'
+[execution.container]
+colima_profile='agents'
+image='agents-agent-mock:local'
+cpus=2.0
+memory_mb=4096
+pids_limit=512
+gc_interval_seconds=3600
+gc_grace_seconds=3600
+build_cache_retention_hours=168""",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "agents.toml"
+            path.write_text(configured)
+            config = load(
+                path,
+                {"AGENTS_ISOLATION": "container", "AGENTS_CONTAINER_IMAGE": "agents-agent-mock@sha256:deadbeef"},
+            )
+            self.assertEqual(config.execution.isolation, "container")
+            self.assertEqual(
+                config.execution.container.colima_profile if config.execution.container else None, "agents"
+            )
+            self.assertEqual(
+                config.execution.container.image if config.execution.container else None,
+                "agents-agent-mock@sha256:deadbeef",
+            )
+
+    def test_rejects_invalid_container_configuration(self) -> None:
+        sections = (
+            "isolation='container'",
+            "isolation='invalid'",
+            """isolation='container'
+[execution.container]
+colima_profile='Bad Profile'
+image='image'
+cpus=2.0
+memory_mb=4096
+pids_limit=512
+gc_interval_seconds=3600
+gc_grace_seconds=3600
+build_cache_retention_hours=168""",
+            """isolation='container'
+[execution.container]
+colima_profile='agents'
+image=''
+cpus=2.0
+memory_mb=4096
+pids_limit=512
+gc_interval_seconds=3600
+gc_grace_seconds=3600
+build_cache_retention_hours=168""",
+            """isolation='container'
+[execution.container]
+colima_profile='agents'
+image='image'
+cpus=0
+memory_mb=4096
+pids_limit=512
+gc_interval_seconds=3600
+gc_grace_seconds=3600
+build_cache_retention_hours=168""",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "agents.toml"
+            for section in sections:
+                with self.subTest(section=section), self.assertRaises(ConfigError):
+                    path.write_text(CONFIG.replace("provider='mock'", f"provider='mock'\n{section}"))
+                    load(path, {})
+
+    def test_container_mode_requires_ipv4_loopback(self) -> None:
+        configured = CONFIG.replace("provider='mock'", "provider='mock'\nisolation='container'").replace(
+            "host='127.0.0.1'", "host='localhost'"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "agents.toml"
+            path.write_text(
+                configured.replace(
+                    "[web]",
+                    """[execution.container]
+colima_profile='agents'
+image='image'
+cpus=2.0
+memory_mb=4096
+pids_limit=512
+gc_interval_seconds=3600
+gc_grace_seconds=3600
+build_cache_retention_hours=168
+[web]""",
+                )
+            )
+            with self.assertRaisesRegex(ConfigError, "127.0.0.1"):
+                load(path, {})
+
     def test_loads_cron_and_interval_schedules(self) -> None:
         configured = CONFIG.replace(
             "slug='human'",

@@ -15,6 +15,7 @@ worker_grace_seconds = 86400
 [execution]
 backend = "herdr"
 version = "0.8.2"
+isolation = "host"
 # Omit session to derive agents-{project.instance_id} from initialized state.
 provider = "opencode"
 # Set one fixed model:
@@ -26,6 +27,16 @@ provider = "opencode"
 #   { id = "openai/gpt-5", effort = "high" },
 #   { id = "anthropic/claude-sonnet-4-6" },
 # ]
+
+[execution.container]
+colima_profile = "agents"
+image = "agents-agent-opencode:local"
+cpus = 2.0
+memory_mb = 4096
+pids_limit = 512
+gc_interval_seconds = 3600
+gc_grace_seconds = 3600
+build_cache_retention_hours = 168
 
 [web]
 host = "127.0.0.1"

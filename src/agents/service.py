@@ -4,6 +4,7 @@ import fcntl
 import json
 import os
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -227,6 +228,8 @@ def _stop_started_process(config: AgentsConfig, name: str, process: subprocess.P
 
 def start(config: AgentsConfig) -> None:
     state = config.state_dir
+    if os.environ.get("AGENTS_TOPOLOGY") != "compose" and (state / "container-topology.json").exists():
+        raise ServiceError("whole-system Compose topology is owned; stop it before starting host services")
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     if state.stat().st_mode & 0o077:
         raise ServiceError(".agents must have mode 0700")
@@ -288,6 +291,74 @@ def start(config: AgentsConfig) -> None:
     if herdr_process is not None:
         _stop_started_process(config, "herdr", herdr_process)
     raise ServiceError("services did not become ready within 30 seconds")
+
+
+def foreground(config: AgentsConfig) -> None:
+    """Supervise Herdr and agentsd in the current PID namespace."""
+    auth_path_value = os.environ.get("AGENTS_PROVIDER_AUTH_FILE")
+    if auth_path_value and config.execution.provider != "mock":
+        auth_path = Path(auth_path_value)
+        if auth_path.is_symlink() or not auth_path.is_file() or auth_path.stat().st_mode & 0o077:
+            raise ServiceError("unsafe whole-system provider credential file")
+        value = auth_path.read_text()
+        if config.execution.provider == "opencode":
+            target = Path.home() / ".local/share/opencode/auth.json"
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            target.write_text(value)
+            target.chmod(0o600)
+        elif config.execution.provider == "claude":
+            os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = value
+    _write_herdr_config(config)
+    session = _session(config)
+    command, environment = _herdr_command(config, session, "server")
+    agentsd_value = shutil.which("agentsd")
+    if agentsd_value is None:
+        raise ServiceError("required agentsd executable is not installed")
+    herdr = subprocess.Popen(command, cwd=config.root, env=environment, start_new_session=True)
+    agentsd: subprocess.Popen[bytes] | None = None
+    stopping = False
+
+    def terminate(_: int, __: Any) -> None:
+        nonlocal stopping
+        stopping = True
+        for process in (agentsd, herdr):
+            if process is not None and process.poll() is None:
+                process.terminate()
+
+    previous = {value: signal.signal(value, terminate) for value in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and not _herdr_health(config, session):
+            if herdr.poll() is not None:
+                raise ServiceError("Herdr exited before foreground readiness")
+            time.sleep(0.25)
+        if not _herdr_health(config, session):
+            raise ServiceError("Herdr did not become ready within 30 seconds")
+        agentsd = subprocess.Popen(
+            [agentsd_value],
+            cwd=config.root,
+            env=environment,
+            start_new_session=True,
+        )
+        while not stopping:
+            if herdr.poll() is not None:
+                raise ServiceError("Herdr exited while supervising whole-system services")
+            if agentsd.poll() is not None:
+                raise ServiceError("agentsd exited while supervising whole-system services")
+            time.sleep(0.25)
+    finally:
+        for process in (agentsd, herdr):
+            if process is not None and process.poll() is None:
+                process.terminate()
+        for process in (agentsd, herdr):
+            if process is not None:
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+        for value, handler in previous.items():
+            signal.signal(value, handler)
 
 
 def _stop_named(config: AgentsConfig, name: str, *, remove_record: bool = True) -> Path | None:

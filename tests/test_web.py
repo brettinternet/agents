@@ -3,17 +3,27 @@ from __future__ import annotations
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from agents.auth import AgentContext
-from agents.config import AgentsConfig, ExecutionConfig, ModelChoice, ProjectConfig, RuntimeConfig, WebConfig
+from agents.auth import AgentContext, AuthenticationError
+from agents.config import (
+    AgentsConfig,
+    ContainerConfig,
+    ExecutionConfig,
+    IsolationMode,
+    ModelChoice,
+    ProjectConfig,
+    RuntimeConfig,
+    WebConfig,
+)
 from agents.db import connect, migrate, utc_now
 from agents.messages import Messaging
 from agents.store import Store
-from agents.web import create_app
+from agents.web import _listen_host, create_app, create_secret_broker_app
 
 
 class WebAuthTests(unittest.TestCase):
@@ -262,6 +272,68 @@ class WebAuthTests(unittest.TestCase):
             )
             self.assertEqual(generic_ack.status_code, 200)
 
+    def test_secret_broker_exposes_only_secret_routes_and_health(self):
+        client = TestClient(create_secret_broker_app(self.config, self.connection), base_url="http://testserver")
+        self.assertEqual(client.get("/health").json(), {"ok": True, "service": "agents-secrets"})
+        self.assertEqual(client.get("/api/v1/snapshot").status_code, 404)
+        self.assertEqual(client.get("/agent/v1/health").status_code, 404)
+
+    def test_secret_routes_require_run_identity_and_declared_sensitive_name(self):
+        (self.config.root / ".env.schema").write_text("# @sensitive\nTEST_SECRET=\nPUBLIC=\n")
+        work_run_id = self._terminal_run("work", "AGENT-0001", "researcher-work-secret")
+        persistent_run_id = self._terminal_run("persistent", "researcher", "researcher-persistent-secret")
+
+        def authenticate(_, execution_id, token, *__):
+            if token != "valid-token":
+                raise AuthenticationError("invalid token")
+            if execution_id == "work":
+                return AgentContext(work_run_id, "researcher", "work", "AGENT-0001", False)
+            return AgentContext(persistent_run_id, "researcher", "persistent", "researcher", True)
+
+        def headers(execution_id: str, token: str = "valid-token") -> dict[str, str]:
+            return {
+                "Authorization": f"Bearer {token}",
+                "X-Agents-Execution-ID": execution_id,
+            }
+
+        with (
+            patch("agents.web.authenticate_agent", side_effect=authenticate),
+            patch("agents.web.resolve_secret_paths"),
+            patch("agents.web.broker_values", return_value={"TEST_SECRET": "value"}) as broker,
+        ):
+            response = self.client.post(
+                "/agent/v1/secrets/reveal",
+                headers=headers("work"),
+                json={"name": "TEST_SECRET"},
+            )
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["data"]["value_base64"], "dmFsdWU=")
+            self.assertEqual(
+                self.client.post(
+                    "/agent/v1/secrets/reveal",
+                    headers=headers("work"),
+                    json={"name": "PUBLIC"},
+                ).status_code,
+                403,
+            )
+            self.assertEqual(
+                self.client.post(
+                    "/agent/v1/secrets/reveal",
+                    headers=headers("persistent"),
+                    json={"name": "TEST_SECRET"},
+                ).status_code,
+                403,
+            )
+            self.assertEqual(
+                self.client.post(
+                    "/agent/v1/secrets/reveal",
+                    headers=headers("work", "wrong-token"),
+                    json={"name": "TEST_SECRET"},
+                ).status_code,
+                401,
+            )
+        broker.assert_called_once()
+
     def test_snapshot_roster_exposes_terminal_purpose(self):
         self.client.post("/auth/login", data={"token": "w" * 64}, headers={"Origin": "http://testserver"})
         self._terminal_run("work", "W-18", "researcher-work-18")
@@ -357,3 +429,17 @@ class WebAuthTests(unittest.TestCase):
             ).fetchone()[0],
             1,
         )
+
+    def test_container_execution_listens_for_vm_traffic(self):
+        execution = replace(
+            self.config.execution,
+            isolation=IsolationMode.CONTAINER,
+            container=ContainerConfig("agents", "image", 1.0, 512, 64, 60, 60, 24),
+        )
+        config = replace(self.config, execution=execution)
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(_listen_host(config), "0.0.0.0")
+
+    def test_host_execution_preserves_configured_listener(self):
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(_listen_host(self.config), "127.0.0.1")

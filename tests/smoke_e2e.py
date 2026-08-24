@@ -349,7 +349,15 @@ def _isolated_environment(config_path: Path, home: Path, xdg: Path) -> Iterator[
         "AGENTS_SECRETS_TRANSPORT",
     ):
         os.environ.pop(name, None)
-    fixture_path = str(FIXTURE_BIN)
+    fixture_bin = xdg / "fixture-bin"
+    fixture_bin.mkdir(parents=True, mode=0o700)
+    mock_wrapper = fixture_bin / "mock_cli"
+    mock_wrapper.write_text(
+        f"#!{sys.executable}\nimport runpy\nrunpy.run_path({str(FIXTURE_BIN / 'mock_cli')!r}, run_name='__main__')\n",
+        encoding="utf-8",
+    )
+    mock_wrapper.chmod(0o700)
+    fixture_path = str(fixture_bin)
     broker_root = xdg / "broker"
     broker_root.mkdir(parents=True, mode=0o700)
     os.environ.update(

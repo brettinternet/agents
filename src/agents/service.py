@@ -259,7 +259,7 @@ def _stop_started_process(config: AgentsConfig, name: str, process: subprocess.P
 def start(config: AgentsConfig) -> None:
     state = config.state_dir
     if os.environ.get("AGENTS_TOPOLOGY") != "compose":
-        if (state / "container-topology.json").exists():
+        if (state / "container-topology.json").exists() or (state / "container-topology.json").is_symlink():
             raise ServiceError("whole-system Compose topology is owned; stop it before starting host services")
         if config.execution.isolation is IsolationMode.CONTAINER and config.execution.container is not None:
             if not config.db_path.is_file():

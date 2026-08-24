@@ -754,6 +754,12 @@ class ContainerGarbageCollector:
                 and execution not in active
                 and now - created_epoch >= self.container.gc_grace_seconds
             ):
+                try:
+                    confirmed = json.loads(self.runtime.docker("volume", "inspect", name))
+                except json.JSONDecodeError as exc:
+                    raise ContainerRuntimeError(f"docker returned malformed volume identity for {name!r}") from exc
+                if confirmed != values:
+                    continue
                 self.runtime.docker("volume", "rm", name)
                 removed_volumes.append(name)
         cleanup_errors: list[str] = []

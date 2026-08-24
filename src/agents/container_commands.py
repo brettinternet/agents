@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import os
 import shutil
@@ -175,6 +176,35 @@ def _cleanup_secret_source_artifacts(auth_file: Path) -> None:
         shutil.rmtree(root)
 
 
+def _system_auth_directory(config: AgentsConfig, *, create: bool = False) -> Path:
+    runtime = config.state_dir / "runtime"
+    directory = runtime / "system-auth"
+    for candidate in (config.state_dir, runtime, directory):
+        if create and not candidate.exists() and not candidate.is_symlink():
+            candidate.mkdir(mode=0o700)
+        if not candidate.is_dir() or candidate.is_symlink():
+            raise ContainerCommandError("whole-system credential directory is unsafe")
+        metadata = candidate.stat()
+        if metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
+            raise ContainerCommandError("whole-system credential directory is unsafe")
+    return directory
+
+
+def _topology_owner_alive(owner_pid: int, owner_started: str) -> bool:
+    from . import service
+
+    try:
+        os.kill(owner_pid, 0)
+    except OSError as exc:
+        if exc.errno == errno.ESRCH:
+            return False
+        raise ContainerCommandError("cannot establish whole-system topology owner liveness") from exc
+    try:
+        return service._process_started(owner_pid) == owner_started
+    except service.ServiceError as exc:
+        raise ContainerCommandError("cannot establish whole-system topology owner identity") from exc
+
+
 def _compose_environment(config: AgentsConfig, topology_id: str, auth_file: Path) -> dict[str, str]:
     instance = _instance(config)
     provider = _provider(config)
@@ -268,8 +298,6 @@ def _verify_compose_project_scope(config: AgentsConfig, topology_id: str) -> Non
 
 
 def _recover_dead_topology(config: AgentsConfig) -> None:
-    from . import service
-
     record = _topology_record(config)
     if record.exists() or record.is_symlink():
         if not record.is_file() or record.is_symlink():
@@ -282,13 +310,7 @@ def _recover_dead_topology(config: AgentsConfig) -> None:
             owner_started = str(value["owner_started"])
         except (OSError, KeyError, ValueError, json.JSONDecodeError) as exc:
             raise ContainerCommandError("whole-system topology ownership record is malformed") from exc
-        try:
-            owner_alive = service._process_started(owner_pid) == owner_started
-            if owner_alive:
-                os.kill(owner_pid, 0)
-        except OSError, service.ServiceError:
-            owner_alive = False
-        if owner_alive:
+        if _topology_owner_alive(owner_pid, owner_started):
             raise ContainerCommandError("whole-system topology owner is still running")
         runtime = _runtime(config)
         names = runtime.docker(
@@ -311,8 +333,8 @@ def _recover_dead_topology(config: AgentsConfig) -> None:
                 or labels.get("dev.agents.topology") != topology_id
             ):
                 raise ContainerCommandError("whole-system topology container identity is unsafe")
-        expected = (config.state_dir / "runtime" / "system-auth").resolve()
-        if auth_file.is_symlink() or auth_file.parent.resolve() != expected:
+        expected = _system_auth_directory(config)
+        if auth_file.is_symlink() or auth_file.parent.resolve() != expected.resolve():
             raise ContainerCommandError("whole-system credential path is unsafe")
         _verify_compose_project_scope(config, topology_id)
         _completed(
@@ -428,8 +450,7 @@ def start(config: AgentsConfig) -> None:
     system_image_id = runtime.resolve_image_id(f"agents-system-{_provider(config)}:local")
     secrets_image_id = runtime.resolve_image_id("agents-secrets:local")
     topology_id = uuid.uuid4().hex
-    directory = config.state_dir / "runtime" / "system-auth"
-    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    directory = _system_auth_directory(config, create=True)
     auth_file = directory / topology_id
     auth_value = _auth_value(config)
     descriptor = os.open(auth_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -525,8 +546,8 @@ def stop(config: AgentsConfig) -> None:
         auth_file = Path(str(value["auth_file"]))
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
         raise ContainerCommandError("whole-system topology ownership record is malformed") from exc
-    expected = (config.state_dir / "runtime" / "system-auth").resolve()
-    if auth_file.is_symlink() or auth_file.parent.resolve() != expected:
+    expected = _system_auth_directory(config)
+    if auth_file.is_symlink() or auth_file.parent.resolve() != expected.resolve():
         raise ContainerCommandError("whole-system credential path is unsafe")
     service._stop_named(config, "container-janitor")
     _verify_compose_project_scope(config, topology_id)
@@ -852,7 +873,7 @@ def _verify_system_topology(config: AgentsConfig, *, exercise_janitor: bool = Tr
         secrets_image_id = str(record_value["secrets_image_id"])
     except (OSError, KeyError, ValueError, json.JSONDecodeError) as exc:
         raise ContainerCommandError("whole-system topology ownership record is malformed") from exc
-    system_auth = config.state_dir / "runtime" / "system-auth"
+    system_auth = _system_auth_directory(config)
     if auth_file.is_symlink() or auth_file.parent.resolve() != system_auth.resolve():
         raise ContainerCommandError("whole-system credential path is unsafe")
     names = runtime.docker(
@@ -1033,7 +1054,8 @@ def _verify_system_topology(config: AgentsConfig, *, exercise_janitor: bool = Tr
 def reset(config: AgentsConfig) -> None:
     from . import service
 
-    if _topology_record(config).exists() or any(service.status(config).values()):
+    topology_record = _topology_record(config)
+    if topology_record.exists() or topology_record.is_symlink() or any(service.status(config).values()):
         raise ContainerCommandError("all Agents topologies must be stopped before container:reset")
     runtime = _runtime(config)
     environment = _compose_environment(

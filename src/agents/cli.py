@@ -309,7 +309,8 @@ def doctor(config: AgentsConfig, online: bool = True) -> list[str]:
             try:
                 runtime = ContainerRuntime(config.execution.container)
                 runtime.initialize(config.root, _instance_id(config), config.web.port)
-                if (config.state_dir / "container-topology.json").is_file():
+                topology_record = config.state_dir / "container-topology.json"
+                if topology_record.exists() or topology_record.is_symlink():
                     from .container_commands import ContainerCommandError, _verify_system_topology
 
                     try:

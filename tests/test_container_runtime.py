@@ -12,7 +12,12 @@ from typing import cast
 from unittest.mock import ANY, MagicMock, call, patch
 
 from agents.config import AgentsConfig, ContainerConfig, IsolationMode
-from agents.container_commands import _cleanup_secret_source_artifacts
+from agents.container_commands import (
+    ContainerCommandError,
+    _cleanup_secret_source_artifacts,
+    _system_auth_directory,
+    _topology_owner_alive,
+)
 from agents.container_runner import _write_secret
 from agents.container_runner import run as run_container
 from agents.container_runtime import (
@@ -46,6 +51,21 @@ class ContainerRuntimeTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_system_auth_directory_rejects_symlinked_runtime(self) -> None:
+        self.config.state_dir.mkdir(mode=0o700)
+        outside = self.root / "outside"
+        outside.mkdir(mode=0o700)
+        (self.config.state_dir / "runtime").symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(ContainerCommandError, "credential directory is unsafe"):
+            _system_auth_directory(self.config, create=True)
+
+    def test_topology_owner_liveness_fails_closed_on_permission_error(self) -> None:
+        with (
+            patch("agents.container_commands.os.kill", side_effect=PermissionError("denied")),
+            self.assertRaisesRegex(ContainerCommandError, "owner liveness"),
+        ):
+            _topology_owner_alive(123, "started")
 
     def _identity(self) -> tuple[dict[str, object], dict[str, object]]:
         cwd = str((self.root / "clone").resolve())
@@ -488,6 +508,8 @@ class ContainerRuntimeTests(unittest.TestCase):
             )
         )
 
+        volume_inspections: dict[str, int] = {}
+
         def docker(*args: str) -> str:
             if args == (
                 "container",
@@ -500,9 +522,12 @@ class ContainerRuntimeTests(unittest.TestCase):
             ):
                 return owned_rows
             if args[:2] == ("volume", "ls"):
-                return "ephemeral-volume\nactive-volume"
+                return "ephemeral-volume\nreplaced-volume\nactive-volume"
             if args[:2] == ("volume", "inspect"):
-                execution = "old" if args[2] == "ephemeral-volume" else "active"
+                name = args[2]
+                volume_inspections[name] = volume_inspections.get(name, 0) + 1
+                execution = "active" if name == "active-volume" else "old"
+                retention = "persistent" if name == "replaced-volume" and volume_inspections[name] == 2 else "ephemeral"
                 return json.dumps(
                     [
                         {
@@ -510,7 +535,7 @@ class ContainerRuntimeTests(unittest.TestCase):
                             "Labels": {
                                 "dev.agents.instance": "instance",
                                 "dev.agents.execution": execution,
-                                "dev.agents.retention": "ephemeral",
+                                "dev.agents.retention": retention,
                             },
                         }
                     ]
@@ -536,6 +561,7 @@ class ContainerRuntimeTests(unittest.TestCase):
         self.assertNotIn(call("compose-init", ANY), runtime.remove_container.call_args_list)
         self.assertNotIn(call("wrong-instance", ANY), runtime.remove_container.call_args_list)
         self.assertNotIn(call("uncertain", ANY), runtime.remove_container.call_args_list)
+        self.assertNotIn(call("volume", "rm", "replaced-volume"), runtime.docker.call_args_list)
         self.assertEqual(result["volumes"], ["ephemeral-volume"])
         self.assertEqual(result["images"], ["sha256:old-dangling"])
         runtime.docker.assert_any_call("volume", "rm", "ephemeral-volume")

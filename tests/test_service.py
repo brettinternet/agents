@@ -90,6 +90,14 @@ class ServiceTests(unittest.TestCase):
                 start(config)
             runtime.assert_not_called()
 
+    def test_start_rejects_dangling_whole_system_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = _config(Path(temporary))
+            config.state_dir.mkdir(mode=0o700)
+            (config.state_dir / "container-topology.json").symlink_to(config.state_dir / "missing")
+            with self.assertRaisesRegex(ServiceError, "Compose topology is owned"):
+                start(config)
+
     def test_start_container_mode_requires_runtime_prerequisites(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             config = _config(Path(temporary))

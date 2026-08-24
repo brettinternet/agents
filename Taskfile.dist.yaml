@@ -35,6 +35,10 @@ tasks:
     desc: Start or reuse the local Herdr and Agents services
     cmd: task server:start
 
+  stop:
+    desc: Stop the Agents services
+    cmd: task server:stop
+
   env:init:
     desc: Create and validate the local environment
     cmds:
@@ -117,30 +121,39 @@ tasks:
   sessions:
     desc: List Agents-owned sessions
     cmd: "{{.ENV_RUN}} {{.PYTHON}} -m agents.cli sessions"
+
   container:runtime:init:
     desc: Create or validate the dedicated Agents Colima runtime
     cmd: "{{.ENV_RUN}} {{.PYTHON}} -m agents.cli container runtime-init"
+
   container:build:
     desc: Build provider-specific agent and whole-system images
     cmd: "{{.ENV_RUN}} {{.PYTHON}} -m agents.cli container build"
+
   container:start:
     desc: Start the supervised whole-system Compose topology
     cmd: "{{.ENV_RUN}} {{.PYTHON}} -m agents.cli container start"
+
   container:stop:
     desc: Stop the owned whole-system Compose topology
     cmd: "{{.ENV_RUN}} {{.PYTHON}} -m agents.cli container stop"
+
   container:status:
     desc: Show owned whole-system Compose status
     cmd: "{{.ENV_RUN}} {{.PYTHON}} -m agents.cli container status"
+
   container:gc:
     desc: Garbage-collect only Agents-owned ephemeral container resources
     cmd: "{{.ENV_RUN}} {{.PYTHON}} -m agents.cli container gc"
+
   container:reset:
     desc: Destructively remove the stopped Agents Compose state and Colima profile
     cmd: "{{.ENV_RUN}} {{.PYTHON}} -m agents.cli container reset"
+
   container:smoke:
     desc: Exercise the selected agent or whole-system container topology
     cmd: "{{.ENV_RUN}} {{.PYTHON}} -m agents.cli container smoke {{.CLI_ARGS}}"
+
   check:
     desc: Run formatting, lint, and type checks
     cmds:

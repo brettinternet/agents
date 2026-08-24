@@ -152,7 +152,7 @@ class GitWorktreeTests(unittest.TestCase):
         (path / "file").write_text("changed")
         submitted = self._commit(path, "change")
 
-        import_isolated_submission(self.repo, path, branch, base, submitted)
+        import_isolated_submission(self.repo, path, branch, base, submitted, 1, 1)
 
         self.assertEqual(branch_sha(self.repo, branch), submitted)
         self.assertEqual(git(self.repo, "for-each-ref", "--format=%(refname)", "refs/agents/import"), "")
@@ -164,18 +164,18 @@ class GitWorktreeTests(unittest.TestCase):
 
         (path / "untracked").write_text("dirty")
         with self.assertRaises(GitError):
-            import_isolated_submission(self.repo, path, branch, base, base)
+            import_isolated_submission(self.repo, path, branch, base, base, 1, 1)
         (path / "untracked").unlink()
 
         git(path, "checkout", "-b", "wrong")
         with self.assertRaises(GitError):
-            import_isolated_submission(self.repo, path, branch, base, base)
+            import_isolated_submission(self.repo, path, branch, base, base, 1, 1)
         git(path, "checkout", branch)
 
         (path / "file").write_text("changed")
         submitted = self._commit(path, "change")
         with self.assertRaises(GitError):
-            import_isolated_submission(self.repo, path, branch, base, base)
+            import_isolated_submission(self.repo, path, branch, base, base, 1, 1)
         self.assertEqual(branch_sha(self.repo, branch), base)
         self.assertEqual(head_sha(path), submitted)
 
@@ -189,7 +189,7 @@ class GitWorktreeTests(unittest.TestCase):
         unrelated = self._commit(path, "unrelated")
         git(path, "branch", "-M", branch)
         with self.assertRaises(GitError):
-            import_isolated_submission(self.repo, path, branch, base, unrelated)
+            import_isolated_submission(self.repo, path, branch, base, unrelated, 1, 1)
         self.assertEqual(branch_sha(self.repo, branch), base)
 
         real = self.root / "managed" / "real"
@@ -197,7 +197,7 @@ class GitWorktreeTests(unittest.TestCase):
         link = self.root / "managed" / "link"
         link.symlink_to(real, target_is_directory=True)
         with self.assertRaises(GitError):
-            import_isolated_submission(self.repo, link, "agents/symlink/1", self.base, self.base)
+            import_isolated_submission(self.repo, link, "agents/symlink/1", self.base, self.base, 1, 1)
 
     def test_import_uses_expected_base_for_atomic_branch_update(self):
         config = self._config()
@@ -211,7 +211,7 @@ class GitWorktreeTests(unittest.TestCase):
         git(self.repo, "update-ref", f"refs/heads/{branch}", advanced, base)
 
         with self.assertRaises(GitError):
-            import_isolated_submission(self.repo, path, branch, base, submitted)
+            import_isolated_submission(self.repo, path, branch, base, submitted, 1, 1)
         self.assertEqual(branch_sha(self.repo, branch), advanced)
         self.assertEqual(git(self.repo, "for-each-ref", "--format=%(refname)", "refs/agents/import"), "")
 

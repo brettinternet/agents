@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import base64
 import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -299,7 +300,7 @@ class WebAuthTests(unittest.TestCase):
         with (
             patch("agents.web.authenticate_agent", side_effect=authenticate),
             patch("agents.web.resolve_secret_paths"),
-            patch("agents.web.broker_values", return_value={"TEST_SECRET": "value"}) as broker,
+            patch("agents.web.broker_byte_values", return_value={"TEST_SECRET": b"value"}) as broker,
         ):
             response = self.client.post(
                 "/agent/v1/secrets/reveal",
@@ -348,6 +349,103 @@ class WebAuthTests(unittest.TestCase):
             self.assertEqual(listed.status_code, 200)
             self.assertEqual(listed.json()["data"]["names"], ["TEST_SECRET"])
         self.assertEqual(broker.call_count, 2)
+
+    def test_secret_routes_round_trip_exact_bytes(self):
+        (self.config.root / ".env.schema").write_text("# @sensitive\nTEST_SECRET=\n")
+        run_id = self._terminal_run("work", "AGENT-0001", "researcher-work-secret-bytes")
+        context = AgentContext(run_id, "researcher", "work", "AGENT-0001", False)
+        raw = b"\xffa\x00b"
+        with (
+            patch("agents.web.authenticate_agent", return_value=context),
+            patch("agents.web.resolve_secret_paths"),
+            patch("agents.web.set_secret_value") as stored,
+            patch("agents.web.broker_byte_values", return_value={"TEST_SECRET": raw}),
+        ):
+            headers = {"Authorization": "Bearer valid", "X-Agents-Execution-ID": "execution"}
+            set_response = self.client.post(
+                "/agent/v1/secrets/set",
+                headers=headers,
+                json={"name": "TEST_SECRET", "value_base64": base64.b64encode(raw).decode()},
+            )
+            reveal_response = self.client.post(
+                "/agent/v1/secrets/reveal",
+                headers=headers,
+                json={"name": "TEST_SECRET"},
+            )
+        self.assertEqual(set_response.status_code, 200)
+        self.assertEqual(stored.call_args.args[2], raw)
+        self.assertEqual(reveal_response.json()["data"]["value_base64"], base64.b64encode(raw).decode())
+
+    def test_whole_system_secret_routes_forward_to_broker(self):
+        (self.config.root / ".env.schema").write_text("# @sensitive\nTEST_SECRET=\n")
+        run_id = self._terminal_run("work", "AGENT-0001", "researcher-work-secret-broker")
+        context = AgentContext(run_id, "researcher", "work", "AGENT-0001", False)
+        forwarded = AsyncMock(return_value=(200, {"ok": True, "data": {"value_base64": "dmFsdWU="}}))
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "AGENTS_SECRETS_TRANSPORT": "agent-api",
+                    "AGENTS_SECRETS_API_URL": "http://broker:9891",
+                },
+                clear=False,
+            ),
+            patch("agents.web.authenticate_agent", return_value=context),
+            patch("agents.web._secret_broker_request", forwarded),
+            patch("agents.web.broker_values", side_effect=AssertionError("local store must remain masked")),
+        ):
+            response = self.client.post(
+                "/agent/v1/secrets/reveal",
+                headers={"Authorization": "Bearer valid", "X-Agents-Execution-ID": "execution"},
+                json={"name": "TEST_SECRET"},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["data"]["value_base64"], "dmFsdWU=")
+        call = forwarded.await_args
+        assert call is not None
+        self.assertEqual(call.args[1:], ("reveal", {"name": "TEST_SECRET"}))
+
+    def test_whole_system_secret_run_executes_in_broker(self):
+        (self.config.root / ".env.schema").write_text("# @sensitive\nTEST_SECRET=\n")
+        run_id = self._terminal_run("work", "AGENT-0001", "researcher-work-secret-broker-run")
+        context = AgentContext(run_id, "researcher", "work", "AGENT-0001", False)
+        request = {
+            "names": ["TEST_SECRET"],
+            "argv": ["print-secret"],
+            "tty": False,
+        }
+
+        async def relay(websocket, initial):
+            self.assertEqual(initial, request)
+            await websocket.send_bytes(b"\x01broker-child\n")
+            await websocket.send_json({"exit_code": 0})
+
+        proxied = AsyncMock(side_effect=relay)
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "AGENTS_SECRETS_TRANSPORT": "agent-api",
+                    "AGENTS_SECRETS_API_URL": "http://broker:9891",
+                },
+                clear=False,
+            ),
+            patch("agents.web.authenticate_agent", return_value=context),
+            patch("agents.web._proxy_secret_run", proxied),
+            patch("agents.web.broker_values", side_effect=AssertionError("local store must remain masked")),
+            patch(
+                "agents.web.asyncio.create_subprocess_exec",
+                side_effect=AssertionError("Agents service must not execute the secret child"),
+            ),
+            self.client.websocket_connect(
+                "/agent/v1/secrets/run",
+                headers={"Authorization": "Bearer valid", "X-Agents-Execution-ID": "execution"},
+            ) as websocket,
+        ):
+            websocket.send_json(request)
+            self.assertEqual(websocket.receive_bytes(), b"\x01broker-child\n")
+            self.assertEqual(websocket.receive_json(), {"exit_code": 0})
+        proxied.assert_awaited_once()
 
     def test_secret_run_rejects_extra_initial_fields(self):
         (self.config.root / ".env.schema").write_text("# @sensitive\nTEST_SECRET=\n")

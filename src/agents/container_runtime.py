@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -21,6 +22,7 @@ from .execution import (
     ExecutionBackend,
     ExecutionConflict,
     ExecutionNotFound,
+    ExecutionTerminated,
     ExecutionUnavailable,
     RunHandle,
     RunSnapshot,
@@ -650,8 +652,17 @@ class ContainerGarbageCollector:
             )
         }
         protected_images = {self.runtime.resolve_image_id(self.container.image)}
-        removed_containers: list[str] = []
-        rows = self.runtime.docker(
+        protected_images.update(
+            str(row[0])
+            for row in self.connection.execute(
+                "SELECT tr.container_image_id FROM terminal_runs tr "
+                "WHERE tr.execution_backend='herdr-container' AND tr.container_image_id LIKE 'sha256:%' "
+                "AND (tr.state IN ('reserved','creating','live','retained','ending') "
+                "OR EXISTS (SELECT 1 FROM launch_attempts la WHERE la.terminal_run_id=tr.id "
+                "AND la.state IN ('posting','uncertain')))"
+            )
+        )
+        all_containers = self.runtime.docker(
             "container",
             "ls",
             "--all",
@@ -660,13 +671,20 @@ class ContainerGarbageCollector:
             "--format",
             "{{json .}}",
         )
-        now = time.time()
-        for line in rows.splitlines():
+        owned_containers: list[tuple[str, dict[str, Any]]] = []
+        for line in all_containers.splitlines():
             item = json.loads(line)
             name = str(item.get("Names", ""))
             inspect = self.runtime.inspect_container(name)
             if inspect is None:
                 continue
+            owned_containers.append((name, inspect))
+            image_id = str(inspect.get("Image", ""))
+            if image_id.startswith("sha256:"):
+                protected_images.add(image_id)
+        removed_containers: list[str] = []
+        now = time.time()
+        for name, inspect in owned_containers:
             labels = inspect.get("Config", {}).get("Labels", {})
             owned_instance = isinstance(labels, dict) and labels.get(_INSTANCE_LABEL) == self.instance
             execution = labels.get("dev.agents.execution")
@@ -740,7 +758,7 @@ class ContainerGarbageCollector:
                 removed_volumes.append(name)
         cleanup_errors: list[str] = []
         workspaces = self.connection.execute(
-            "SELECT DISTINCT tr.id terminal_run_id,e.worktree_path,"
+            "SELECT DISTINCT tr.id terminal_run_id,tr.execution_backend,e.worktree_path,"
             "COALESCE((SELECT s.commit_sha FROM submissions s WHERE s.execution_id=e.id "
             "ORDER BY s.id DESC LIMIT 1),e.base_sha) target_sha "
             "FROM terminal_runs tr JOIN assignments a ON a.terminal_run_id=tr.id "
@@ -756,22 +774,30 @@ class ContainerGarbageCollector:
                     (row["terminal_run_id"],),
                 ).fetchone():
                     continue
-                remove_recorded_workspace(
+                isolation = (
+                    IsolationMode.CONTAINER if row["execution_backend"] == "herdr-container" else IsolationMode.HOST
+                )
+                cleanup_config = replace(
                     self.config,
-                    self.config.project.path,
+                    execution=replace(self.config.execution, isolation=isolation),
+                )
+                remove_recorded_workspace(
+                    cleanup_config,
+                    cleanup_config.project.path,
                     Path(str(row["worktree_path"])),
                     str(row["target_sha"]),
                 )
             except (GitError, OSError) as exc:
                 cleanup_errors.append(str(exc))
         for row in self.connection.execute(
-            "SELECT tr.id,tr.agent_auth_id,tr.generation FROM terminal_runs tr "
+            "SELECT tr.id,tr.execution_name,tr.agent_auth_id,tr.generation FROM terminal_runs tr "
             "WHERE tr.state IN ('ended','failed') AND tr.agent_auth_id IS NOT NULL "
+            "AND tr.execution_backend='herdr-container' "
             "AND NOT EXISTS (SELECT 1 FROM launch_attempts la WHERE la.terminal_run_id=tr.id "
             "AND la.state IN ('posting','uncertain'))"
         ):
-            runtime_dir = self.config.state_dir / "runtime" / str(row["agent_auth_id"])
-            expected = (self.config.state_dir / "runtime").resolve()
+            runtime_root = self.config.state_dir / "runtime"
+            runtime_dir = runtime_root / str(row["agent_auth_id"])
             try:
                 if self.connection.execute(
                     "SELECT 1 FROM launch_attempts WHERE terminal_run_id=? AND state IN ('posting','uncertain')",
@@ -779,20 +805,79 @@ class ContainerGarbageCollector:
                 ).fetchone():
                     continue
                 if (
-                    runtime_dir.is_symlink()
-                    or runtime_dir.parent.resolve() != expected
+                    runtime_root.is_symlink()
+                    or not runtime_root.is_dir()
+                    or runtime_dir.parent != runtime_root
+                    or runtime_dir.is_symlink()
                     or self.runtime.inspect_container(
                         container_name(self.instance, int(row["id"]), int(row["generation"]))
                     )
                     is not None
                 ):
                     raise ContainerRuntimeError(f"refusing unsafe runtime cleanup for terminal {row['id']}")
+                execution_name = str(row["execution_name"])
+                manifest_dir = runtime_root / "containers"
+                manifest_path = manifest_dir / f"{hashlib.sha256(execution_name.encode()).hexdigest()}.json"
+                if (
+                    manifest_dir.is_symlink()
+                    or (manifest_dir.exists() and not manifest_dir.is_dir())
+                    or manifest_path.parent != manifest_dir
+                    or manifest_path.is_symlink()
+                ):
+                    raise ContainerRuntimeError(f"refusing unsafe manifest cleanup for terminal {row['id']}")
+                if runtime_dir.is_dir() and not manifest_path.exists():
+                    raise ContainerRuntimeError(f"refusing runtime cleanup without manifest for terminal {row['id']}")
+                if manifest_path.exists():
+                    manifest = json.loads(manifest_path.read_text())
+                    labels = manifest.get("labels") if isinstance(manifest, dict) else None
+                    if (
+                        not isinstance(labels, dict)
+                        or manifest.get("execution_name") != execution_name
+                        or manifest.get("container_name")
+                        != container_name(self.instance, int(row["id"]), int(row["generation"]))
+                        or manifest.get("runtime_dir") != str(runtime_dir.resolve())
+                        or labels.get(_INSTANCE_LABEL) != self.instance
+                        or labels.get("dev.agents.execution") != execution_name
+                        or labels.get("dev.agents.run_id") != str(row["id"])
+                        or labels.get("dev.agents.generation") != str(row["generation"])
+                    ):
+                        raise ContainerRuntimeError(f"refusing mismatched manifest cleanup for terminal {row['id']}")
                 if runtime_dir.is_dir():
                     shutil.rmtree(runtime_dir)
-            except (ContainerRuntimeError, OSError) as exc:
+                if manifest_path.exists():
+                    manifest_path.unlink()
+            except (ContainerRuntimeError, OSError, json.JSONDecodeError) as exc:
                 cleanup_errors.append(str(exc))
         retention = self.container.build_cache_retention_hours
-        self.runtime.docker("image", "prune", "--force", "--filter", f"until={retention}h")
+        removed_images: list[str] = []
+        image_rows = self.runtime.docker(
+            "image",
+            "ls",
+            "--filter",
+            "dangling=true",
+            "--format",
+            "{{json .}}",
+        )
+        for line in image_rows.splitlines():
+            try:
+                item = json.loads(line)
+                values = json.loads(self.runtime.docker("image", "inspect", str(item["ID"])))
+            except (KeyError, json.JSONDecodeError) as exc:
+                raise ContainerRuntimeError("docker returned malformed dangling image identity") from exc
+            if not isinstance(values, list) or len(values) != 1 or not isinstance(values[0], dict):
+                raise ContainerRuntimeError("docker returned an unexpected dangling image identity")
+            image = values[0]
+            image_id = str(image.get("Id") or "")
+            created = str(image.get("Created") or "")
+            if not image_id.startswith("sha256:"):
+                raise ContainerRuntimeError("docker returned a dangling image without immutable identity")
+            try:
+                created_epoch = calendar.timegm(time.strptime(created[:19], "%Y-%m-%dT%H:%M:%S"))
+            except ValueError as exc:
+                raise ContainerRuntimeError(f"docker returned malformed creation time for image {image_id}") from exc
+            if image_id not in protected_images and now - created_epoch >= retention * 3600:
+                self.runtime.docker("image", "rm", image_id)
+                removed_images.append(image_id)
         self.runtime.docker("builder", "prune", "--force", "--filter", f"until={retention}h")
         for image_id in protected_images:
             if self.runtime.resolve_image_id(image_id) != image_id:
@@ -806,6 +891,7 @@ class ContainerGarbageCollector:
             "containers": removed_containers,
             "volumes": removed_volumes,
             "trim_error": trim_error,
+            "images": removed_images,
             "cleanup_errors": cleanup_errors,
         }
 
@@ -973,6 +1059,16 @@ class ContainerizedHerdrBackend:
             raise ExecutionConflict("container_identity", f"container {name!r} has mismatched bind mounts")
         return inspect
 
+    def _verify_running(self, manifest: Mapping[str, Any]) -> dict[str, Any]:
+        inspect = self._verify(manifest)
+        state = inspect.get("State")
+        if not isinstance(state, dict) or state.get("Running") is not True:
+            raise ExecutionTerminated(
+                "container_exited",
+                f"container {manifest.get('container_name')!r} is not running",
+            )
+        return inspect
+
     def _verify_live(self, run: RunSnapshot) -> RunSnapshot:
         manifest = self._read_manifest(run.handle.name)
         if manifest is None:
@@ -998,7 +1094,7 @@ class ContainerizedHerdrBackend:
             or (image_id is not None and manifest.get("image_id") != image_id)
         ):
             raise ExecutionConflict("container_manifest", f"container manifest for {execution_name!r} is mismatched")
-        self._verify(manifest)
+        self._verify_running(manifest)
         return expected
 
     def health(self) -> BackendHealth:
@@ -1072,7 +1168,7 @@ class ContainerizedHerdrBackend:
             if existing != manifest:
                 raise ExecutionConflict("container_manifest", "existing container manifest identity differs")
             if self.runtime.inspect_container(name) is not None:
-                self._verify(existing)
+                self._verify_running(existing)
         else:
             if self.runtime.inspect_container(name) is not None:
                 raise ExecutionConflict(
@@ -1130,7 +1226,7 @@ class ContainerizedHerdrBackend:
             if delay:
                 time.sleep(delay)
             try:
-                self._verify(manifest)
+                self._verify_running(manifest)
                 return run
             except ExecutionNotFound:
                 continue

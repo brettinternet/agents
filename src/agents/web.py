@@ -10,16 +10,19 @@ import os
 import pty
 import sqlite3
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any
 
+import httpx
 import uvicorn
 from fastapi import Depends, FastAPI, Form, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from websockets.asyncio.client import connect as websocket_connect
+from websockets.exceptions import WebSocketException
 
 from .auth import (
     AgentContext,
@@ -47,6 +50,7 @@ from .policy import DomainError, validate_request_id, validate_text
 from .reconciler import Reconciler
 from .secret_store import (
     SecretStoreError,
+    broker_byte_values,
     broker_values,
     check_store,
     set_secret_value,
@@ -129,7 +133,7 @@ def _human_mutation(
     return session
 
 
-def _agent(
+async def _agent(
     request: Request,
     authorization: Annotated[str | None, Header()] = None,
     execution_id: Annotated[str | None, Header(alias="X-Agents-Execution-ID")] = None,
@@ -216,9 +220,60 @@ def _declared_secret(request: Request, name: object) -> str:
     return name
 
 
+def _secret_broker_url() -> str | None:
+    if os.environ.get("AGENTS_SECRETS_TRANSPORT") != "agent-api":
+        return None
+    value = os.environ.get("AGENTS_SECRETS_API_URL")
+    return value.rstrip("/") if value else None
+
+
+async def _secret_broker_request(
+    headers: Mapping[str, str],
+    action: str,
+    body: dict[str, Any],
+) -> tuple[int, dict[str, Any]]:
+    base = _secret_broker_url()
+    if base is None:
+        raise SecretStoreError("secret broker URL is unavailable")
+    forwarded = {
+        "Authorization": headers.get("authorization", ""),
+        "X-Agents-Execution-ID": headers.get("x-agents-execution-id", ""),
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(f"{base}/agent/v1/secrets/{action}", headers=forwarded, json=body)
+        payload = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise SecretStoreError("secret broker request failed") from exc
+    if not isinstance(payload, dict):
+        raise SecretStoreError("secret broker returned a malformed response")
+    return response.status_code, payload
+
+
+def _secret_broker_data(status: int, payload: dict[str, Any]) -> dict[str, Any]:
+    data = payload.get("data")
+    if status != 200 or payload.get("ok") is not True or not isinstance(data, dict):
+        raise SecretStoreError("secret broker rejected the request")
+    return data
+
+
+async def _forward_secret_request(request: Request, action: str, body: dict[str, Any]) -> dict[str, Any]:
+    status, payload = await _secret_broker_request(request.headers, action, body)
+    if status != 200:
+        detail = payload.get("detail")
+        raise HTTPException(
+            status, detail=detail if isinstance(detail, dict) else error("secret_store", "request failed")
+        )
+    try:
+        return _secret_broker_data(status, payload)
+    except SecretStoreError as exc:
+        raise HTTPException(502, detail=error("secret_store", str(exc))) from exc
+
+
 def _broker_child_prefix() -> tuple[str, ...]:
     uid_value = os.environ.get("AGENTS_BROKER_CHILD_UID")
     gid_value = os.environ.get("AGENTS_BROKER_CHILD_GID")
+
     if uid_value is None and gid_value is None:
         return ()
     if (
@@ -243,6 +298,60 @@ def _broker_child_prefix() -> tuple[str, ...]:
         "--ambient-caps=-all",
         "--",
     )
+
+
+async def _proxy_secret_run(websocket: WebSocket, initial: dict[str, Any]) -> None:
+    base = _secret_broker_url()
+    if base is None:
+        raise SecretStoreError("secret broker URL is unavailable")
+    if base.startswith("http://"):
+        base = f"ws://{base.removeprefix('http://')}"
+    elif base.startswith("https://"):
+        base = f"wss://{base.removeprefix('https://')}"
+    else:
+        raise SecretStoreError("secret broker URL is invalid")
+    headers = {
+        "Authorization": websocket.headers.get("authorization", ""),
+        "X-Agents-Execution-ID": websocket.headers.get("x-agents-execution-id", ""),
+    }
+    try:
+        async with websocket_connect(
+            f"{base}/agent/v1/secrets/run",
+            additional_headers=headers,
+            open_timeout=10,
+            proxy=None,
+        ) as upstream:
+            await upstream.send(json.dumps(initial))
+
+            async def client_to_broker() -> None:
+                while True:
+                    message = await websocket.receive()
+                    if message.get("bytes") is not None:
+                        await upstream.send(message["bytes"])
+                    elif message.get("text") is not None:
+                        await upstream.send(message["text"])
+
+            async def broker_to_client() -> None:
+                async for message in upstream:
+                    if isinstance(message, bytes):
+                        await websocket.send_bytes(message)
+                    else:
+                        await websocket.send_text(message)
+
+            relays = {
+                asyncio.create_task(client_to_broker()),
+                asyncio.create_task(broker_to_client()),
+            }
+            done, pending = await asyncio.wait(relays, return_when=asyncio.FIRST_COMPLETED)
+            for relay in pending:
+                relay.cancel()
+            for relay in pending:
+                with contextlib.suppress(asyncio.CancelledError, WebSocketDisconnect):
+                    await relay
+            for relay in done:
+                await relay
+    except (OSError, WebSocketDisconnect, WebSocketException) as exc:
+        raise SecretStoreError("secret broker run failed") from exc
 
 
 def _container_secret_command(
@@ -511,8 +620,10 @@ def create_app(config: AgentsConfig | None = None, connection: sqlite3.Connectio
         _verify_secret_container(request, context)
         if await _json_body(request) != {}:
             raise HTTPException(400, detail=error("malformed_json", "request body must be exactly {}"))
+        if _secret_broker_url() is not None:
+            return ok(await _forward_secret_request(request, "list", {}))
         try:
-            values = broker_values(resolve_secret_paths(request.app.state.config.root))
+            values = broker_byte_values(resolve_secret_paths(request.app.state.config.root))
         except SecretStoreError as exc:
             raise HTTPException(409, detail=error("secret_store", str(exc))) from exc
         declared = _sensitive_names(request.app.state.config.root)
@@ -524,6 +635,8 @@ def create_app(config: AgentsConfig | None = None, connection: sqlite3.Connectio
         _verify_secret_container(request, context)
         if await _json_body(request) != {}:
             raise HTTPException(400, detail=error("malformed_json", "request body must be exactly {}"))
+        if _secret_broker_url() is not None:
+            return ok(await _forward_secret_request(request, "check", {}))
         try:
             check_store(resolve_secret_paths(request.app.state.config.root))
         except SecretStoreError as exc:
@@ -538,11 +651,13 @@ def create_app(config: AgentsConfig | None = None, connection: sqlite3.Connectio
         if set(body) != {"name"}:
             raise HTTPException(400, detail=error("malformed_json", "request body must contain exactly name"))
         name = _declared_secret(request, body.get("name"))
+        if _secret_broker_url() is not None:
+            return ok(await _forward_secret_request(request, "reveal", {"name": name}))
         try:
-            value = broker_values(resolve_secret_paths(request.app.state.config.root), [name])[name]
+            value = broker_byte_values(resolve_secret_paths(request.app.state.config.root), [name])[name]
         except SecretStoreError as exc:
             raise HTTPException(409, detail=error("secret_store", str(exc))) from exc
-        return ok({"value_base64": base64.b64encode(value.encode()).decode()})
+        return ok({"value_base64": base64.b64encode(value).decode()})
 
     @app.post("/agent/v1/secrets/set")
     async def agent_secret_set(request: Request, context: AgentAuth):
@@ -560,8 +675,13 @@ def create_app(config: AgentsConfig | None = None, connection: sqlite3.Connectio
             raise HTTPException(400, detail=error("malformed_json", "value_base64 must be a string"))
         try:
             value = base64.b64decode(encoded, validate=True)
+        except ValueError as exc:
+            raise HTTPException(409, detail=error("secret_store", str(exc))) from exc
+        if _secret_broker_url() is not None:
+            return ok(await _forward_secret_request(request, "set", {"name": name, "value_base64": encoded}))
+        try:
             set_secret_value(resolve_secret_paths(request.app.state.config.root), name, value)
-        except (ValueError, SecretStoreError) as exc:
+        except SecretStoreError as exc:
             raise HTTPException(409, detail=error("secret_store", str(exc))) from exc
         return ok({})
 
@@ -573,6 +693,8 @@ def create_app(config: AgentsConfig | None = None, connection: sqlite3.Connectio
         if set(body) != {"name"}:
             raise HTTPException(400, detail=error("malformed_json", "request body must contain exactly name"))
         name = _declared_secret(request, body.get("name"))
+        if _secret_broker_url() is not None:
+            return ok(await _forward_secret_request(request, "unset", {"name": name}))
         try:
             unset_secret(resolve_secret_paths(request.app.state.config.root), name)
         except SecretStoreError as exc:
@@ -656,6 +778,9 @@ def create_app(config: AgentsConfig | None = None, connection: sqlite3.Connectio
             if any(name not in declared for name in names):
                 await websocket.send_json({"error": "secret name is not declared sensitive"})
                 await websocket.close(code=4403)
+                return
+            if _secret_broker_url() is not None:
+                await _proxy_secret_run(websocket, initial)
                 return
             values = broker_values(resolve_secret_paths(websocket.app.state.config.root), names)
             container_child = docker_backend is not None

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -382,6 +381,8 @@ def import_isolated_submission(
     branch: str,
     base_sha: str,
     commit_sha: str,
+    execution_id: int,
+    revision: int,
 ) -> None:
     """Import exactly one clean descendant from a standalone execution clone."""
     _assert_nonsymlinked(clone, label="submission")
@@ -389,6 +390,8 @@ def import_isolated_submission(
         raise GitError("submission path is the authoritative repository")
     _standalone_git_dir(clone)
     _validate_branch(branch)
+    if execution_id <= 0 or revision <= 0:
+        raise GitError("submission import identity must be positive")
     if _current_branch(clone) != branch:
         raise GitError("submission is on the wrong branch")
     if not is_clean(clone):
@@ -402,7 +405,7 @@ def import_isolated_submission(
     if _ref_sha(project, branch_ref) != base_sha:
         raise GitError("authoritative branch no longer matches recorded base")
 
-    import_ref = f"refs/agents/import/{uuid.uuid4().hex}"
+    import_ref = f"refs/agents/import/{execution_id}/{revision}"
     operation_error: GitError | None = None
     cleanup_error: GitError | None = None
     try:

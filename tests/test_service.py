@@ -21,10 +21,14 @@ from agents.config import (
 )
 from agents.service import (
     ServiceError,
+    _agents_environment,
     _close_mapped_workspaces,
+    _foreground_agents_environment,
+    _herdr_environment,
     _owned,
     _record,
     acquire_daemon_lock,
+    foreground,
     shutdown,
     start,
     stop,
@@ -128,11 +132,39 @@ class ServiceTests(unittest.TestCase):
                 patch("agents.service._owned", side_effect=(None, (123, {}))),
                 patch("agents.service._herdr_health", return_value=True),
                 patch("agents.service._web_health_ready", return_value=True),
+                patch("agents.service._port_free", return_value=True),
                 patch("agents.service._launch_process", return_value=FakeProcess()) as launch,
             ):
                 start(config)
             self.assertEqual(launch.call_count, 1)
             self.assertEqual(launch.call_args.args[1], "agentsd")
+
+    def test_service_environments_keep_credentials_only_for_agentsd(self) -> None:
+        config = _config(Path("/tmp/project"))
+        environment = {
+            "OPENCODE_AUTH_JSON": '{"token":"secret"}',
+            "AGENTS_TOPOLOGY": "compose",
+            "AGENTS_BROKER_PORT": "9891",
+            "AGENTS_BROKER_SECRETS_ROOT": "/private/broker",
+            "AGENTS_PROVIDER_AUTH_FILE": "/run/agents-secrets/provider-auth",
+            "AGENTS_SYSTEM_CONTAINER": "1",
+            "AGENTS_SECRETS_TRANSPORT": "agent-api",
+        }
+        with patch.dict("os.environ", environment, clear=True):
+            agents = _agents_environment(config)
+            herdr = _herdr_environment(config)
+            foreground_agents = _foreground_agents_environment(config)
+        self.assertEqual(agents["OPENCODE_AUTH_JSON"], '{"token":"secret"}')
+        self.assertNotIn("OPENCODE_AUTH_JSON", herdr)
+        self.assertEqual(agents["AGENTS_BROKER_SECRETS_ROOT"], "/private/broker")
+        self.assertNotIn("AGENTS_BROKER_SECRETS_ROOT", herdr)
+        for name in ("AGENTS_TOPOLOGY", "AGENTS_BROKER_PORT", "AGENTS_SECRETS_TRANSPORT"):
+            self.assertNotIn(name, agents)
+        self.assertEqual(foreground_agents["AGENTS_SYSTEM_CONTAINER"], "1")
+        self.assertEqual(foreground_agents["AGENTS_BROKER_PORT"], "9891")
+        self.assertEqual(foreground_agents["AGENTS_SECRETS_TRANSPORT"], "agent-api")
+        for name in ("OPENCODE_AUTH_JSON", "AGENTS_PROVIDER_AUTH_FILE"):
+            self.assertNotIn(name, foreground_agents)
 
     def test_start_rejects_unhealthy_owned_herdr(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -155,6 +187,29 @@ class ServiceTests(unittest.TestCase):
                 self.assertRaisesRegex(ServiceError, "stale service ownership record for agentsd"),
             ):
                 start(config)
+
+    def test_foreground_removes_provider_credential_when_setup_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            home.mkdir()
+            auth = root / "provider-auth"
+            auth.write_text("{}")
+            auth.chmod(0o600)
+            config = _config(root)
+            config = replace(
+                config,
+                execution=replace(config.execution, provider="opencode", provider_id="opencode_cli"),
+            )
+            provider_path = home / ".local/share/opencode/auth.json"
+            with (
+                patch.dict("os.environ", {"AGENTS_PROVIDER_AUTH_FILE": str(auth)}, clear=False),
+                patch("agents.service.Path.home", return_value=home),
+                patch("agents.service._write_herdr_config", side_effect=ServiceError("injected setup failure")),
+                self.assertRaisesRegex(ServiceError, "injected setup failure"),
+            ):
+                foreground(config)
+            self.assertFalse(provider_path.exists())
 
     def test_stop_preserves_herdr(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

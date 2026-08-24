@@ -3,9 +3,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import json
 import os
 import secrets
+import shutil
 import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -29,6 +32,7 @@ from .execution import (
     RunSpec,
 )
 from .git_worktree import GitError, remove_recorded_workspace
+from .herdr_client import HerdrBackend
 from .profiles import (
     PROVIDER_CAPABILITIES,
     ProfileError,
@@ -51,11 +55,26 @@ def _api_url(config: AgentsConfig) -> str:
     return f"http://{host}:{config.web.port}"
 
 
-def _profile_runtime(config: AgentsConfig, agent_auth_id: str) -> tuple[Path | None, Path]:
-    if config.execution.isolation is IsolationMode.HOST:
+def _profile_runtime(
+    config: AgentsConfig,
+    agent_auth_id: str,
+    *,
+    isolation: IsolationMode | None = None,
+) -> tuple[Path | None, Path]:
+    if (isolation or config.execution.isolation) is IsolationMode.HOST:
         return None, config.state_dir / "runtime"
     root = config.state_dir / "runtime" / agent_auth_id
     return root / "home", root / "provider"
+
+
+def _config_for_backend(config: AgentsConfig, backend: str) -> AgentsConfig:
+    if backend == "herdr":
+        isolation = IsolationMode.HOST
+    elif backend == "herdr-container":
+        isolation = IsolationMode.CONTAINER
+    else:
+        raise ValueError(f"unsupported stored execution backend {backend!r}")
+    return replace(config, execution=replace(config.execution, isolation=isolation))
 
 
 def _container_provider_credential(config: AgentsConfig, provider: str) -> tuple[str, str] | None:
@@ -67,7 +86,40 @@ def _container_provider_credential(config: AgentsConfig, provider: str) -> tuple
     value = os.environ.get(name)
     if not value:
         raise ExecutionUnavailable("container_auth_missing", f"{name} is required for containerized {provider}")
+    if name == "OPENCODE_AUTH_JSON":
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ExecutionUnavailable("container_auth_invalid", "OPENCODE_AUTH_JSON must be valid JSON") from exc
+        if not isinstance(parsed, dict):
+            raise ExecutionUnavailable("container_auth_invalid", "OPENCODE_AUTH_JSON must contain a JSON object")
     return name, value
+
+
+def _stage_container_provider_credential(config: AgentsConfig, provider: str, runtime_dir: Path) -> Path | None:
+    credential = _container_provider_credential(config, provider)
+    if credential is None:
+        return None
+    if runtime_dir.is_symlink() or not runtime_dir.is_dir() or runtime_dir.stat().st_mode & 0o077:
+        raise ExecutionConflict("container_credential", "run credential directory is unsafe")
+    path = runtime_dir / "provider-auth"
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise ExecutionConflict("container_credential", "run credential path is unsafe")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise ExecutionConflict("container_credential", "run credential path is unsafe") from exc
+    try:
+        payload = memoryview(credential[1].encode())
+        while payload:
+            payload = payload[os.write(descriptor, payload) :]
+    finally:
+        os.close(descriptor)
+    path.chmod(0o600)
+    return path
 
 
 def _normalize_status(status: str | None) -> str:
@@ -177,17 +229,6 @@ def _reserve_terminal_unchecked(
     instance = str(project[0])
     profile = profile_name(instance, run_id, generation)
     mcp = mcp_name(instance, run_id, generation)
-    if purpose_kind == "persistent" and config.execution.isolation is IsolationMode.CONTAINER:
-        working_directory = config.state_dir / "runtime" / profile / "workspace"
-        if working_directory.is_symlink():
-            raise RuntimeError("persistent container workspace is unsafe")
-        working_directory.mkdir(parents=True, mode=0o700)
-        if any(working_directory.iterdir()):
-            raise RuntimeError("persistent container workspace is not empty")
-        connection.execute(
-            "UPDATE terminal_runs SET working_directory=? WHERE id=?",
-            (str(working_directory.resolve()), run_id),
-        )
     session_purpose_id = purpose_id
     if purpose_kind == "work":
         work = connection.execute("SELECT seq,active_execution_id FROM work_items WHERE id=?", (purpose_id,)).fetchone()
@@ -218,6 +259,27 @@ def _reserve_terminal_unchecked(
         "VALUES(?,?,0,'reserved',?,?)",
         (run_id, int(budget_exempt), now, now),
     )
+    if purpose_kind == "persistent" and config.execution.isolation is IsolationMode.CONTAINER:
+        profile_root = config.state_dir / "runtime" / profile
+        working_directory = profile_root / "workspace"
+        created_root = not profile_root.exists()
+        created_workspace = not working_directory.exists()
+        try:
+            if profile_root.is_symlink() or working_directory.is_symlink():
+                raise RuntimeError("persistent container workspace is unsafe")
+            working_directory.mkdir(parents=True, mode=0o700)
+            if any(working_directory.iterdir()):
+                raise RuntimeError("persistent container workspace is not empty")
+            connection.execute(
+                "UPDATE terminal_runs SET working_directory=? WHERE id=?",
+                (str(working_directory.resolve()), run_id),
+            )
+        except BaseException:
+            if created_workspace and working_directory.is_dir() and not working_directory.is_symlink():
+                shutil.rmtree(working_directory)
+            if created_root and profile_root.is_dir() and not any(profile_root.iterdir()):
+                profile_root.rmdir()
+            raise
     return dict(connection.execute("SELECT * FROM terminal_runs WHERE id=?", (run_id,)).fetchone())
 
 
@@ -439,6 +501,12 @@ class Reconciler:
         if project is None:
             return
         prefix = f"agents-{project['instance_id']}-"
+        recorded = {
+            str(row["execution_name"]): (str(row["execution_backend"]), Path(str(row["working_directory"])).resolve())
+            for row in self.connection.execute(
+                "SELECT execution_name,execution_backend,working_directory FROM terminal_runs ORDER BY id"
+            )
+        }
         mapped = {
             str(row["execution_name"])
             for row in self.connection.execute(
@@ -446,18 +514,16 @@ class Reconciler:
                 "WHERE state IN ('reserved','creating','live') AND token_revoked_at IS NULL"
             )
         }
-        expected_cwds = {
-            Path(str(row["working_directory"])).resolve()
-            for row in self.connection.execute("SELECT DISTINCT working_directory FROM terminal_runs")
-        }
+        listing_backend = self.backend.inner if isinstance(self.backend, ContainerizedHerdrBackend) else self.backend
         try:
-            runs = await asyncio.to_thread(self.backend.list_runs, prefix)
+            runs = await asyncio.to_thread(listing_backend.list_runs, prefix)
         except ExecutionUnavailable, ExecutionTimeout, ExecutionBusy:
             return
         for run in runs:
             if run.handle.name in mapped:
                 continue
-            if run.cwd not in expected_cwds:
+            identity = recorded.get(run.handle.name)
+            if identity is None or run.cwd != identity[1]:
                 self._incident(
                     "terminal_cleanup_refused",
                     "terminal",
@@ -465,9 +531,18 @@ class Reconciler:
                     f"backend cwd {run.cwd} is not recorded in Agents state",
                 )
                 continue
+            cleanup_backend = self._backend_for_name(identity[0])
+            if cleanup_backend is None:
+                self._incident(
+                    "terminal_cleanup_refused",
+                    "terminal",
+                    run.handle.name,
+                    f"unsupported stored execution backend {identity[0]!r}",
+                )
+                continue
             try:
                 async with self._profile_lock:
-                    await asyncio.to_thread(self.backend.delete_run, run.handle)
+                    await asyncio.to_thread(cleanup_backend.delete_run, run.handle)
             except ExecutionError as exc:
                 self._incident("terminal_cleanup_failed", "terminal", run.handle.name, str(exc))
 
@@ -645,8 +720,9 @@ class Reconciler:
             if broker_url := os.environ.get("AGENTS_SECRETS_API_URL"):
                 environment["AGENTS_SECRETS_API_URL"] = broker_url
                 environment["AGENTS_SECRETS_TRANSPORT"] = "agent-api"
-            if credential := _container_provider_credential(self.config, provider):
-                environment[credential[0]] = credential[1]
+            credential_path = _stage_container_provider_credential(self.config, provider, provider_runtime)
+            if credential_path is not None:
+                environment["AGENTS_PROVIDER_CREDENTIAL_FILE"] = str(credential_path)
             spec = RunSpec(
                 str(run["execution_name"]),
                 run_id,
@@ -813,6 +889,24 @@ class Reconciler:
         async with self._profile_lock:
             await self._delete_run_locked(handle)
 
+    def _stored_backend(self, row: sqlite3.Row) -> ExecutionBackend | None:
+        return self._backend_for_name(str(row["execution_backend"]))
+
+    def _backend_for_name(self, stored: str) -> ExecutionBackend | None:
+        if stored == "herdr":
+            return self.backend.inner if isinstance(self.backend, ContainerizedHerdrBackend) else self.backend
+        if stored == "herdr-container":
+            if isinstance(self.backend, ContainerizedHerdrBackend):
+                return self.backend
+            if self.config.execution.container is None or not isinstance(self.backend, HerdrBackend):
+                return None
+            return ContainerizedHerdrBackend(
+                self.config,
+                self.backend,
+                ContainerRuntime(self.config.execution.container),
+            )
+        return None
+
     async def _replace_stale_cwd_run(self, run: sqlite3.Row, snapshot: RunSnapshot) -> bool:
         if run["error"] == _STALE_CWD_REPLACED:
             return False
@@ -868,7 +962,8 @@ class Reconciler:
     def _discard_profile(self, materialized: Any, artifacts: list[dict[str, Any]]) -> None:
         try:
             row = self.connection.execute(
-                "SELECT provider,agent_auth_id FROM terminal_runs WHERE profile_name=? ORDER BY id DESC LIMIT 1",
+                "SELECT provider,agent_auth_id,execution_backend FROM terminal_runs "
+                "WHERE profile_name=? ORDER BY id DESC LIMIT 1",
                 (str(materialized.name),),
             ).fetchone()
             managed_artifacts = artifacts or [
@@ -879,8 +974,11 @@ class Reconciler:
                     "secret_fields_json": "{}",
                 }
             ]
+            cleanup_config = (
+                _config_for_backend(self.config, str(row["execution_backend"])) if row is not None else self.config
+            )
             provider_home, provider_runtime = _profile_runtime(
-                self.config, str(row["agent_auth_id"]) if row is not None else ""
+                cleanup_config, str(row["agent_auth_id"]) if row is not None else ""
             )
             remove_profile(
                 str(materialized.name),
@@ -984,8 +1082,9 @@ class Reconciler:
         if broker_url := os.environ.get("AGENTS_SECRETS_API_URL"):
             environment["AGENTS_SECRETS_API_URL"] = broker_url
             environment["AGENTS_SECRETS_TRANSPORT"] = "agent-api"
-        if credential := _container_provider_credential(self.config, provider):
-            environment[credential[0]] = credential[1]
+        credential_path = _stage_container_provider_credential(self.config, provider, provider_runtime)
+        if credential_path is not None:
+            environment["AGENTS_PROVIDER_CREDENTIAL_FILE"] = str(credential_path)
         return RunSpec(
             str(run["execution_name"]),
             run_id,
@@ -1030,6 +1129,18 @@ class Reconciler:
             with contextlib.suppress(ExecutionNotFound):
                 await self._delete_run(snapshot.handle)
             return
+        if isinstance(self.backend, ContainerizedHerdrBackend):
+            try:
+                await asyncio.to_thread(
+                    self.backend.verified_container_name,
+                    str(run["execution_name"]),
+                    run_id,
+                    int(run["generation"]),
+                    str(run["container_image_id"]) if run["container_image_id"] else None,
+                )
+            except ExecutionError as exc:
+                await self._fail_uncertain(run, str(exc), cleanup_matches=True)
+                return
         if (
             snapshot.handle.name == run["execution_name"]
             and snapshot.cwd != Path(str(run["working_directory"])).resolve()
@@ -1310,6 +1421,15 @@ class Reconciler:
             ).fetchone()
             if row is None or row["token_revoked_at"] is None:
                 return
+            cleanup_backend = self._stored_backend(row)
+            if cleanup_backend is None:
+                self._incident(
+                    "terminal_cleanup_failed",
+                    "terminal",
+                    str(run_id),
+                    f"unsupported stored execution backend {row['execution_backend']!r}",
+                )
+                return
             handle: RunHandle | None = None
             if row["backend_run_id"] and row["backend_terminal_id"]:
                 handle = RunHandle(
@@ -1319,7 +1439,7 @@ class Reconciler:
                 )
             else:
                 try:
-                    snapshot = await asyncio.to_thread(self.backend.find_run, str(row["execution_name"]))
+                    snapshot = await asyncio.to_thread(cleanup_backend.find_run, str(row["execution_name"]))
                 except ExecutionUnavailable, ExecutionBusy, ExecutionTimeout:
                     return
                 except ExecutionError as exc:
@@ -1338,16 +1458,16 @@ class Reconciler:
                     handle = snapshot.handle
             if handle is not None:
                 try:
-                    await asyncio.to_thread(self.backend.delete_run, handle)
+                    await asyncio.to_thread(cleanup_backend.delete_run, handle)
                 except ExecutionUnavailable, ExecutionBusy, ExecutionTimeout:
                     return
                 except ExecutionError as exc:
                     self._incident("terminal_cleanup_failed", "terminal", str(run_id), str(exc))
                     return
-            elif isinstance(self.backend, ContainerizedHerdrBackend):
+            elif isinstance(cleanup_backend, ContainerizedHerdrBackend):
                 try:
                     await asyncio.to_thread(
-                        self.backend.cleanup_run,
+                        cleanup_backend.cleanup_run,
                         str(row["execution_name"]),
                         remove_runtime=False,
                     )
@@ -1367,7 +1487,14 @@ class Reconciler:
             ]
             key = bytes.fromhex(read_private_secret(self.config.state_dir / "agent-auth-key"))
             token = derive_agent_token(key, str(row["instance_id"]), run_id, int(row["generation"]))
-            provider_home, provider_runtime = _profile_runtime(self.config, str(row["agent_auth_id"]))
+            stored_isolation = (
+                IsolationMode.CONTAINER if row["execution_backend"] == "herdr-container" else IsolationMode.HOST
+            )
+            provider_home, provider_runtime = _profile_runtime(
+                self.config,
+                str(row["agent_auth_id"]),
+                isolation=stored_isolation,
+            )
             try:
                 await asyncio.to_thread(
                     remove_profile,
@@ -1391,10 +1518,11 @@ class Reconciler:
                 workspace = Path(str(row["working_directory"]))
                 if target_sha and workspace.exists():
                     try:
+                        cleanup_config = _config_for_backend(self.config, str(row["execution_backend"]))
                         await asyncio.to_thread(
                             remove_recorded_workspace,
-                            self.config,
-                            self.config.project.path,
+                            cleanup_config,
+                            cleanup_config.project.path,
                             workspace,
                             target_sha,
                             allow_dirty=True,
@@ -1687,35 +1815,47 @@ class Reconciler:
             self._spawn(f"cleanup:{run_id}", self._cleanup_terminal(run_id))
         try:
             for row in self.connection.execute(
-                "SELECT e.worktree_path,COALESCE(("
+                "SELECT DISTINCT e.worktree_path,tr.execution_backend,COALESCE(("
                 "SELECT s.commit_sha FROM submissions s WHERE s.execution_id=e.id "
                 "ORDER BY s.id DESC LIMIT 1),e.base_sha) AS recorded_sha "
                 "FROM executions e JOIN work_items w ON w.id=e.work_id "
+                "JOIN assignments a ON a.execution_id=e.id "
+                "JOIN terminal_runs tr ON tr.id=a.terminal_run_id "
                 "WHERE w.status IN ('delivered','cancelled') AND e.updated_at<=?",
                 (cutoff_text,),
             ):
                 path = Path(str(row["worktree_path"]))
-                if path.exists():
+                if path.exists() or path.is_symlink():
                     try:
+                        cleanup_config = _config_for_backend(self.config, str(row["execution_backend"]))
                         remove_recorded_workspace(
-                            self.config,
-                            self.config.project.path,
+                            cleanup_config,
+                            cleanup_config.project.path,
                             path,
                             str(row["recorded_sha"]),
                         )
                     except (GitError, OSError) as exc:
                         self._incident("worktree_cleanup_mismatch", "worktree", str(path), str(exc))
             for row in self.connection.execute(
-                "SELECT worktree_path,target_sha FROM checks WHERE state IN ('passed','failed','interrupted') "
-                "AND updated_at<=?",
+                "SELECT c.worktree_path,c.target_sha,("
+                "SELECT tr.execution_backend FROM assignments a "
+                "JOIN terminal_runs tr ON tr.id=a.terminal_run_id "
+                "WHERE a.execution_id=e.id ORDER BY a.id LIMIT 1) execution_backend "
+                "FROM checks c JOIN submissions s ON s.id=c.submission_id "
+                "JOIN executions e ON e.id=s.execution_id "
+                "WHERE c.state IN ('passed','failed','interrupted') AND c.updated_at<=?",
                 (cutoff_text,),
             ):
                 path = Path(str(row["worktree_path"]))
-                if path.exists():
+                if path.exists() or path.is_symlink():
                     try:
+                        backend = row["execution_backend"]
+                        cleanup_config = (
+                            _config_for_backend(self.config, str(backend)) if backend is not None else self.config
+                        )
                         remove_recorded_workspace(
-                            self.config,
-                            self.config.project.path,
+                            cleanup_config,
+                            cleanup_config.project.path,
                             path,
                             str(row["target_sha"]),
                             allow_dirty=True,
@@ -1723,19 +1863,27 @@ class Reconciler:
                     except (GitError, OSError) as exc:
                         self._incident("checktree_cleanup_mismatch", "worktree", str(path), str(exc))
             for row in self.connection.execute(
-                "SELECT r.worktree_path,s.commit_sha FROM reviews r "
-                "JOIN submissions s ON s.id=r.submission_id "
+                "SELECT r.worktree_path,s.commit_sha,COALESCE(review_tr.execution_backend,("
+                "SELECT tr.execution_backend FROM assignments a "
+                "JOIN terminal_runs tr ON tr.id=a.terminal_run_id "
+                "WHERE a.execution_id=e.id ORDER BY a.id LIMIT 1)) execution_backend "
+                "FROM reviews r JOIN submissions s ON s.id=r.submission_id "
                 "JOIN executions e ON e.id=s.execution_id "
                 "JOIN work_items w ON w.id=e.work_id "
+                "LEFT JOIN terminal_runs review_tr ON review_tr.id=r.terminal_run_id "
                 "WHERE w.status IN ('delivered','cancelled') AND w.updated_at<=?",
                 (cutoff_text,),
             ):
                 path = Path(str(row["worktree_path"]))
-                if path.exists():
+                if path.exists() or path.is_symlink():
                     try:
+                        backend = row["execution_backend"]
+                        cleanup_config = (
+                            _config_for_backend(self.config, str(backend)) if backend is not None else self.config
+                        )
                         remove_recorded_workspace(
-                            self.config,
-                            self.config.project.path,
+                            cleanup_config,
+                            cleanup_config.project.path,
                             path,
                             str(row["commit_sha"]),
                         )

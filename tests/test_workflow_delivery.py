@@ -93,6 +93,14 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.connection.close()
         self.temp.cleanup()
 
+    def test_backend_selection_uses_stored_execution_mode(self):
+        alternate = object()
+        with patch("agents.delivery.build_execution_backend", return_value=alternate) as build:
+            selected = self.delivery._backend_for("herdr-container")
+        self.assertIs(selected, alternate)
+        self.assertEqual(build.call_args.args[0].execution.isolation.value, "container")
+        self.assertIs(self.delivery._backend_for("herdr"), self.delivery.backend)
+
     def ready_item(
         self,
         gates: list[str] | None = None,

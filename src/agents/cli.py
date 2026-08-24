@@ -88,8 +88,18 @@ def preflight(config: AgentsConfig) -> list[str]:
             "opencode": "OPENCODE_AUTH_JSON",
             "claude": "CLAUDE_CODE_OAUTH_TOKEN",
         }.get(config.execution.provider)
-        if credential and not os.environ.get(credential):
-            errors.append(f"{credential} is required for containerized {config.execution.provider}")
+        if credential:
+            value = os.environ.get(credential)
+            if not value:
+                errors.append(f"{credential} is required for containerized {config.execution.provider}")
+            elif credential == "OPENCODE_AUTH_JSON":
+                try:
+                    parsed = json.loads(value)
+                except json.JSONDecodeError:
+                    errors.append("OPENCODE_AUTH_JSON must be valid JSON")
+                else:
+                    if not isinstance(parsed, dict):
+                        errors.append("OPENCODE_AUTH_JSON must contain a JSON object")
     for setting, placeholder in (("user.name", "Your Name"), ("user.email", "you@example.com")):
         try:
             value = git(config.project.path, "config", "--get", setting)

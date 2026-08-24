@@ -1,8 +1,8 @@
-# syntax=docker/dockerfile:1.7
-ARG PYTHON_IMAGE=ghcr.io/astral-sh/uv:python3.14-bookworm-slim
-ARG BUN_IMAGE=oven/bun:1.3.14
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+ARG PYTHON_IMAGE=ghcr.io/astral-sh/uv:python3.14-bookworm-slim@sha256:7cf77f594be8042dab6daa9fe326f90962252268b4f120a7f5dccce4d947e6c1
+ARG BUN_IMAGE=oven/bun:1.3.14@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4
 
-FROM alpine:3.23 AS task
+FROM alpine:3.23@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40 AS task
 ARG TASK_VERSION=3.52.0
 ARG TASK_SHA256=7e0044108830cec0534577b289564e3b7c83e6df276feb631a1edc63d04e4ebe
 RUN wget -q "https://github.com/go-task/task/releases/download/v${TASK_VERSION}/task_linux_arm64.tar.gz" -O /tmp/task.tgz \

@@ -35,7 +35,7 @@ from .git_worktree import (
     reserve_execution_workspace,
 )
 from .policy import CONSULTATION_SPECIALTIES, DomainError, validate_text, validate_title
-from .reconciler import reserve_terminal
+from .reconciler import _config_for_backend, reserve_terminal
 from .store import Store
 
 
@@ -106,6 +106,12 @@ class Delivery:
         self.connection = connection
         self.backend = backend or build_execution_backend(config)
 
+    def _backend_for(self, execution_backend: str) -> ExecutionBackend:
+        backend_config = _config_for_backend(self.config, execution_backend)
+        if backend_config.execution.isolation is self.config.execution.isolation:
+            return self.backend
+        return build_execution_backend(backend_config)
+
     def request_consultation(
         self, actor: str, item_id: str, expected_version: int, specialty: str, question: str
     ) -> dict[str, Any]:
@@ -141,7 +147,7 @@ class Delivery:
 
     def dispatch_consultation_next(self) -> dict[str, Any] | None:
         """Atomically assign one queued consultation and its terminal lease."""
-        created_workspaces: list[tuple[Path, str]] = []
+        created_workspaces: list[tuple[Path, str, str]] = []
         self.connection.execute("SAVEPOINT dispatch_consultation")
         try:
             result = self._dispatch_consultation_next(created_workspaces)
@@ -158,18 +164,19 @@ class Delivery:
             self._remove_created_workspaces(created_workspaces)
             raise
 
-    def _remove_created_workspaces(self, workspaces: list[tuple[Path, str]]) -> None:
-        for path, target_sha in reversed(workspaces):
+    def _remove_created_workspaces(self, workspaces: list[tuple[Path, str, str]]) -> None:
+        for path, target_sha, backend in reversed(workspaces):
             if path.exists():
+                cleanup_config = _config_for_backend(self.config, backend)
                 remove_recorded_workspace(
-                    self.config,
-                    self.config.project.path,
+                    cleanup_config,
+                    cleanup_config.project.path,
                     path,
                     target_sha,
                     allow_dirty=False,
                 )
 
-    def _dispatch_consultation_next(self, created_workspaces: list[tuple[Path, str]]) -> dict[str, Any] | None:
+    def _dispatch_consultation_next(self, created_workspaces: list[tuple[Path, str, str]]) -> dict[str, Any] | None:
         """Assign one queued consultation while respecting the global capacity."""
         target_sha = ""
         active = int(self.connection.execute("SELECT COUNT(*) FROM consultations WHERE state='assigned'").fetchone()[0])
@@ -243,7 +250,8 @@ class Delivery:
                         target_sha,
                         working_directory,
                     )
-                    created_workspaces.append((working_directory, target_sha))
+                    backend = "herdr-container" if str(self.config.execution.isolation) == "container" else "herdr"
+                    created_workspaces.append((working_directory, target_sha, backend))
         now = utc_now()
         changed = self.connection.execute(
             "UPDATE consultations SET responder=?,state='assigned',terminal_run_id=?,target_sha=?,"
@@ -466,8 +474,9 @@ class Delivery:
 
     def _materialize_dispatch(self, execution_id: int) -> dict[str, Any]:
         row = self.connection.execute(
-            "SELECT e.*,a.actor_slug,a.terminal_run_id FROM executions e "
-            "JOIN assignments a ON a.execution_id=e.id AND a.state='open' WHERE e.id=?",
+            "SELECT e.*,a.actor_slug,a.terminal_run_id,tr.execution_backend FROM executions e "
+            "JOIN assignments a ON a.execution_id=e.id AND a.state='open' "
+            "JOIN terminal_runs tr ON tr.id=a.terminal_run_id WHERE e.id=?",
             (execution_id,),
         ).fetchone()
         if row is None:
@@ -477,10 +486,11 @@ class Delivery:
             current = branch_sha(self.config.project.path, self.config.project.default_branch)
             if current != row["base_sha"]:
                 raise DomainError("base_changed", "default branch advanced before dispatch")
+            execution_config = _config_for_backend(self.config, str(row["execution_backend"]))
             base, branch = reserve_execution_workspace(
-                self.config,
-                self.config.project.path,
-                self.config.project.default_branch,
+                execution_config,
+                execution_config.project.path,
+                execution_config.project.default_branch,
                 str(row["work_id"]),
                 int(row["number"]),
                 worktree,
@@ -557,9 +567,10 @@ class Delivery:
             raise
         path = Path(str(row["worktree_path"]))
         if path.exists() or path.is_symlink():
+            execution_config = _config_for_backend(self.config, str(row["execution_backend"]))
             remove_recorded_workspace(
-                self.config,
-                self.config.project.path,
+                execution_config,
+                execution_config.project.path,
                 path,
                 str(row["base_sha"]),
             )
@@ -577,7 +588,11 @@ class Delivery:
         work = Store(self.connection).get_work(item_id)
         self._version(work, expected_version)
         assignment = self.connection.execute(
-            "SELECT a.*,e.base_sha,e.branch,e.worktree_path FROM assignments a JOIN executions e ON e.id=a.execution_id WHERE a.work_id=? AND a.actor_slug=? AND a.terminal_run_id=? AND a.state='open' AND e.state='active'",
+            "SELECT a.*,e.base_sha,e.branch,e.worktree_path,tr.execution_backend FROM assignments a "
+            "JOIN executions e ON e.id=a.execution_id "
+            "JOIN terminal_runs tr ON tr.id=a.terminal_run_id "
+            "WHERE a.work_id=? AND a.actor_slug=? AND a.terminal_run_id=? "
+            "AND a.state='open' AND e.state='active'",
             (item_id, actor, terminal_run_id),
         ).fetchone()
         if assignment is None or work["status"] != "in_progress":
@@ -586,7 +601,14 @@ class Delivery:
         default = branch_sha(self.config.project.path, self.config.project.default_branch)
         if default != assignment["base_sha"]:
             raise DomainError("base_changed", "default branch advanced")
-        if str(self.config.execution.isolation) == "container":
+        execution_config = _config_for_backend(self.config, str(assignment["execution_backend"]))
+        revision = int(
+            self.connection.execute(
+                "SELECT COALESCE(MAX(revision),0)+1 FROM submissions WHERE execution_id=?",
+                (assignment["execution_id"],),
+            ).fetchone()[0]
+        )
+        if str(execution_config.execution.isolation) == "container":
             try:
                 import_isolated_submission(
                     self.config.project.path,
@@ -594,6 +616,8 @@ class Delivery:
                     str(assignment["branch"]),
                     str(assignment["base_sha"]),
                     commit_sha,
+                    int(assignment["execution_id"]),
+                    revision,
                 )
             except GitError as exc:
                 raise DomainError("invalid_submission", str(exc)) from exc
@@ -604,19 +628,13 @@ class Delivery:
             or commit_sha == assignment["base_sha"]
         ):
             raise DomainError("invalid_submission", "submission must be a clean committed descendant")
-        revision = int(
-            self.connection.execute(
-                "SELECT COALESCE(MAX(revision),0)+1 FROM submissions WHERE execution_id=?",
-                (assignment["execution_id"],),
-            ).fetchone()[0]
-        )
         now = utc_now()
         submission = self.connection.execute(
             "INSERT INTO submissions(execution_id,revision,commit_sha,summary,state,created_at,updated_at)VALUES(?,?,?,?, 'checking',?,?)",
             (assignment["execution_id"], revision, commit_sha, summary, now, now),
         ).lastrowid
         checktree = self.config.root / ".worktrees/check" / str(submission)
-        add_agent_snapshot(self.config, self.config.project.path, commit_sha, checktree)
+        add_agent_snapshot(execution_config, execution_config.project.path, commit_sha, checktree)
         for position, argv in enumerate(self.config.project.verify, 1):
             self.connection.execute(
                 "INSERT INTO checks(submission_id,scope,target_sha,position,command,worktree_path,state,created_at,updated_at)VALUES(?,'submission',?,?,?,?, 'queued',?,?)",
@@ -791,11 +809,22 @@ class Delivery:
         )
         return {"id": row["id"], "state": state}
 
-    def _prepare_review_worktree(self, commit_sha: str, reviewtree: Path) -> None:
+    def _prepare_review_worktree(self, submission_id: int, gate: str, commit_sha: str, reviewtree: Path) -> None:
         if reviewtree.exists() and any(reviewtree.iterdir()):
+            previous = self.connection.execute(
+                "SELECT tr.execution_backend FROM reviews r "
+                "JOIN terminal_runs tr ON tr.id=r.terminal_run_id "
+                "WHERE r.submission_id=? AND r.gate=? ORDER BY r.id DESC LIMIT 1",
+                (submission_id, gate),
+            ).fetchone()
+            cleanup_config = (
+                _config_for_backend(self.config, str(previous["execution_backend"]))
+                if previous is not None
+                else self.config
+            )
             remove_recorded_workspace(
-                self.config,
-                self.config.project.path,
+                cleanup_config,
+                cleanup_config.project.path,
                 reviewtree,
                 commit_sha,
                 allow_dirty=True,
@@ -805,6 +834,7 @@ class Delivery:
     def _assign_review(self, submission: sqlite3.Row, submission_id: int, gate: str, now: str) -> bool:
         self.connection.execute("SAVEPOINT assign_review")
         reviewtree: Path | None = None
+        review_config = self.config
         try:
             if gate == "coordination":
                 if not self._manager_available():
@@ -831,18 +861,19 @@ class Delivery:
                     self.connection.execute("RELEASE SAVEPOINT assign_review")
                     return False
                 reviewtree = self.config.root / ".worktrees/review" / f"{submission_id}-{gate}"
-                self._prepare_review_worktree(str(submission["commit_sha"]), reviewtree)
+                self._prepare_review_worktree(submission_id, gate, str(submission["commit_sha"]), reviewtree)
 
                 worktree_path = reviewtree
                 run = reserve_terminal(
                     self.connection,
-                    self.config,
+                    review_config,
                     actor=str(actor["slug"]),
                     purpose_kind="review",
                     purpose_id=f"{submission_id}-{gate}",
                     working_directory=reviewtree,
                 )
                 terminal_run_id = int(run["id"])
+                review_config = _config_for_backend(self.config, str(run["execution_backend"]))
             self.connection.execute(
                 "INSERT INTO reviews(submission_id,gate,actor_slug,terminal_run_id,worktree_path,verdict,created_at,updated_at)"
                 "VALUES(?,?,?,?,?,'pending',?,?)",
@@ -870,8 +901,8 @@ class Delivery:
             self.connection.execute("RELEASE SAVEPOINT assign_review")
             if reviewtree is not None and reviewtree.exists():
                 remove_recorded_workspace(
-                    self.config,
-                    self.config.project.path,
+                    review_config,
+                    review_config.project.path,
                     reviewtree,
                     str(submission["commit_sha"]),
                     allow_dirty=False,
@@ -1116,6 +1147,7 @@ class Delivery:
             "error=COALESCE(error,?),updated_at=? WHERE id=?",
             (now, reason, now, run_id),
         )
+        backend = self._backend_for(str(row["execution_backend"]))
         handle: RunHandle | None = None
         if row["backend_run_id"] and row["backend_terminal_id"]:
             handle = RunHandle(
@@ -1125,7 +1157,7 @@ class Delivery:
             )
         elif str(row["execution_name"]) not in {"", "reserved"}:
             try:
-                snapshot = self.backend.find_run(str(row["execution_name"]))
+                snapshot = backend.find_run(str(row["execution_name"]))
             except (ExecutionUnavailable, ExecutionBusy, ExecutionTimeout) as exc:
                 raise DomainError("execution_unavailable", f"cannot verify old terminal: {exc}") from exc
             except ExecutionError as exc:
@@ -1136,7 +1168,7 @@ class Delivery:
                 handle = snapshot.handle
         if handle is not None:
             try:
-                self.backend.delete_run(handle)
+                backend.delete_run(handle)
             except ExecutionNotFound:
                 pass
             except (ExecutionUnavailable, ExecutionBusy, ExecutionTimeout) as exc:

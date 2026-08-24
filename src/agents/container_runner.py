@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -18,21 +20,72 @@ def _required(name: str) -> str:
     return value
 
 
-def _write_secret(path: Path, value: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if path.is_symlink() or path.parent.is_symlink():
-        raise ContainerRuntimeError(f"unsafe credential path: {path}")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+def _write_secret(root: Path, relative_path: Path, value: str) -> None:
+    if relative_path.is_absolute() or not relative_path.name or ".." in relative_path.parts:
+        raise ContainerRuntimeError(f"unsafe credential path: {relative_path}")
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+    descriptors: list[int] = []
+    try:
+        descriptors.append(os.open(root, directory_flags))
+        for part in relative_path.parent.parts:
+            if part in {"", "."}:
+                continue
+            with contextlib.suppress(FileExistsError):
+                os.mkdir(part, mode=0o700, dir_fd=descriptors[-1])
+            descriptors.append(os.open(part, directory_flags, dir_fd=descriptors[-1]))
+        for descriptor in descriptors:
+            metadata = os.fstat(descriptor)
+            if metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
+                raise OSError("credential directory is not private")
+        try:
+            target_metadata = os.stat(relative_path.name, dir_fd=descriptors[-1], follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            if stat.S_ISLNK(target_metadata.st_mode):
+                raise OSError("credential target is a symlink")
+            os.unlink(relative_path.name, dir_fd=descriptors[-1])
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(relative_path.name, flags, 0o600, dir_fd=descriptors[-1])
+        try:
+            remaining = memoryview(value.encode())
+            while remaining:
+                remaining = remaining[os.write(descriptor, remaining) :]
+        finally:
+            os.close(descriptor)
+    except OSError as exc:
+        raise ContainerRuntimeError(f"unsafe credential path: {root / relative_path}") from exc
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _read_provider_credential(provider_dir: Path) -> str:
+    value = os.environ.pop("AGENTS_PROVIDER_CREDENTIAL_FILE", "")
+    path = Path(value)
+    expected = provider_dir / "provider-auth"
+    if path != expected or path.is_symlink() or not path.is_file():
+        raise ContainerRuntimeError("provider credential path is unsafe")
+    flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(path, flags, 0o600)
-    except OSError as exc:
-        raise ContainerRuntimeError(f"unsafe credential path: {path}") from exc
-    try:
-        os.write(descriptor, value.encode())
-    finally:
-        os.close(descriptor)
+        descriptor = os.open(path, flags)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
+            raise OSError("provider credential file is not private")
+        try:
+            raw = os.read(descriptor, metadata.st_size + 1)
+        finally:
+            os.close(descriptor)
+        path.unlink()
+        return raw.decode()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ContainerRuntimeError("provider credential path is unsafe") from exc
 
 
 def _metadata() -> tuple[ContainerRuntime, dict[str, Any]]:
@@ -95,19 +148,19 @@ def run(argv: tuple[str, ...] | None = None) -> int:
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
     provider_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     if agent == "opencode":
-        auth = os.environ.pop("OPENCODE_AUTH_JSON", "")
+        auth = _read_provider_credential(provider_dir)
         if not auth:
             raise ContainerRuntimeError("OPENCODE_AUTH_JSON is required for containerized OpenCode")
         try:
             parsed = json.loads(auth)
         except json.JSONDecodeError as exc:
             raise ContainerRuntimeError("OPENCODE_AUTH_JSON is not valid JSON") from exc
-        _write_secret(home / ".local" / "share" / "opencode" / "auth.json", json.dumps(parsed, separators=(",", ":")))
+        _write_secret(home, Path(".local/share/opencode/auth.json"), json.dumps(parsed, separators=(",", ":")))
     elif agent == "claude":
-        token = os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", "")
+        token = _read_provider_credential(provider_dir)
         if not token:
             raise ContainerRuntimeError("CLAUDE_CODE_OAUTH_TOKEN is required for containerized Claude Code")
-        _write_secret(provider_dir / "claude-token", token)
+        _write_secret(provider_dir, Path("claude-token"), token)
 
     docker = [
         "run",
@@ -141,7 +194,7 @@ def run(argv: tuple[str, ...] | None = None) -> int:
     ]
     for key, value in sorted(metadata["labels"].items()):
         docker.extend(("--label", f"{key}={value}"))
-    blocked = {"OPENCODE_AUTH_JSON", "CLAUDE_CODE_OAUTH_TOKEN"}
+    blocked = {"AGENTS_PROVIDER_CREDENTIAL_FILE", "OPENCODE_AUTH_JSON", "CLAUDE_CODE_OAUTH_TOKEN"}
     for name_to_pass in sorted(set(metadata["env_names"]) - blocked):
         if name_to_pass in os.environ:
             docker.extend(("--env", name_to_pass))

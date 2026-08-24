@@ -12,6 +12,7 @@ dependencies = [
     { name = "fastmcp" },
     { name = "httpx" },
     { name = "uvicorn", extra = ["standard"] },
+    { name = "websockets" },
 ]
 
 [package.dev-dependencies]
@@ -27,6 +28,7 @@ requires-dist = [
     { name = "fastmcp", specifier = "==3.4.6" },
     { name = "httpx", specifier = "==0.28.1" },
     { name = "uvicorn", extras = ["standard"], specifier = "==0.52.1" },
+    { name = "websockets", specifier = "==17.0.1" },
 ]
 
 [package.metadata.requires-dev]

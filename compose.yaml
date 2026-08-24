@@ -63,7 +63,7 @@ services:
       - /tmp:rw,noexec,nosuid,nodev
       - /run:rw,noexec,nosuid,nodev
       - /home/agents/.local/share/opencode:rw,noexec,nosuid,nodev
-      - /home/agents/bin:rw,nosuid,nodev
+      - /home/agents/bin:rw,nosuid,nodev,mode=0700,uid=${AGENTS_UID},gid=${AGENTS_GID}
     ports:
       - 127.0.0.1:${AGENTS_WEB_PORT}:${AGENTS_WEB_PORT}
     networks:
@@ -120,8 +120,9 @@ services:
       AGENTS_BROKER_SECRETS_ROOT: /run/agents-secrets
       AGENTS_BROKER_ENV_SCHEMA: /run/agents-secrets/.env.schema
       AGENTS_BROKER_WORKTREE: /run/agents-secrets
-      AGENTS_BROKER_DB_PATH: /run/agents-state/agents.db
-      AGENTS_BROKER_AUTH_KEY_PATH: /run/agents-state/agent-auth-key
+      AGENTS_BROKER_DB_PATH: /run/agents-state/source/agents.db
+      AGENTS_BROKER_AUTH_KEY_PATH: /run/agents-state/source/agent-auth-key
+      AGENTS_BROKER_STATE_ROOT: /run/agents-state
     cap_drop:
       - ALL
     cap_add:
@@ -179,7 +180,7 @@ services:
         target: /run/agents-secrets/store
       - type: bind
         source: ${AGENTS_REPO_PATH}/.agents
-        target: /run/agents-state
+        target: /run/agents-state/source
         read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev

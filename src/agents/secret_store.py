@@ -30,6 +30,8 @@ KEY_NAME = ".env.sops-age"
 HOME_NAME = ".sops-isolated-home"
 LOCK_NAME = "agents-secret-store.lock"
 
+StoredValue = str | dict[str, str]
+
 
 class SecretStoreError(Exception):
     pass
@@ -311,19 +313,17 @@ def _validate_ciphertext(paths: Paths, recipient: str) -> dict[str, object]:
     for name, value in ciphertext.items():
         if name == "sops":
             continue
-        if (
-            not isinstance(name, str)
-            or not NAME_RE.fullmatch(name)
-            or not isinstance(value, str)
-            or not value.startswith("ENC[")
-        ):
+        valid_value = isinstance(value, str) and value.startswith("ENC[")
+        if isinstance(value, dict) and set(value) == {"encoding", "value"}:
+            valid_value = all(isinstance(item, str) and item.startswith("ENC[") for item in value.values())
+        if not isinstance(name, str) or not NAME_RE.fullmatch(name) or not valid_value:
             raise SecretStoreError("encrypted secret store contains an invalid top-level entry")
     if FORMAT_KEY not in ciphertext:
         raise SecretStoreError("encrypted secret store lacks its format marker")
     return ciphertext
 
 
-def _decrypt(paths: Paths) -> dict[str, str]:
+def _decrypt(paths: Paths) -> dict[str, StoredValue]:
     recipient = _derive_recipient(paths)
     _validate_ciphertext(paths, recipient)
     output = _run(
@@ -335,20 +335,48 @@ def _decrypt(paths: Paths) -> dict[str, str]:
     plain = _parse_json(output, "decrypted secret store")
     if plain.get(FORMAT_KEY) != FORMAT_VERSION:
         raise SecretStoreError("unsupported agent secret store version")
-    values: dict[str, str] = {}
+    values: dict[str, StoredValue] = {}
     for name, value in plain.items():
         if name == FORMAT_KEY:
             continue
-        if not isinstance(name, str) or not NAME_RE.fullmatch(name) or not isinstance(value, str):
+        if not isinstance(name, str) or not NAME_RE.fullmatch(name):
             raise SecretStoreError("decrypted secret store contains an invalid entry")
-        if "\0" in value:
-            raise SecretStoreError("decrypted secret store contains a NUL byte")
-        values[name] = value
+        if isinstance(value, str):
+            if "\0" in value:
+                raise SecretStoreError("decrypted secret store contains a NUL byte")
+            values[name] = value
+            continue
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"encoding", "value"}
+            or value.get("encoding") != "base64"
+            or not isinstance(value.get("value"), str)
+        ):
+            raise SecretStoreError("decrypted secret store contains an invalid entry")
+        values[name] = {"encoding": "base64", "value": value["value"]}
     return values
 
 
-def _validate_schema(paths: Paths, values: dict[str, str]) -> None:
-    env = _command_env(values)
+def _stored_bytes(value: StoredValue) -> bytes:
+    if isinstance(value, str):
+        return value.encode()
+    try:
+        return base64.b64decode(value["value"], validate=True)
+    except ValueError as exc:
+        raise SecretStoreError("decrypted secret store contains malformed byte encoding") from exc
+
+
+def _validate_schema(paths: Paths, values: dict[str, StoredValue]) -> None:
+    schema_values: dict[str, str] = {}
+    for name, value in values.items():
+        raw = _stored_bytes(value)
+        try:
+            decoded = raw.decode()
+        except UnicodeDecodeError:
+            continue
+        if "\0" not in decoded:
+            schema_values[name] = decoded
+    env = _command_env(schema_values)
     output = _run(
         [
             "varlock",
@@ -500,13 +528,9 @@ def unset_secret(paths: Paths, name: str) -> None:
 
 
 def reveal_secret(paths: Paths, name: str) -> None:
-    _validate_name(name)
-    values = _decrypt(paths)
-    if name not in values:
-        raise SecretStoreError(f"managed key does not exist: {name}")
-    _validate_schema(paths, values)
-    sys.stdout.write(values[name])
-    sys.stdout.flush()
+    values = broker_byte_values(paths, [name])
+    sys.stdout.buffer.write(values[name])
+    sys.stdout.buffer.flush()
 
 
 def list_secrets(paths: Paths) -> None:
@@ -515,36 +539,44 @@ def list_secrets(paths: Paths) -> None:
         print(name)
 
 
-def broker_values(paths: Paths, names: list[str] | None = None) -> dict[str, str]:
+def broker_byte_values(paths: Paths, names: list[str] | None = None) -> dict[str, bytes]:
     values = _decrypt(paths)
     _validate_schema(paths, values)
     if names is None:
-        return values
+        return {name: _stored_bytes(value) for name, value in values.items()}
     for name in names:
         _validate_name(name)
     unknown = [name for name in names if name not in values]
     if unknown:
         raise SecretStoreError(f"unknown managed secret name: {unknown[0]}")
-    return {name: values[name] for name in names}
+    return {name: _stored_bytes(values[name]) for name in names}
+
+
+def broker_values(paths: Paths, names: list[str] | None = None) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for name, raw in broker_byte_values(paths, names).items():
+        try:
+            decoded = raw.decode()
+        except UnicodeDecodeError:
+            raise SecretStoreError(f"managed secret cannot be exported as an environment value: {name}") from None
+        if "\0" in decoded:
+            raise SecretStoreError(f"managed secret cannot be exported as an environment value: {name}")
+        values[name] = decoded
+    return values
 
 
 def set_secret_value(paths: Paths, name: str, value: bytes) -> None:
     _validate_name(name)
-    try:
-        decoded = value.decode("utf-8")
-    except UnicodeDecodeError:
-        raise SecretStoreError("secret value must be valid UTF-8") from None
-    if "\0" in decoded:
-        raise SecretStoreError("secret value cannot contain a NUL byte")
+    encoded: StoredValue = {"encoding": "base64", "value": base64.b64encode(value).decode()}
     with _exclusive_lock(paths.lock):
         values = _decrypt(paths)
-        proposed = {**values, name: decoded}
+        proposed = {**values, name: encoded}
         _validate_schema(paths, proposed)
         _run(
             ["sops", "set", "--value-stdin", str(paths.store), json.dumps([name])],
             cwd=paths.worktree,
             env=_sops_env(paths),
-            input_bytes=json.dumps(decoded).encode("utf-8"),
+            input_bytes=json.dumps(encoded).encode("utf-8"),
             failure="unable to update the encrypted secret store",
         )
         try:
@@ -574,11 +606,7 @@ def _parse_run_args(arguments: list[str]) -> tuple[list[str], list[str]]:
 
 
 def run_command(paths: Paths, names: list[str], command: list[str]) -> NoReturn:
-    values = _decrypt(paths)
-    unknown = [name for name in names if name not in values]
-    if unknown:
-        raise SecretStoreError(f"unknown managed secret name: {unknown[0]}")
-    _validate_schema(paths, values)
+    values = broker_values(paths, names)
     argv = [
         "varlock",
         "run",

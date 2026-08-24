@@ -12,6 +12,7 @@ from typing import cast
 from unittest.mock import ANY, MagicMock, call, patch
 
 from agents.config import AgentsConfig, ContainerConfig, IsolationMode
+from agents.container_commands import _cleanup_secret_source_artifacts
 from agents.container_runner import _write_secret
 from agents.container_runner import run as run_container
 from agents.container_runtime import (
@@ -21,7 +22,7 @@ from agents.container_runtime import (
     ContainerRuntimeError,
     _completed,
 )
-from agents.execution import ExecutionConflict, RunHandle
+from agents.execution import ExecutionConflict, ExecutionTerminated, RunHandle
 
 
 class ContainerRuntimeTests(unittest.TestCase):
@@ -70,6 +71,7 @@ class ContainerRuntimeTests(unittest.TestCase):
         inspect = {
             "Id": "sha256:container",
             "Image": "sha256:image",
+            "State": {"Running": True},
             "Config": {"User": f"{os.getuid()}:{os.getgid()}", "WorkingDir": cwd, "Labels": labels},
             "HostConfig": {
                 "ReadonlyRootfs": True,
@@ -173,8 +175,36 @@ class ContainerRuntimeTests(unittest.TestCase):
         secret_path = provider / "auth.json"
         secret_path.symlink_to(destination)
         with self.assertRaisesRegex(ContainerRuntimeError, "unsafe credential path"):
-            _write_secret(secret_path, "secret")
+            _write_secret(provider, Path("auth.json"), "secret")
         self.assertFalse(destination.exists())
+
+    def test_secret_writer_rejects_symlinked_ancestor(self) -> None:
+        provider = self.root / "provider"
+        provider.mkdir()
+        outside = self.root / "outside"
+        outside.mkdir()
+        (provider / "nested").symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(ContainerRuntimeError, "unsafe credential path"):
+            _write_secret(provider, Path("nested/auth.json"), "secret")
+        self.assertFalse((outside / "auth.json").exists())
+
+    def test_secret_source_cleanup_removes_only_matching_artifacts(self) -> None:
+        auth = self.root / "topology"
+        auth.write_text("auth")
+        broker_config = self.root / "topology-broker.toml"
+        broker_local = self.root / "topology-broker.env"
+        broker_root = self.root / "topology-broker"
+        broker_config.write_text("config")
+        broker_local.write_text("secret")
+        broker_root.mkdir()
+        (broker_root / "secret").write_text("secret")
+        unrelated = self.root / "other-broker.env"
+        unrelated.write_text("keep")
+        _cleanup_secret_source_artifacts(auth)
+        self.assertFalse(broker_config.exists())
+        self.assertFalse(broker_local.exists())
+        self.assertFalse(broker_root.exists())
+        self.assertEqual(unrelated.read_text(), "keep")
 
     def test_identity_verification_accepts_only_exact_hardened_container(self) -> None:
         manifest, inspect = self._identity()
@@ -254,6 +284,16 @@ class ContainerRuntimeTests(unittest.TestCase):
             with self.subTest(run_id=run_id, generation=generation), self.assertRaises(ExecutionConflict):
                 self.backend.verified_container_name("execution", run_id, generation)
 
+    def test_live_identity_rejects_stopped_container(self) -> None:
+        manifest, inspect = self._identity()
+        inspect["State"] = {"Running": False, "ExitCode": 1}
+        path = self.backend._manifest_path("execution")
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(manifest))
+        self.runtime.inspect_container.return_value = inspect
+        with self.assertRaisesRegex(ExecutionTerminated, "not running"):
+            self.backend.verified_container_name("execution", 1, 2)
+
     def test_delete_rejects_missing_manifest_without_closing_herdr(self) -> None:
         with self.assertRaisesRegex(ExecutionConflict, "manifest.*absent"):
             self.backend.delete_run(RunHandle("execution", "workspace", "pane"))
@@ -297,59 +337,57 @@ class ContainerRuntimeTests(unittest.TestCase):
         connection.row_factory = sqlite3.Row
         connection.execute(
             "CREATE TABLE terminal_runs("
-            "id INTEGER,execution_name TEXT,state TEXT,agent_auth_id TEXT,generation INTEGER)"
+            "id INTEGER,execution_name TEXT,state TEXT,agent_auth_id TEXT,generation INTEGER,"
+            "execution_backend TEXT,container_image_id TEXT)"
         )
         connection.execute("CREATE TABLE launch_attempts(terminal_run_id INTEGER,state TEXT)")
         connection.execute("CREATE TABLE assignments(terminal_run_id INTEGER,execution_id INTEGER)")
         connection.execute("CREATE TABLE executions(id INTEGER,worktree_path TEXT,base_sha TEXT,state TEXT)")
         connection.execute("CREATE TABLE submissions(id INTEGER,execution_id INTEGER,commit_sha TEXT)")
-        connection.execute("INSERT INTO terminal_runs VALUES(1,'active','live','active',1)")
-        connection.execute("INSERT INTO terminal_runs VALUES(2,'uncertain','failed','uncertain-auth',1)")
+        connection.execute(
+            "INSERT INTO terminal_runs VALUES(1,'active','live','active',1,'herdr-container','sha256:active-image')"
+        )
+        connection.execute(
+            "INSERT INTO terminal_runs VALUES(2,'uncertain','failed','uncertain-auth',1,'herdr-container',NULL)"
+        )
         connection.execute("INSERT INTO launch_attempts VALUES(2,'uncertain')")
-        runtime = MagicMock()
-        runtime.resolve_image_id.side_effect = lambda image: image if image.startswith("sha256:") else "sha256:image"
-        runtime.docker.side_effect = [
-            "\n".join(
-                (
-                    json.dumps({"Names": "stale"}),
-                    json.dumps({"Names": "stale-running"}),
-                    json.dumps({"Names": "wrong-instance"}),
-                    json.dumps({"Names": "active"}),
-                    json.dumps({"Names": "compose-init"}),
-                    json.dumps({"Names": "uncertain"}),
-                )
-            ),
-            "ephemeral-volume\nactive-volume",
+        connection.execute("INSERT INTO terminal_runs VALUES(3,'ended','ended','ended-auth',2,'herdr-container',NULL)")
+        connection.execute("INSERT INTO terminal_runs VALUES(4,'host-ended','ended','host-auth',1,'herdr',NULL)")
+        connection.execute(
+            "INSERT INTO terminal_runs VALUES(5,'manifest-missing','ended','missing-auth',1,'herdr-container',NULL)"
+        )
+
+        ended_runtime = self.config.state_dir / "runtime" / "ended-auth"
+        ended_runtime.mkdir(parents=True)
+        host_runtime = self.config.state_dir / "runtime" / "host-auth"
+        host_runtime.mkdir(parents=True)
+        (host_runtime / "keep").write_text("keep")
+        missing_manifest_runtime = self.config.state_dir / "runtime" / "missing-auth"
+        missing_manifest_runtime.mkdir(parents=True)
+        (missing_manifest_runtime / "keep").write_text("keep")
+        ended_manifest = (
+            self.config.state_dir / "runtime" / "containers" / f"{hashlib.sha256(b'ended').hexdigest()}.json"
+        )
+        ended_manifest.parent.mkdir()
+        ended_manifest.write_text(
             json.dumps(
-                [
-                    {
-                        "CreatedAt": "2000-01-01T00:00:00Z",
-                        "Labels": {
-                            "dev.agents.instance": "instance",
-                            "dev.agents.execution": "old",
-                            "dev.agents.retention": "ephemeral",
-                        },
-                    }
-                ]
-            ),
-            "",
-            json.dumps(
-                [
-                    {
-                        "CreatedAt": "2000-01-01T00:00:00Z",
-                        "Labels": {
-                            "dev.agents.instance": "instance",
-                            "dev.agents.execution": "active",
-                            "dev.agents.retention": "ephemeral",
-                        },
-                    }
-                ]
-            ),
-            "",
-            "",
-        ]
+                {
+                    "execution_name": "ended",
+                    "container_name": "agents-instance-r3-g2",
+                    "runtime_dir": str(ended_runtime.resolve()),
+                    "labels": {
+                        "dev.agents.instance": "instance",
+                        "dev.agents.execution": "ended",
+                        "dev.agents.run_id": "3",
+                        "dev.agents.generation": "2",
+                    },
+                }
+            )
+        )
+
         stale = {
             "Id": "sha256:stale",
+            "Image": "sha256:stale-image",
             "Config": {
                 "Labels": {
                     "dev.agents.instance": "instance",
@@ -361,6 +399,7 @@ class ContainerRuntimeTests(unittest.TestCase):
         }
         stale_running = {
             "Id": "sha256:stale-running",
+            "Image": "sha256:stale-running-image",
             "Created": "2000-01-01T00:00:00Z",
             "Config": {
                 "Labels": {
@@ -372,6 +411,7 @@ class ContainerRuntimeTests(unittest.TestCase):
             "State": {"Running": True, "FinishedAt": ""},
         }
         wrong_instance = {
+            "Image": "sha256:foreign",
             "Created": "2000-01-01T00:00:00Z",
             "Config": {
                 "Labels": {
@@ -383,6 +423,7 @@ class ContainerRuntimeTests(unittest.TestCase):
             "State": {"Running": True, "FinishedAt": ""},
         }
         active = {
+            "Image": "sha256:active-image",
             "Config": {
                 "Labels": {
                     "dev.agents.instance": "instance",
@@ -412,31 +453,100 @@ class ContainerRuntimeTests(unittest.TestCase):
             },
             "State": {"Running": False, "FinishedAt": "2000-01-01T00:00:00Z"},
         }
-        runtime.inspect_container.side_effect = [stale, stale_running, wrong_instance, active, compose, uncertain]
+        inspections = {
+            "foreign": {"Image": "sha256:foreign"},
+            "stale": stale,
+            "stale-running": stale_running,
+            "wrong-instance": wrong_instance,
+            "active": active,
+            "compose-init": compose,
+            "uncertain": uncertain,
+            "agents-instance-r3-g2": None,
+            "agents-instance-r5-g1": None,
+        }
+        runtime = MagicMock()
+        runtime.resolve_image_id.side_effect = lambda image: image if image.startswith("sha256:") else "sha256:image"
+        runtime.inspect_container.side_effect = lambda name: inspections[name]
+
+        owned_rows = "\n".join(
+            json.dumps({"Names": name})
+            for name in (
+                "stale",
+                "stale-running",
+                "wrong-instance",
+                "active",
+                "compose-init",
+                "uncertain",
+            )
+        )
+        image_rows = "\n".join(
+            json.dumps({"ID": image_id})
+            for image_id in (
+                "sha256:image",
+                "sha256:active-image",
+                "sha256:old-dangling",
+            )
+        )
+
+        def docker(*args: str) -> str:
+            if args == (
+                "container",
+                "ls",
+                "--all",
+                "--filter",
+                "label=dev.agents.instance=instance",
+                "--format",
+                "{{json .}}",
+            ):
+                return owned_rows
+            if args[:2] == ("volume", "ls"):
+                return "ephemeral-volume\nactive-volume"
+            if args[:2] == ("volume", "inspect"):
+                execution = "old" if args[2] == "ephemeral-volume" else "active"
+                return json.dumps(
+                    [
+                        {
+                            "CreatedAt": "2000-01-01T00:00:00Z",
+                            "Labels": {
+                                "dev.agents.instance": "instance",
+                                "dev.agents.execution": execution,
+                                "dev.agents.retention": "ephemeral",
+                            },
+                        }
+                    ]
+                )
+            if args[:2] == ("image", "ls"):
+                return image_rows
+            if args[:2] == ("image", "inspect"):
+                return json.dumps([{"Id": args[2], "Created": "2000-01-01T00:00:00Z"}])
+            if args[:2] in (("volume", "rm"), ("image", "rm"), ("builder", "prune")):
+                return ""
+            raise AssertionError(f"unexpected docker call: {args!r}")
+
+        runtime.docker.side_effect = docker
         runtime.trim.side_effect = ContainerRuntimeError("trim unavailable")
         with patch("agents.container_runtime._instance_id", return_value="instance"):
             collector = ContainerGarbageCollector(self.config, connection, runtime)
         result = collector.collect()
+
         runtime.remove_container.assert_has_calls(
             [call("stale", "sha256:stale"), call("stale-running", "sha256:stale-running")]
         )
         self.assertEqual(runtime.remove_container.call_count, 2)
         self.assertNotIn(call("compose-init", ANY), runtime.remove_container.call_args_list)
         self.assertNotIn(call("wrong-instance", ANY), runtime.remove_container.call_args_list)
-        self.assertNotIn(call("uncertain"), runtime.remove_container.call_args_list)
+        self.assertNotIn(call("uncertain", ANY), runtime.remove_container.call_args_list)
         self.assertEqual(result["volumes"], ["ephemeral-volume"])
-        runtime.docker.assert_any_call(
-            "volume",
-            "ls",
-            "--filter",
-            "label=dev.agents.instance=instance",
-            "--filter",
-            "label=dev.agents.retention=ephemeral",
-            "--format",
-            "{{.Name}}",
-        )
+        self.assertEqual(result["images"], ["sha256:old-dangling"])
         runtime.docker.assert_any_call("volume", "rm", "ephemeral-volume")
-        self.assertNotIn(call("volume", "rm", "active-volume"), runtime.docker.call_args_list)
+        runtime.docker.assert_any_call("image", "rm", "sha256:old-dangling")
+        for protected in ("sha256:image", "sha256:active-image"):
+            self.assertNotIn(call("image", "rm", protected), runtime.docker.call_args_list)
+        self.assertFalse(ended_runtime.exists())
+        self.assertFalse(ended_manifest.exists())
+        self.assertTrue((host_runtime / "keep").is_file())
+        self.assertTrue((missing_manifest_runtime / "keep").is_file())
+        self.assertTrue(any("without manifest" in error for error in result["cleanup_errors"]))
         self.assertIn("trim unavailable", result["trim_error"])
         connection.close()
 
@@ -445,6 +555,11 @@ class ContainerRuntimeTests(unittest.TestCase):
         runtime_dir = self.root / "runtime"
         cwd.mkdir()
         runtime_dir.mkdir()
+        provider = runtime_dir / "provider"
+        provider.mkdir()
+        credential = provider / "provider-auth"
+        credential.write_text('{"token":"super-secret"}')
+        credential.chmod(0o600)
         runtime = MagicMock()
         runtime.docker_environment.return_value = {"DOCKER_HOST": "unix:///socket"}
         environment = {
@@ -457,12 +572,12 @@ class ContainerRuntimeTests(unittest.TestCase):
             "AGENTS_CONTAINER_MEMORY_MB": "4096",
             "AGENTS_CONTAINER_PIDS": "512",
             "AGENTS_CONTAINER_NETWORK": "agents-runs",
-            "OPENCODE_AUTH_JSON": '{"token":"super-secret"}',
+            "AGENTS_PROVIDER_CREDENTIAL_FILE": str(credential.resolve()),
             "AGENTS_API_TOKEN": "run-token",
         }
         metadata = {
             "labels": {"dev.agents.instance": "instance"},
-            "env_names": ["OPENCODE_AUTH_JSON", "AGENTS_API_TOKEN"],
+            "env_names": ["AGENTS_PROVIDER_CREDENTIAL_FILE", "AGENTS_API_TOKEN"],
         }
         completed = SimpleNamespace(returncode=0)
         with (
@@ -483,6 +598,7 @@ class ContainerRuntimeTests(unittest.TestCase):
             (runtime_dir / "home/.local/share/opencode/auth.json").read_text(),
             '{"token":"super-secret"}',
         )
+        self.assertFalse(credential.exists())
 
 
 if __name__ == "__main__":

@@ -41,8 +41,37 @@ def _session(config: AgentsConfig) -> str:
     return value
 
 
-def _herdr_environment(config: AgentsConfig) -> dict[str, str]:
+def _agents_environment(config: AgentsConfig) -> dict[str, str]:
     environment = os.environ.copy()
+    for name in tuple(environment):
+        if (name.startswith("AGENTS_BROKER_") and name != "AGENTS_BROKER_SECRETS_ROOT") or name in {
+            "AGENTS_TOPOLOGY",
+            "AGENTS_SYSTEM_CONTAINER",
+            "AGENTS_WEB_LISTEN_HOST",
+            "AGENTS_SECRETS_TRANSPORT",
+        }:
+            environment.pop(name)
+    environment.update(
+        {
+            "AGENTS_CONFIG": str(config.source),
+            "HERDR_CONFIG_PATH": str(config.herdr_config),
+        }
+    )
+    return environment
+
+
+def _herdr_environment(config: AgentsConfig) -> dict[str, str]:
+    environment = _agents_environment(config)
+    environment.pop("OPENCODE_AUTH_JSON", None)
+    environment.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+    environment.pop("AGENTS_BROKER_SECRETS_ROOT", None)
+    return environment
+
+
+def _foreground_agents_environment(config: AgentsConfig) -> dict[str, str]:
+    environment = os.environ.copy()
+    for name in ("OPENCODE_AUTH_JSON", "CLAUDE_CODE_OAUTH_TOKEN", "AGENTS_PROVIDER_AUTH_FILE"):
+        environment.pop(name, None)
     environment.update(
         {
             "AGENTS_CONFIG": str(config.source),
@@ -239,8 +268,17 @@ def start(config: AgentsConfig) -> None:
                 "opencode": "OPENCODE_AUTH_JSON",
                 "claude": "CLAUDE_CODE_OAUTH_TOKEN",
             }.get(config.execution.provider)
-            if credential is not None and not os.environ.get(credential):
-                raise ServiceError(f"{credential} is required for containerized {config.execution.provider}")
+            if credential is not None:
+                value = os.environ.get(credential)
+                if not value:
+                    raise ServiceError(f"{credential} is required for containerized {config.execution.provider}")
+                if credential == "OPENCODE_AUTH_JSON":
+                    try:
+                        parsed = json.loads(value)
+                    except json.JSONDecodeError as exc:
+                        raise ServiceError("OPENCODE_AUTH_JSON must be valid JSON") from exc
+                    if not isinstance(parsed, dict):
+                        raise ServiceError("OPENCODE_AUTH_JSON must contain a JSON object")
             from .container_runtime import ContainerRuntime, ContainerRuntimeError
 
             connection = sqlite3.connect(config.db_path)
@@ -303,6 +341,8 @@ def start(config: AgentsConfig) -> None:
         raise ServiceError(f"owned Agents service is running but unhealthy; {_EXPLICIT_RESTART}")
     if herdr_ready and web_ready:
         return
+    if not agentsd_owned and not _port_free(config.web.host, config.web.port):
+        raise ServiceError(f"web port {config.web.host}:{config.web.port} is already in use")
 
     _write_herdr_config(config)
     herdr_process: subprocess.Popen[bytes] | None = None
@@ -315,7 +355,7 @@ def start(config: AgentsConfig) -> None:
             agentsd = config.root / ".venv" / "bin" / "agentsd"
             if not agentsd.is_file() or not os.access(agentsd, os.X_OK):
                 raise ServiceError(f"required managed executable is not installed: {agentsd}")
-            agentsd_process = _launch_process(config, "agentsd", agentsd, [], _herdr_environment(config))
+            agentsd_process = _launch_process(config, "agentsd", agentsd, [], _agents_environment(config))
 
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
@@ -343,47 +383,76 @@ def start(config: AgentsConfig) -> None:
 
 def foreground(config: AgentsConfig) -> None:
     """Supervise Herdr and agentsd in the current PID namespace."""
-    provider_path: Path | None = None
-    auth_path_value = os.environ.get("AGENTS_PROVIDER_AUTH_FILE")
-    if auth_path_value and config.execution.provider != "mock":
-        auth_path = Path(auth_path_value)
-        if auth_path.is_symlink() or not auth_path.is_file() or auth_path.stat().st_mode & 0o077:
-            raise ServiceError("unsafe whole-system provider credential file")
-        private = Path("/tmp/agents-provider")
-        private.mkdir(mode=0o700)
-        if config.execution.provider == "opencode":
-            provider_path = Path.home() / ".local/share/opencode/auth.json"
-            provider_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            provider_path.write_bytes(auth_path.read_bytes())
-            provider_path.chmod(0o600)
-        elif config.execution.provider == "claude":
-            token = private / "claude-token"
-            token.write_bytes(auth_path.read_bytes())
-            token.chmod(0o600)
-            wrapper = Path.home() / "bin" / "claude"
-            wrapper.parent.mkdir(mode=0o700)
-            wrapper.write_text(
-                "#!/opt/agents/.venv/bin/python\n"
-                "import os,sys\n"
-                "from pathlib import Path\n"
-                "os.environ['CLAUDE_CODE_OAUTH_TOKEN']=Path('/tmp/agents-provider/claude-token').read_text()\n"
-                "os.execv('/usr/local/bin/claude',['claude',*sys.argv[1:]])\n",
-                encoding="utf-8",
-            )
-            wrapper.chmod(0o500)
-            provider_path = token
-    _write_herdr_config(config)
-    session = _session(config)
-    command, environment = _herdr_command(config, session, "server")
-    if config.execution.provider == "claude":
-        environment["PATH"] = f"{Path.home() / 'bin'}:{environment.get('PATH', '')}"
-    agentsd_value = shutil.which("agentsd")
-    if agentsd_value is None:
-        raise ServiceError("required agentsd executable is not installed")
-    record_names = ("compose-herdr", "compose-agentsd")
-    for name in record_names:
-        (config.state_dir / f"{name}.pid").unlink(missing_ok=True)
-    herdr = subprocess.Popen(command, cwd=config.root, env=environment, start_new_session=True)
+    provider_artifacts: list[Path] = []
+
+    def cleanup_provider_artifacts() -> None:
+        for path in provider_artifacts:
+            path.unlink(missing_ok=True)
+
+    try:
+        auth_path_value = os.environ.get("AGENTS_PROVIDER_AUTH_FILE")
+        if auth_path_value and config.execution.provider != "mock":
+            auth_path = Path(auth_path_value)
+            if auth_path.is_symlink() or not auth_path.is_file() or auth_path.stat().st_mode & 0o077:
+                raise ServiceError("unsafe whole-system provider credential file")
+            if config.execution.provider == "opencode":
+                provider_path = Path.home() / ".local/share/opencode/auth.json"
+                provider_artifacts.append(provider_path)
+                provider_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                provider_path.write_bytes(auth_path.read_bytes())
+                provider_path.chmod(0o600)
+            elif config.execution.provider == "claude":
+                private = Path("/tmp/agents-provider")
+                private.mkdir(mode=0o700, exist_ok=True)
+                if (
+                    private.is_symlink()
+                    or not private.is_dir()
+                    or private.stat().st_uid != os.getuid()
+                    or private.stat().st_mode & 0o077
+                ):
+                    raise ServiceError("unsafe whole-system provider credential directory")
+                token = private / "claude-token"
+                provider_artifacts.append(token)
+                token.write_bytes(auth_path.read_bytes())
+                token.chmod(0o600)
+                wrapper_dir = Path.home() / "bin"
+                wrapper_dir.mkdir(mode=0o700, exist_ok=True)
+                wrapper_metadata = wrapper_dir.stat()
+                if (
+                    wrapper_dir.is_symlink()
+                    or not wrapper_dir.is_dir()
+                    or wrapper_metadata.st_uid != os.getuid()
+                    or wrapper_metadata.st_mode & 0o077
+                ):
+                    raise ServiceError("unsafe whole-system provider wrapper directory")
+                wrapper = wrapper_dir / "claude"
+                if wrapper.exists() or wrapper.is_symlink():
+                    raise ServiceError("unsafe whole-system provider wrapper path")
+                provider_artifacts.append(wrapper)
+                wrapper.write_text(
+                    "#!/opt/agents/.venv/bin/python\n"
+                    "import os,sys\n"
+                    "from pathlib import Path\n"
+                    "os.environ['CLAUDE_CODE_OAUTH_TOKEN']=Path('/tmp/agents-provider/claude-token').read_text()\n"
+                    "os.execv('/usr/local/bin/claude',['claude',*sys.argv[1:]])\n",
+                    encoding="utf-8",
+                )
+                wrapper.chmod(0o500)
+        _write_herdr_config(config)
+        session = _session(config)
+        command, environment = _herdr_command(config, session, "server")
+        if config.execution.provider == "claude":
+            environment["PATH"] = f"{Path.home() / 'bin'}:{environment.get('PATH', '')}"
+        agentsd_value = shutil.which("agentsd")
+        if agentsd_value is None:
+            raise ServiceError("required agentsd executable is not installed")
+        record_names = ("compose-herdr", "compose-agentsd")
+        for name in record_names:
+            (config.state_dir / f"{name}.pid").unlink(missing_ok=True)
+        herdr = subprocess.Popen(command, cwd=config.root, env=environment, start_new_session=True)
+    except BaseException:
+        cleanup_provider_artifacts()
+        raise
     _record(config.state_dir / "compose-herdr.pid", herdr, Path(command[0]))
     agentsd: subprocess.Popen[bytes] | None = None
     stopping = False
@@ -404,7 +473,7 @@ def foreground(config: AgentsConfig) -> None:
             time.sleep(0.25)
         if not _herdr_health(config, session):
             raise ServiceError("Herdr did not become ready within 30 seconds")
-        agentsd_environment = _herdr_environment(config)
+        agentsd_environment = _foreground_agents_environment(config)
         agentsd = subprocess.Popen(
             [agentsd_value],
             cwd=config.root,
@@ -437,8 +506,7 @@ def foreground(config: AgentsConfig) -> None:
                 continue
             if process is not None and record.get("pid") == process.pid:
                 path.unlink(missing_ok=True)
-        if provider_path is not None:
-            provider_path.unlink(missing_ok=True)
+        cleanup_provider_artifacts()
         for value, handler in previous.items():
             signal.signal(value, handler)
 
@@ -606,7 +674,7 @@ def _cleanup_profiles(config: AgentsConfig, connection: Any, rows: list[Any], pr
         try:
             provider_home = None
             runtime_dir = config.state_dir / "runtime"
-            if config.execution.isolation is IsolationMode.CONTAINER:
+            if row["execution_backend"] == "herdr-container":
                 root = runtime_dir / str(row["agent_auth_id"])
                 provider_home = root / "home"
                 runtime_dir = root / "provider"
@@ -700,34 +768,43 @@ def shutdown(config: AgentsConfig, client: Any | None = None) -> None:
             connection.rollback()
             raise
 
-        expected_cwds = {str(Path(row["working_directory"]).resolve()) for row in rows}
+        container_rows = [row for row in rows if row["execution_backend"] == "herdr-container"]
+        host_rows = [row for row in rows if row["execution_backend"] == "herdr"]
+        expected_cwds = {str(Path(row["working_directory"]).resolve()) for row in host_rows}
         if herdr_client is None:
             herdr_client = _herdr_client(config, session)
         assert herdr_client is not None
-        if config.execution.isolation is IsolationMode.CONTAINER:
-            from .container_runtime import ContainerizedHerdrBackend
-            from .execution import RunHandle
-            from .herdr_client import HerdrBackend
+        failures = []
+        unknown_rows = [row for row in rows if row["execution_backend"] not in {"herdr", "herdr-container"}]
+        failures.extend(
+            f"{row['execution_name']}: unsupported stored backend {row['execution_backend']!r}" for row in unknown_rows
+        )
+        if container_rows:
+            if config.execution.container is None:
+                failures.append("stored container runs cannot be cleaned without [execution.container]")
+            else:
+                from .container_runtime import ContainerizedHerdrBackend
+                from .execution import RunHandle
+                from .herdr_client import HerdrBackend
 
-            backend = ContainerizedHerdrBackend(
-                config,
-                HerdrBackend(herdr_client, provider_id=config.execution.provider_id),
-            )
-            failures = []
-            for row in rows:
-                handle = None
-                if row["backend_run_id"] and row["backend_terminal_id"]:
-                    handle = RunHandle(
-                        str(row["execution_name"]),
-                        str(row["backend_run_id"]),
-                        str(row["backend_terminal_id"]),
-                    )
-                try:
-                    backend.cleanup_run(str(row["execution_name"]), handle, remove_runtime=False)
-                except Exception as exc:
-                    failures.append(f"{row['execution_name']}: container cleanup: {exc}")
-        else:
-            failures = _close_mapped_workspaces(herdr_client, prefix, expected_cwds)
+                backend = ContainerizedHerdrBackend(
+                    config,
+                    HerdrBackend(herdr_client, provider_id=config.execution.provider_id),
+                )
+                for row in container_rows:
+                    handle = None
+                    if row["backend_run_id"] and row["backend_terminal_id"]:
+                        handle = RunHandle(
+                            str(row["execution_name"]),
+                            str(row["backend_run_id"]),
+                            str(row["backend_terminal_id"]),
+                        )
+                    try:
+                        backend.cleanup_run(str(row["execution_name"]), handle, remove_runtime=False)
+                    except Exception as exc:
+                        failures.append(f"{row['execution_name']}: container cleanup: {exc}")
+        if host_rows:
+            failures.extend(_close_mapped_workspaces(herdr_client, prefix, expected_cwds))
         failures.extend(_cleanup_profiles(config, connection, rows, project))
         if failures:
             raise ServiceError("shutdown cleanup incomplete: " + "; ".join(failures))

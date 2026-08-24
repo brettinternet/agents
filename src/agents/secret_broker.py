@@ -17,6 +17,18 @@ def main() -> None:
     config = load()
     db_path = Path(os.environ.get("AGENTS_BROKER_DB_PATH", config.db_path))
     auth_source = Path(os.environ.get("AGENTS_BROKER_AUTH_KEY_PATH", config.state_dir / "agent-auth-key"))
+    secret_root = Path(os.environ.get("AGENTS_BROKER_SECRETS_ROOT", ""))
+    state_root = Path(os.environ.get("AGENTS_BROKER_STATE_ROOT", ""))
+    private_roots = (secret_root, state_root)
+    for private_root in private_roots:
+        if (
+            not private_root.is_absolute()
+            or private_root.is_symlink()
+            or not private_root.is_dir()
+            or private_root.stat().st_uid != 0
+        ):
+            raise RuntimeError("unsafe broker private mount root")
+        private_root.chmod(0o700)
     if auth_source.is_symlink() or not auth_source.is_file() or auth_source.stat().st_mode & 0o077:
         raise RuntimeError("unsafe broker authentication key")
     config.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)

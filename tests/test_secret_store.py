@@ -260,6 +260,20 @@ class SecretStoreTests(unittest.TestCase):
             self.assertNotIn(b"alpha-bravo", missing.stderr)
             self.assertNotIn(b"charlie-delta", missing.stderr)
 
+    def test_protocol_set_preserves_exact_binary_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_repository(root)
+            self.assertEqual(self.cli(root, "init").returncode, 0)
+            paths = self.make_paths(root)
+            value = b"\xffalpha\0omega"
+
+            secret_store.set_secret_value(paths, "DEMO_TOKEN", value)
+
+            self.assertEqual(secret_store.broker_byte_values(paths, ["DEMO_TOKEN"]), {"DEMO_TOKEN": value})
+            with self.assertRaisesRegex(secret_store.SecretStoreError, "environment value"):
+                secret_store.broker_values(paths, ["DEMO_TOKEN"])
+
     def test_run_selection_filtering_argv_validation_and_redaction(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

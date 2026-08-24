@@ -40,6 +40,7 @@ from agents.execution import (
 from agents.reconciler import (
     Reconciler,
     _container_provider_credential,
+    _profile_runtime,
     bootstrap_persistent_agents,
     reserve_terminal,
 )
@@ -232,10 +233,10 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
             self.config,
             execution=replace(self.config.execution, isolation=IsolationMode.CONTAINER, container=container),
         )
-        with patch.dict(os.environ, {"OPENCODE_AUTH_JSON": "opaque-secret"}, clear=True):
+        with patch.dict(os.environ, {"OPENCODE_AUTH_JSON": '{"token":"opaque-secret"}'}, clear=True):
             self.assertEqual(
                 _container_provider_credential(config, "opencode_cli"),
-                ("OPENCODE_AUTH_JSON", "opaque-secret"),
+                ("OPENCODE_AUTH_JSON", '{"token":"opaque-secret"}'),
             )
         with patch.dict(os.environ, {}, clear=True), self.assertRaisesRegex(ExecutionUnavailable, "OPENCODE_AUTH_JSON"):
             _container_provider_credential(config, "opencode_cli")
@@ -1525,6 +1526,16 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
             ).fetchone()["id"],
             replacement,
         )
+
+    def test_profile_cleanup_paths_follow_stored_container_backend(self):
+        provider_home, provider_runtime = _profile_runtime(
+            self.config,
+            "auth-id",
+            isolation=IsolationMode.CONTAINER,
+        )
+        root = self.config.state_dir / "runtime" / "auth-id"
+        self.assertEqual(provider_home, root / "home")
+        self.assertEqual(provider_runtime, root / "provider")
 
     def test_prepost_work_failure_uses_terminal_recovery(self):
         item_id, run = self._make_work_terminal("idle")

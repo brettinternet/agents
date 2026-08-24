@@ -260,6 +260,28 @@ class SecretStoreTests(unittest.TestCase):
             self.assertNotIn(b"alpha-bravo", missing.stderr)
             self.assertNotIn(b"charlie-delta", missing.stderr)
 
+    def test_secret_operations_succeed_without_env_local(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_repository(root)
+            (root / ".env.local").unlink()
+            self.assertFalse((root / ".env.local").exists())
+            self.assertEqual(self.cli(root, "init").returncode, 0)
+            check = self.cli(root, "check")
+            self.assertEqual(check.returncode, 0, check.stderr.decode())
+            created = self.cli(root, "set", "DEMO_TOKEN", input_bytes=b"echo-foxtrot")
+            self.assertEqual(created.returncode, 0, created.stderr.decode())
+            self.assertEqual(self.cli(root, "reveal", "DEMO_TOKEN").stdout, b"echo-foxtrot")
+            home = root / "home"
+            home.mkdir()
+            env = os.environ.copy()
+            env["HOME"] = str(home)
+            program = "import os; print('ok' if os.environ.get('DEMO_TOKEN') == 'echo-foxtrot' else 'bad')"
+            ran = self.cli(root, "run", "DEMO_TOKEN", "--", sys.executable, "-c", program, env=env)
+            self.assertEqual(ran.returncode, 0, ran.stderr.decode())
+            self.assertEqual(ran.stdout, b"ok\n")
+            self.assertEqual(self.cli(root, "unset", "DEMO_TOKEN").returncode, 0)
+
     def test_run_selection_filtering_argv_validation_and_redaction(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

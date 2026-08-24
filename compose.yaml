@@ -41,18 +41,18 @@ services:
         target: /home/agents/.config/herdr
       - type: bind
         source: /dev/null
-        target: ${AGENTS_REPO_PATH}/.env.local
+        target: ${AGENTS_ENV_LOCAL_MASK_TARGET}
         read_only: true
       - type: bind
         source: /dev/null
-        target: ${AGENTS_REPO_PATH}/.env.sops-age
+        target: ${AGENTS_AGE_KEY_MASK_TARGET}
         read_only: true
       - type: bind
         source: /dev/null
-        target: ${AGENTS_REPO_PATH}/agent-secrets.sops.json
+        target: ${AGENTS_SECRET_STORE_MASK_TARGET}
         read_only: true
       - type: tmpfs
-        target: ${AGENTS_REPO_PATH}/.sops-isolated-home
+        target: ${AGENTS_SOPS_HOME_MASK_TARGET}
       - type: tmpfs
         target: ${AGENTS_REPO_PATH}/.agents/runtime/system-auth
       - type: bind
@@ -137,20 +137,20 @@ services:
         read_only: true
       - type: bind
         source: /dev/null
-        target: ${AGENTS_REPO_PATH}/.env.local
+        target: ${AGENTS_ENV_LOCAL_MASK_TARGET}
         read_only: true
       - type: bind
         source: /dev/null
-        target: ${AGENTS_REPO_PATH}/.env.sops-age
+        target: ${AGENTS_AGE_KEY_MASK_TARGET}
         read_only: true
       - type: bind
         source: /dev/null
-        target: ${AGENTS_REPO_PATH}/agent-secrets.sops.json
+        target: ${AGENTS_SECRET_STORE_MASK_TARGET}
         read_only: true
       - type: tmpfs
         target: ${AGENTS_REPO_PATH}/.agents
       - type: tmpfs
-        target: ${AGENTS_REPO_PATH}/.sops-isolated-home
+        target: ${AGENTS_SOPS_HOME_MASK_TARGET}
       - type: bind
         source: ${AGENTS_BROKER_CONFIG_PATH}
         target: /run/agents.toml

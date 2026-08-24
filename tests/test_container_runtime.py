@@ -15,6 +15,7 @@ from agents.config import AgentsConfig, ContainerConfig, IsolationMode
 from agents.container_commands import (
     ContainerCommandError,
     _cleanup_secret_source_artifacts,
+    _compose_mask_target,
     _system_auth_directory,
     _topology_owner_alive,
 )
@@ -59,6 +60,15 @@ class ContainerRuntimeTests(unittest.TestCase):
         (self.config.state_dir / "runtime").symlink_to(outside, target_is_directory=True)
         with self.assertRaisesRegex(ContainerCommandError, "credential directory is unsafe"):
             _system_auth_directory(self.config, create=True)
+
+    def test_compose_mask_target_uses_tmp_for_absent_sensitive_path(self) -> None:
+        self.assertEqual(_compose_mask_target(self.root, ".env.local"), "/tmp/.agents-absent-env-local")
+        self.assertFalse((self.root / ".env.local").exists())
+
+    def test_compose_mask_target_rejects_symlink(self) -> None:
+        (self.root / ".env.local").symlink_to(self.root / "outside")
+        with self.assertRaisesRegex(ContainerCommandError, "masked path is unsafe"):
+            _compose_mask_target(self.root, ".env.local")
 
     def test_topology_owner_liveness_fails_closed_on_permission_error(self) -> None:
         with (

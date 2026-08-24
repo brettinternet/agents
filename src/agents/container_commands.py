@@ -205,6 +205,16 @@ def _topology_owner_alive(owner_pid: int, owner_started: str) -> bool:
         raise ContainerCommandError("cannot establish whole-system topology owner identity") from exc
 
 
+def _compose_mask_target(repository: Path, name: str, *, directory: bool = False) -> str:
+    path = repository / name
+    wrong_type = path.exists() and (not path.is_dir() if directory else not path.is_file())
+    if path.is_symlink() or wrong_type:
+        raise ContainerCommandError(f"whole-system masked path is unsafe: {path}")
+    if path.exists():
+        return str(path)
+    return f"/tmp/.agents-absent-{name.lstrip('.').replace('.', '-')}"
+
+
 def _compose_environment(config: AgentsConfig, topology_id: str, auth_file: Path) -> dict[str, str]:
     instance = _instance(config)
     provider = _provider(config)
@@ -228,6 +238,10 @@ def _compose_environment(config: AgentsConfig, topology_id: str, auth_file: Path
         "AGENTS_SYSTEM_IMAGE": f"agents-system-{provider}:local",
         "AGENTS_SECRETS_IMAGE": "agents-secrets:local",
         "AGENTS_PROVIDER_AUTH_FILE": str(auth_file.resolve()),
+        "AGENTS_ENV_LOCAL_MASK_TARGET": _compose_mask_target(repository, ".env.local"),
+        "AGENTS_AGE_KEY_MASK_TARGET": _compose_mask_target(repository, ".env.sops-age"),
+        "AGENTS_SECRET_STORE_MASK_TARGET": _compose_mask_target(repository, "agent-secrets.sops.json"),
+        "AGENTS_SOPS_HOME_MASK_TARGET": _compose_mask_target(repository, ".sops-isolated-home", directory=True),
         **_secret_source_environment(config, provider, auth_file),
     }
     environment.pop("OPENCODE_AUTH_JSON", None)
@@ -944,15 +958,14 @@ def _verify_system_topology(config: AgentsConfig, *, exercise_janitor: bool = Tr
         if isinstance(mount, dict)
     }
     agent_tmpfs = agents.get("HostConfig", {}).get("Tmpfs", {})
-    for masked in (
-        config.root / ".env.local",
-        config.root / ".env.sops-age",
-        config.root / "agent-secrets.sops.json",
-    ):
-        if agent_mounts.get(str(masked)) != ("bind", "/dev/null"):
-            raise ContainerCommandError(f"whole-system Agents service exposes secret identity path {masked}")
+    for name in (".env.local", ".env.sops-age", "agent-secrets.sops.json"):
+        masked = _compose_mask_target(config.root, name)
+        if agent_mounts.get(masked) != ("bind", "/dev/null"):
+            raise ContainerCommandError(
+                f"whole-system Agents service exposes secret identity path {config.root / name}"
+            )
     for private_tmpfs in (
-        config.root / ".sops-isolated-home",
+        Path(_compose_mask_target(config.root, ".sops-isolated-home", directory=True)),
         config.state_dir / "runtime" / "system-auth",
         Path("/home/agents/.local/share/opencode"),
         Path("/home/agents/bin"),
@@ -976,13 +989,10 @@ def _verify_system_topology(config: AgentsConfig, *, exercise_janitor: bool = Tr
     control_plane = str(config.root / ".agents")
     if control_plane not in secret_tmpfs and secret_mounts.get(control_plane, ("", "", False))[0] != "tmpfs":
         raise ContainerCommandError("whole-system secret broker exposes the repository control plane")
-    for masked in (
-        config.root / ".env.local",
-        config.root / ".env.sops-age",
-        config.root / "agent-secrets.sops.json",
-    ):
-        if secret_mounts.get(str(masked)) != ("bind", "/dev/null", False):
-            raise ContainerCommandError(f"whole-system secret broker exposes secret identity path {masked}")
+    for name in (".env.local", ".env.sops-age", "agent-secrets.sops.json"):
+        masked = _compose_mask_target(config.root, name)
+        if secret_mounts.get(masked) != ("bind", "/dev/null", False):
+            raise ContainerCommandError(f"whole-system secret broker exposes secret identity path {config.root / name}")
     broker_root = auth_file.parent / f"{auth_file.name}-broker"
     if config.execution.provider == "mock":
         schema_source = broker_root / "worktree" / ".env.schema"

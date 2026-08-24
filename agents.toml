@@ -102,9 +102,30 @@ capacity = 3
 
 [[schedules]]
 slug = "manager-garden-round"
-every = "6h"
+every = "2h"
 to = "@manager"
-message = "Take one bounded garden round: notice a loose end or promising thread, then start one reversible, public-safe action or conversation; say `nothing worth doing` if nothing earns a turn."
+message = """
+Review recent findings, conversations, backlog state, and observed friction.
+Choose at most one worthwhile action:
+
+1. Start a bounded reversible experiment or conversation.
+2. Create and refine one tracked spike or task when a durable outcome is justified.
+3. Propose one evidence-backed agents.toml or agents/*.md improvement through tracked implementation work.
+4. Report `nothing worth doing`.
+
+Prefer a conversation or reversible experiment over tracked work. Before acting, state the objective, boundaries, stopping condition, and output destination. Base later tuning proposals on useful artifacts, abandoned or duplicate work, queue growth, and required human intervention.
+
+Do not manufacture work to satisfy the round. Do not weaken safety, authorization, review, verification, or human approval.
+"""
+overlap = "skip"
+
+[[schedules]]
+slug = "manager-autonomy-review"
+every = "14d"
+to = "@manager"
+message = """
+Review the autonomy experiment since the prior review using useful artifacts, abandoned or duplicate work, queue growth, and required human intervention. Propose at most one evidence-backed agents.toml or agents/*.md adjustment through tracked implementation work, or report `no change needed`. Preserve safety, authorization, review, verification, and human approval.
+"""
 overlap = "skip"
 
 [[schedules]]

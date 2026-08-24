@@ -8,7 +8,7 @@ import signal
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, NotRequired, TypedDict
 
 from .config import AgentsConfig
 from .container_runtime import build_execution_backend
@@ -38,6 +38,53 @@ from .git_worktree import (
 from .policy import CONSULTATION_SPECIALTIES, DomainError, validate_text, validate_title
 from .reconciler import _config_for_backend, reserve_terminal
 from .store import Store
+
+
+class DecisionOptionInput(TypedDict):
+    label: str
+    placeholder: NotRequired[str]
+
+
+class CustomDecisionOption(TypedDict):
+    label: str
+    input: DecisionOptionInput
+
+
+type DecisionOption = str | CustomDecisionOption
+
+
+def _normalize_decision_options(options: object) -> list[DecisionOption]:
+    if not isinstance(options, list) or not 2 <= len(options) <= 5:
+        raise DomainError("validation_failed", "decision options must contain 2-5 unique values")
+    normalized: list[DecisionOption] = []
+    labels: set[str] = set()
+    for option in options:
+        if isinstance(option, str):
+            label = validate_text(option, "decision option", maximum=2048)
+            normalized_option: DecisionOption = label
+        elif isinstance(option, dict) and set(option) == {"label", "input"}:
+            label = validate_text(option["label"], "decision option label", maximum=2048)
+            input_metadata = option["input"]
+            if (
+                not isinstance(input_metadata, dict)
+                or "label" not in input_metadata
+                or not set(input_metadata) <= {"label", "placeholder"}
+            ):
+                raise DomainError("validation_failed", "decision option input metadata is invalid")
+            input_label = validate_text(input_metadata["label"], "decision option input label", maximum=2048)
+            normalized_input: DecisionOptionInput = {"label": input_label}
+            if "placeholder" in input_metadata:
+                normalized_input["placeholder"] = validate_text(
+                    input_metadata["placeholder"], "decision option input placeholder", maximum=2048
+                )
+            normalized_option = {"label": label, "input": normalized_input}
+        else:
+            raise DomainError("validation_failed", "decision option must be text or custom-input metadata")
+        if label in labels:
+            raise DomainError("validation_failed", "decision options must contain 2-5 unique values")
+        labels.add(label)
+        normalized.append(normalized_option)
+    return normalized
 
 
 class _ReservationConflict(RuntimeError):
@@ -350,21 +397,25 @@ class Delivery:
         return {"id": consultation_id, "state": "completed", "version": expected_version + 1}
 
     def propose_decision(
-        self, actor: str, *, item_id: str | None, title: str, question: str, options: list[str], recommendation: str
+        self,
+        actor: str,
+        *,
+        item_id: str | None,
+        title: str,
+        question: str,
+        options: list[DecisionOption],
+        recommendation: str,
     ) -> dict[str, Any]:
         if actor not in {"manager", "human"}:
             raise DomainError("unauthorized", "actor cannot propose decisions")
         validate_title(title)
         validate_text(question, "decision question")
         validate_text(recommendation, "decision recommendation", maximum=2048)
-        for option in options:
-            validate_text(option, "decision option", maximum=2048)
-        if not 2 <= len(options) <= 5 or len(options) != len(set(options)):
-            raise DomainError("validation_failed", "decision options must contain 2-5 unique values")
+        normalized_options = _normalize_decision_options(options)
         now = utc_now()
         cursor = self.connection.execute(
             "INSERT INTO decisions(work_id,title,question,options_json,recommendation,state,proposed_by,created_at,updated_at)VALUES(?,?,?,?,?,'open',?,?,?)",
-            (item_id, title, question, json.dumps(options), recommendation, actor, now, now),
+            (item_id, title, question, json.dumps(normalized_options), recommendation, actor, now, now),
         )
         return {"id": cursor.lastrowid, "state": "open"}
 

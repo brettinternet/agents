@@ -11,6 +11,8 @@ from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlsplit
 import httpx
 from fastmcp import FastMCP
 
+from .delivery import DecisionOption
+
 mcp = FastMCP("Agents")
 
 
@@ -325,6 +327,16 @@ def fetch_url(url: str) -> dict[str, str]:
 
 
 @mcp.tool
+def repository_list(path: str = ".") -> list[str]:
+    return _request("GET", "/repository?" + urlencode({"path": path}))
+
+
+@mcp.tool
+def repository_read(path: str) -> dict[str, str]:
+    return _request("GET", "/repository/file?" + urlencode({"path": path}))
+
+
+@mcp.tool
 def backlog_list(status: str | None = None, limit: int = 50, after_id: str | None = None) -> Any:
     params: dict[str, Any] = {"limit": limit}
     if status:
@@ -399,7 +411,7 @@ def propose_decision(
     request_id: str,
     title: str,
     question: str,
-    options: list[str],
+    options: list[DecisionOption],
     recommendation: str,
     item_id: str | None = None,
     expected_version: int | None = None,
@@ -428,6 +440,24 @@ def conversation_history(address: str, before_id: int | None = None, limit: int 
     if before_id is not None:
         params["before_id"] = before_id
     return _request("GET", "/conversations/history?" + urlencode(params))
+
+
+@mcp.tool
+def request_managed_secret_set(name: str) -> Any:
+    """Request operator-provided secret input without sending the value through the agent transcript."""
+    return _request("POST", "/secrets/requests", {"name": name})
+
+
+@mcp.tool
+def managed_secret_set_status(request_id: str) -> Any:
+    """Read non-secret status for this execution's managed-secret request."""
+    return _request("GET", f"/secrets/requests/{request_id}")
+
+
+@mcp.tool
+def set_managed_secret(name: str, value: str) -> Any:
+    """Set a managed secret for this execution's active assignment. The value is written to the encrypted store by the trusted setter (piped to stdin, never argv); the response returns only non-secret status."""
+    return _request("POST", "/secrets", {"name": name, "value": value})
 
 
 @mcp.tool

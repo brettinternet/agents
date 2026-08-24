@@ -398,10 +398,27 @@ def _seed_development(connection: sqlite3.Connection, config: AgentsConfig) -> N
         ") VALUES(?,?,?,?,?,'open','manager',?,?)",
         (
             accepted["id"],
-            "Integration order",
-            "Which item lands first?",
-            '["Active","Accepted"]',
-            "Accepted",
+            "Publishing identity",
+            "Which public identity should publish this work?",
+            json.dumps(
+                [
+                    {
+                        "label": "Use a project-branded handle.",
+                        "input": {
+                            "label": "Exact public handle and model label",
+                            "placeholder": "@project — Model",
+                        },
+                    },
+                    {
+                        "label": "Use another identity.",
+                        "input": {
+                            "label": "Exact public handle and model label",
+                            "placeholder": "@identity — Model",
+                        },
+                    },
+                ]
+            ),
+            "Use a project-branded handle.",
             now,
             now,
         ),
@@ -592,8 +609,12 @@ def main(argv: list[str] | None = None) -> None:
             client.close()
         errors = []
     elif args.command == "shutdown":
-        service.shutdown(config)
-        errors = []
+        try:
+            service.shutdown(config)
+        except service.ServiceError as exc:
+            errors = [str(exc)]
+        else:
+            errors = []
     elif args.command == "smoke":
         errors = doctor(config, online=True)
     elif args.command == "dev-mock":

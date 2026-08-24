@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -501,6 +502,67 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
                     ",".join("?" for _ in reserved)
                 ),
                 tuple(reserved),
+            ).fetchone()
+        )
+
+    def test_bootstrap_suspends_and_raises_incident_on_recent_relevant_failures(self):
+        for _ in range(3):
+            run = self.reserve()
+            now = utc_now()
+            self.connection.execute(
+                "UPDATE terminal_runs SET state='failed',error=?,token_revoked_at=?,updated_at=? WHERE id=?",
+                ("boom: crashed immediately", now, now, run["id"]),
+            )
+            self.connection.execute(
+                "UPDATE launch_attempts SET state='failed',updated_at=? WHERE terminal_run_id=?",
+                (now, run["id"]),
+            )
+            self.connection.execute(
+                "UPDATE actor_leases SET released_at=? WHERE terminal_run_id=?",
+                (now, run["id"]),
+            )
+        reserved = bootstrap_persistent_agents(self.connection, self.config)
+        self.assertFalse(
+            self.connection.execute(
+                "SELECT 1 FROM terminal_runs WHERE id IN ({}) AND actor_slug='manager'".format(
+                    ",".join("?" for _ in reserved)
+                ),
+                tuple(reserved),
+            ).fetchone()
+        )
+        incident = self.connection.execute(
+            "SELECT state,entity_id FROM incidents WHERE kind='persistent_agent_relaunch_suspended'"
+        ).fetchone()
+        self.assertIsNotNone(incident)
+        self.assertEqual((incident["state"], incident["entity_id"]), ("open", "manager"))
+
+    def test_bootstrap_recovers_once_relevant_failures_age_out_of_window(self):
+        stale = (datetime.now(UTC) - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+        for _ in range(3):
+            run = self.reserve()
+            self.connection.execute(
+                "UPDATE terminal_runs SET state='failed',error=?,token_revoked_at=?,updated_at=? WHERE id=?",
+                ("boom: crashed immediately", stale, stale, run["id"]),
+            )
+            self.connection.execute(
+                "UPDATE launch_attempts SET state='failed',updated_at=? WHERE terminal_run_id=?",
+                (stale, run["id"]),
+            )
+            self.connection.execute(
+                "UPDATE actor_leases SET released_at=? WHERE terminal_run_id=?",
+                (stale, run["id"]),
+            )
+        reserved = bootstrap_persistent_agents(self.connection, self.config)
+        replacement = self.connection.execute(
+            "SELECT generation,state FROM terminal_runs WHERE id IN ({}) AND actor_slug='manager'".format(
+                ",".join("?" for _ in reserved)
+            ),
+            tuple(reserved),
+        ).fetchone()
+        self.assertEqual(tuple(replacement), (4, "reserved"))
+        self.assertIsNone(
+            self.connection.execute(
+                "SELECT 1 FROM incidents WHERE kind='persistent_agent_relaunch_suspended'"
             ).fetchone()
         )
 
@@ -1536,6 +1598,106 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
         root = self.config.state_dir / "runtime" / "auth-id"
         self.assertEqual(provider_home, root / "home")
         self.assertEqual(provider_runtime, root / "provider")
+
+    def test_orphaned_execution_sweep_recovers_terminal_that_ended_without_fencing(self):
+        item_id, run = self._make_work_terminal("idle")
+        now = utc_now()
+        self.connection.execute(
+            "UPDATE terminal_runs SET state='ended',updated_at=? WHERE id=?",
+            (now, run["id"]),
+        )
+        self.reconciler._recover_orphaned_executions()
+        work = self.connection.execute("SELECT status,blocked_from FROM work_items WHERE id=?", (item_id,)).fetchone()
+        self.assertEqual((work["status"], work["blocked_from"]), ("blocked", "in_progress"))
+        blocker = self.connection.execute(
+            "SELECT kind,state FROM blockers WHERE target_kind='work' AND target_id=?", (item_id,)
+        ).fetchone()
+        self.assertEqual((blocker["kind"], blocker["state"]), ("orphaned_execution", "open"))
+        incident = self.connection.execute(
+            "SELECT state FROM incidents WHERE kind='orphaned_execution' AND entity_id=?", (str(run["id"]),)
+        ).fetchone()
+        self.assertEqual(incident["state"], "open")
+
+    def test_orphaned_execution_sweep_ignores_already_blocked_work(self):
+        item_id, run = self._make_work_terminal("idle")
+        now = utc_now()
+        self.connection.execute(
+            "UPDATE terminal_runs SET state='ended',updated_at=? WHERE id=?",
+            (now, run["id"]),
+        )
+        self.connection.execute(
+            "UPDATE work_items SET status='blocked',blocked_from='in_progress',updated_at=? WHERE id=?",
+            (now, item_id),
+        )
+        self.reconciler._recover_orphaned_executions()
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM blockers WHERE target_kind='work' AND target_id=?", (item_id,)
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_recover_terminal_is_idempotent_and_reblocks_already_ended_run(self):
+        item_id, run = self._make_work_terminal("idle")
+        live_run = self.connection.execute("SELECT * FROM terminal_runs WHERE id=?", (run["id"],)).fetchone()
+        self.assertIsNotNone(live_run)
+        self.reconciler._recover_terminal(live_run, "first crash", blocker_kind="terminal_failure")
+        work = self.connection.execute("SELECT status FROM work_items WHERE id=?", (item_id,)).fetchone()
+        self.assertEqual(work["status"], "blocked")
+        now = utc_now()
+        self.connection.execute(
+            "UPDATE work_items SET status='in_progress',blocked_from=NULL,version=version+1,updated_at=? WHERE id=?",
+            (now, item_id),
+        )
+        self.connection.execute(
+            "UPDATE blockers SET state='resolved',updated_at=? WHERE target_kind='work' AND target_id=?",
+            (now, item_id),
+        )
+        stale_run = self.connection.execute("SELECT * FROM terminal_runs WHERE id=?", (run["id"],)).fetchone()
+        self.assertEqual(stale_run["state"], "failed")
+        self.reconciler._recover_terminal(stale_run, "still dead after resume", blocker_kind="orphaned_execution")
+        work = self.connection.execute("SELECT status,blocked_from FROM work_items WHERE id=?", (item_id,)).fetchone()
+        self.assertEqual((work["status"], work["blocked_from"]), ("blocked", "in_progress"))
+        blocker = self.connection.execute(
+            "SELECT kind,state FROM blockers WHERE target_kind='work' AND target_id=? ORDER BY id DESC LIMIT 1",
+            (item_id,),
+        ).fetchone()
+        self.assertEqual((blocker["kind"], blocker["state"]), ("orphaned_execution", "open"))
+
+    async def test_wake_with_dead_target_terminal_advances_attempts_and_incidents_at_five(self):
+        item_id, run = self._make_work_terminal("idle")
+        now = utc_now()
+        self.connection.execute(
+            "UPDATE terminal_runs SET state='ended',updated_at=? WHERE id=?",
+            (now, run["id"]),
+        )
+        conversation = self.connection.execute(
+            "SELECT id FROM conversations WHERE address=?", (f"work:{item_id}",)
+        ).fetchone()
+        message = self.connection.execute(
+            "INSERT INTO messages(conversation_id,sender_slug,body,urgency,created_at)"
+            "VALUES(?,'system','nudge','normal',?)",
+            (conversation["id"], now),
+        ).lastrowid
+        delivery_id = self.connection.execute(
+            "INSERT INTO deliveries(message_id,actor_slug,terminal_run_id,state,attempts,next_attempt_at)"
+            "VALUES(?,'researcher',?,'pending',4,?)",
+            (message, run["id"], now),
+        ).lastrowid
+        await self.reconciler._wake(cast(int, delivery_id))
+        delivery = self.connection.execute(
+            "SELECT attempts,last_error FROM deliveries WHERE id=?", (delivery_id,)
+        ).fetchone()
+        self.assertEqual(delivery["attempts"], 5)
+        self.assertIn("no live terminal", delivery["last_error"])
+        wake_attempt = self.connection.execute(
+            "SELECT terminal_run_id,result FROM wake_attempts WHERE delivery_id=?", (delivery_id,)
+        ).fetchone()
+        self.assertEqual((wake_attempt["terminal_run_id"], wake_attempt["result"]), (run["id"], "failed"))
+        incident = self.connection.execute(
+            "SELECT state FROM incidents WHERE kind='wake_delivery_failed' AND entity_id=?", (str(delivery_id),)
+        ).fetchone()
+        self.assertEqual(incident["state"], "open")
 
     def test_prepost_work_failure_uses_terminal_recovery(self):
         item_id, run = self._make_work_terminal("idle")

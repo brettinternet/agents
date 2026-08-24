@@ -11,7 +11,6 @@
     <div class="shell">
       <nav aria-label="Agents navigation">
         <div class="brand">
-          <p class="eyebrow">Internet exploration</p>
           <h1>Agents</h1>
         </div>
         <div class="nav-actions">
@@ -30,7 +29,6 @@
       <main>
         <header class="main-header">
           <div>
-            <p class="eyebrow">One repository · durable evidence</p>
             <h2 id="view-title">Agents board</h2>
           </div>
           <div class="connection-wrap">
@@ -43,7 +41,7 @@
           <header class="world-header">
             <div>
               <p class="eyebrow">Live control plane</p>
-              <h3 id="world-title">The Internet Garden</h3>
+              <h3 id="world-title">Board map</h3>
             </div>
             <button id="world-motion" class="quiet compact" type="button">Pause motion</button>
           </header>
@@ -62,42 +60,71 @@
         </section>
       </main>
 
-      <aside aria-label="Conversation and work detail">
-        <section id="detail" class="detail" aria-live="polite">
-          <h2>Details</h2>
+      <aside id="inspector" aria-label="Task and conversation previews">
+        <section id="detail" class="detail detail-preview" aria-live="polite">
+          <p class="eyebrow">Task preview</p>
+          <h2>Nothing selected</h2>
           <p class="empty-state">
             Select work, a queue, or terminal output to inspect durable evidence.
           </p>
         </section>
-        <section class="thread">
-          <header class="thread-header">
-            <div>
-              <p class="eyebrow">Durable conversation</p>
-              <h2 id="thread-title">#findings</h2>
+        <div id="thread-home" class="thread-home">
+          <section id="thread" class="thread thread-preview">
+            <header class="thread-header">
+              <div>
+                <p class="eyebrow">Recent comments</p>
+                <h2 id="thread-title">#findings</h2>
+              </div>
+              <div class="thread-actions">
+                <button id="older" class="quiet compact" type="button" disabled>Load older</button>
+                <button id="open-thread" class="quiet compact" type="button" aria-haspopup="dialog">
+                  Open conversation
+                </button>
+              </div>
+            </header>
+            <div id="messages" class="messages" tabindex="0" aria-live="polite" aria-busy="true">
+              <p class="empty-state">Loading messages…</p>
             </div>
-            <button id="older" class="quiet compact" type="button" disabled>Load older</button>
-          </header>
-          <div id="messages" class="messages" tabindex="0" aria-live="polite" aria-busy="true">
-            <p class="empty-state">Loading messages…</p>
-          </div>
-          <form id="compose" class="compose">
-            <p class="form-error" role="alert" hidden></p>
-            <label for="message-body">Message</label>
-            <textarea id="message-body" required maxlength="16384"></textarea>
-            <div class="form-row">
-              <label
-                >Urgency
-                <select id="message-urgency">
-                  <option value="normal">Normal</option>
-                  <option value="urgent">Urgent</option>
-                </select>
-              </label>
-              <button class="primary" type="submit">Send</button>
-            </div>
-          </form>
-        </section>
+            <form id="compose" class="compose">
+              <p class="form-error" role="alert" hidden></p>
+              <label class="sr-only" for="message-body">Message</label>
+              <div class="compose-box">
+                <textarea id="message-body" required maxlength="16384"></textarea>
+                <div class="compose-controls">
+                  <label class="sr-only" for="message-urgency">Urgency</label>
+                  <select id="message-urgency" aria-label="Message urgency">
+                    <option value="normal">Normal</option>
+                    <option value="urgent">Urgent</option>
+                  </select>
+                  <button class="compose-send" type="submit" aria-label="Send message">
+                    <svg aria-hidden="true" viewBox="0 0 20 20">
+                      <path d="M10 15V5m0 0L6 9m4-4 4 4" />
+                    </svg>
+                  </button>
+                </div>
+              </div>
+            </form>
+          </section>
+        </div>
       </aside>
     </div>
+
+    <dialog
+      id="detail-dialog"
+      class="detail-dialog wide-dialog"
+      aria-labelledby="detail-dialog-title"
+    >
+      <div id="detail-full"></div>
+      <form method="dialog" class="actions">
+        <button type="submit">Close</button>
+      </form>
+    </dialog>
+
+    <dialog id="thread-dialog" class="thread-dialog wide-dialog" aria-labelledby="thread-title">
+      <form method="dialog" class="dialog-close">
+        <button type="submit">Close conversation</button>
+      </form>
+    </dialog>
 
     <dialog id="incident-dialog" class="wide-dialog" aria-labelledby="incident-title">
       <header class="dialog-header">
@@ -309,6 +336,37 @@
       </form>
     </dialog>
 
+    <dialog id="secret-dialog">
+      <form id="secret-form">
+        <header class="dialog-header">
+          <p class="eyebrow">Private managed-secret input</p>
+          <h2 id="secret-title">Set managed secret</h2>
+        </header>
+        <p class="warning">
+          The value goes directly to the assigned worktree setter. It is not stored in Agents
+          messages, events, terminal input, or retry state.
+        </p>
+        <p id="secret-request"></p>
+        <p class="form-error" role="alert" hidden></p>
+        <input type="hidden" name="request_id" />
+        <label
+          >Secret value
+          <input
+            name="value"
+            type="password"
+            required
+            maxlength="65536"
+            autocomplete="new-password"
+            spellcheck="false"
+          />
+        </label>
+        <div class="actions">
+          <button type="button" data-close>Cancel</button>
+          <button class="primary" type="submit">Set once</button>
+        </div>
+      </form>
+    </dialog>
+
     <dialog id="answer-dialog">
       <form id="answer-form">
         <header class="dialog-header">
@@ -319,6 +377,10 @@
           Answers are sent once to the selected Herdr pane and stored in Agents state. Never enter
           secrets.
         </p>
+        <section class="answer-question" aria-labelledby="answer-question-heading">
+          <h3 id="answer-question-heading">Question</h3>
+          <pre id="answer-question"></pre>
+        </section>
         <p class="form-error" role="alert" hidden></p>
         <input type="hidden" name="terminal_run_id" />
         <label

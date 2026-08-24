@@ -357,6 +357,13 @@ def _decrypt(paths: Paths) -> dict[str, StoredValue]:
     return values
 
 
+def _schema_path_args(paths: Paths) -> list[str]:
+    args = ["-p", ".env.schema"]
+    if (paths.worktree / ".env.local").is_file():
+        args += ["-p", ".env.local"]
+    return args
+
+
 def _stored_bytes(value: StoredValue) -> bytes:
     if isinstance(value, str):
         return value.encode()
@@ -381,10 +388,7 @@ def _validate_schema(paths: Paths, values: dict[str, StoredValue]) -> None:
         [
             "varlock",
             "load",
-            "-p",
-            ".env.schema",
-            "-p",
-            ".env.local",
+            *_schema_path_args(paths),
             "--format",
             "json-full",
             "--agent",
@@ -615,10 +619,7 @@ def run_command(paths: Paths, names: list[str], command: list[str]) -> NoReturn:
         "vars",
         "--filter",
         ",".join(names),
-        "-p",
-        ".env.schema",
-        "-p",
-        ".env.local",
+        *_schema_path_args(paths),
         "--",
         *command,
     ]

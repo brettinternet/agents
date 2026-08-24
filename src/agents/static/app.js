@@ -21,6 +21,10 @@ function text(tag, value, className = "") {
   if (className) node.className = className;
   return node;
 }
+function preview(value, limit = 120) {
+  const compact = (value ?? "").replace(/\s+/g, " ").trim();
+  return compact.length > limit ? `${compact.slice(0, limit - 1)}…` : compact;
+}
 function relativeTime(value, now = Date.now()) {
   const timestamp = new Date(value).getTime();
   if (!Number.isFinite(timestamp)) return "";
@@ -134,6 +138,21 @@ async function api(
   }
   return value.data;
 }
+async function submitSecretValue(requestId, body) {
+  const response = await fetch(`/api/v1/secret-requests/${encodeURIComponent(requestId)}/value`, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/octet-stream",
+      "X-CSRF-Token": csrf(),
+      Origin: location.origin,
+    },
+    body,
+  });
+  const value = await response.json();
+  if (!response.ok || !value.ok) throw new Error(value.error?.message || `HTTP ${response.status}`);
+  return value.data;
+}
 function renderRoster() {
   const list = $("roster");
   list.replaceChildren();
@@ -215,6 +234,7 @@ function renderQueues() {
     ["Decisions", state.snapshot.decisions.length, true],
     ["Blockers", state.snapshot.blockers.length, true],
     ["Approvals", state.snapshot.approvals.length, true],
+    ["Secrets", state.snapshot.secret_requests.length, true],
   ];
   for (const [label, count, alert] of summary)
     container.append(text("span", `${label}: ${count}`, `queue ${alert && count ? "alert" : ""}`));
@@ -229,15 +249,28 @@ function renderQueues() {
   incidents.addEventListener("click", openIncidents);
   container.append(incidents);
   for (const row of state.snapshot.decisions) {
-    const button = text("button", `Decision ${row.id}: ${row.title}`, "queue alert");
+    const label = `Decision ${row.id}: ${row.title}`,
+      button = text(
+        "button",
+        `Decision ${row.id}: ${preview(row.title)}`,
+        "queue alert queue-preview",
+      );
+    button.title = label;
     button.addEventListener("click", () => openDecision(row));
     container.append(button);
   }
   for (const row of state.snapshot.blockers) {
-    const button = text("button", `${row.kind}: ${row.reason}`, "queue alert");
-    button.addEventListener("click", () =>
-      row.kind === "waiting_user_answer" ? openAnswer(row) : openBlocker(row),
-    );
+    const waitingForAnswer = row.kind === "waiting_user_answer",
+      label = `${row.kind}: ${row.reason}`,
+      button = text("button", `${row.kind}: ${preview(row.reason)}`, "queue alert queue-preview");
+    button.title = label;
+    button.addEventListener("click", () => (waitingForAnswer ? openAnswer(row) : openBlocker(row)));
+    container.append(button);
+  }
+  for (const row of state.snapshot.secret_requests) {
+    const button = text("button", `Secret: ${row.name}`, "queue alert queue-preview");
+    button.title = `${row.actor_slug} requested ${row.name}`;
+    button.addEventListener("click", () => openSecretRequest(row));
     container.append(button);
   }
 }
@@ -379,15 +412,32 @@ async function selectConversation(value, announce = true) {
   const rows = await api(`/api/v1/conversations/${row.id}/messages?limit=50`);
   renderMessages(rows, rows.length === 50, { forceBottom: changed });
 }
+function detailButton(label) {
+  const button = text("button", label, "primary");
+  button.type = "button";
+  button.setAttribute("aria-haspopup", "dialog");
+  button.addEventListener("click", () => $("detail-dialog").showModal());
+  return button;
+}
+function setFullDetail(...nodes) {
+  const heading = nodes.find((node) => node.tagName === "H2");
+  if (heading) heading.id = "detail-dialog-title";
+  $("detail-full").replaceChildren(...nodes);
+}
 async function loadTerminal(id) {
   try {
     const data = await api(`/api/v1/terminals/${id}/output`),
-      section = $("detail");
-    section.replaceChildren(
-      text("h2", `${data.actor_slug} terminal`),
-      text("p", `${data.state} · ${data.status || "unknown"} · ${data.updated_at}`),
-      text("pre", data.output_tail || "No captured output", "evidence"),
+      title = `${data.actor_slug} terminal`,
+      status = `${data.state} · ${data.status || "unknown"} · ${data.updated_at}`,
+      output = data.output_tail || "No captured output";
+    $("detail").replaceChildren(
+      text("p", "Terminal preview", "eyebrow"),
+      text("h2", title),
+      text("p", status, "meta"),
+      text("pre", output, "evidence preview-evidence"),
+      detailButton("Open terminal output"),
     );
+    setFullDetail(text("h2", title), text("p", status), text("pre", output, "evidence"));
   } catch (error) {
     notify(error.message, true);
   }
@@ -396,18 +446,33 @@ async function loadWork(id) {
   try {
     const data = await api(`/api/v1/work/${id}`);
     state.work = data;
-    const section = $("detail");
-    section.replaceChildren(
-      text("h2", `${data.work.id} ${data.work.title}`),
-      text("p", `${data.work.status} · ${data.work.priority} · v${data.work.version}`),
+    const title = `${data.work.id} ${data.work.title}`,
+      status = `${data.work.status} · ${data.work.priority} · v${data.work.version}`,
+      summary = text(
+        "p",
+        `${data.criteria.length} criteria · ${data.dependencies.length} dependencies`,
+        "preview-summary",
+      );
+    $("detail").replaceChildren(
+      text("p", "Task preview", "eyebrow"),
+      text("h2", title),
+      text("p", status, "meta"),
+      text("h3", "Problem"),
+      text("p", data.work.problem, "preview-copy"),
+      text("h3", "Outcome"),
+      text("p", data.work.outcome, "preview-copy"),
+      summary,
+      detailButton("Open full task"),
+    );
+    const criteria = document.createElement("ul");
+    for (const row of data.criteria) criteria.append(text("li", row.body));
+    setFullDetail(
+      text("h2", title),
+      text("p", status),
       text("h3", "Problem"),
       text("p", data.work.problem),
       text("h3", "Outcome"),
       text("p", data.work.outcome),
-    );
-    const criteria = document.createElement("ul");
-    for (const row of data.criteria) criteria.append(text("li", row.body));
-    section.append(
       text("h3", "Acceptance criteria"),
       criteria,
       text("h3", "Dependencies"),
@@ -518,17 +583,41 @@ function openDecision(row) {
   $("decision-recommendation").textContent = `Recommendation: ${row.recommendation}`;
   const options = $("decision-options");
   options.querySelectorAll(".decision-option").forEach((option) => option.remove());
-  for (const [index, value] of JSON.parse(row.options_json).entries()) {
-    const label = text("label", "", "decision-option"),
+  const syncInputs = () => {
+    for (const input of options.querySelectorAll("[data-decision-input]")) {
+      const selected = document.getElementById(input.dataset.radio).checked;
+      input.hidden = !selected;
+      input.disabled = !selected;
+      input.required = selected;
+    }
+  };
+  for (const [index, option] of JSON.parse(row.options_json).entries()) {
+    const definition = typeof option === "string" ? { label: option } : option,
+      label = text("label", "", "decision-option"),
       input = document.createElement("input");
     input.type = "radio";
+    input.id = `decision-option-${index}`;
     input.name = "resolution";
-    input.value = value;
+    input.value = definition.label;
     input.required = true;
     input.checked = index === 0;
-    label.append(input, text("span", value));
+    input.addEventListener("change", syncInputs);
+    label.append(input, text("span", definition.label));
+    if (definition.input) {
+      const customInput = document.createElement("textarea");
+      customInput.id = `decision-resolution-${index}`;
+      customInput.dataset.decisionInput = "";
+      customInput.dataset.radio = input.id;
+      customInput.setAttribute("aria-label", definition.input.label);
+      customInput.placeholder = definition.input.placeholder || "";
+      customInput.rows = 2;
+      customInput.addEventListener("input", () => customInput.setCustomValidity(""));
+      input.dataset.customInput = customInput.id;
+      label.append(text("span", definition.input.label, "decision-input-label"), customInput);
+    }
     options.append(label);
   }
+  syncInputs();
   $("decision-dialog").showModal();
 }
 function openIncidents() {
@@ -576,10 +665,21 @@ function openBlocker(row) {
   $("blocker-reason").textContent = row.reason;
   $("blocker-dialog").showModal();
 }
+function openSecretRequest(row) {
+  const form = $("secret-form");
+  form.reset();
+  form.elements.request_id.value = row.id;
+  $("secret-title").textContent = `Set ${row.name}`;
+  $("secret-request").textContent =
+    `${row.actor_slug} requested this value for its active work assignment.`;
+  $("secret-dialog").showModal();
+}
+
 function openAnswer(row) {
   const form = $("answer-form");
   form.elements.terminal_run_id.value = row.terminal_run_id;
   $("answer-title").textContent = `Answer ${row.actor_slug}`;
+  $("answer-question").textContent = row.reason;
   $("answer-dialog").showModal();
 }
 $("new-intake").addEventListener("click", () => $("intake-dialog").showModal());
@@ -683,11 +783,22 @@ $("decision-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget,
     id = form.elements.decision_id.value,
-    item = form.elements.item_id.value;
+    item = form.elements.item_id.value,
+    selected = form.querySelector('input[name="resolution"]:checked'),
+    customInput = selected.dataset.customInput
+      ? document.getElementById(selected.dataset.customInput)
+      : null;
+  const customValue = customInput?.value.trim();
+  if (customInput && !customValue) {
+    customInput.setCustomValidity("Enter a value.");
+    customInput.reportValidity();
+    return;
+  }
+  if (customInput) customInput.setCustomValidity("");
   const body = {
     item_id: item || null,
     expected_version: item ? Number(form.elements.expected_version.value) : null,
-    resolution: form.elements.resolution.value,
+    resolution: customInput ? `${selected.value}\n${customValue}` : selected.value,
   };
   try {
     await api(`/api/v1/decisions/${id}/resolve`, { method: "POST", body, intent: true });
@@ -716,6 +827,37 @@ $("blocker-form").addEventListener("submit", async (event) => {
     notify(error.message, true);
   }
 });
+$("open-thread").addEventListener("click", () => {
+  const thread = $("thread");
+  thread.classList.remove("thread-preview");
+  thread.classList.add("thread-expanded");
+  $("thread-dialog").append(thread);
+  $("thread-dialog").showModal();
+  $("messages").scrollTop = $("messages").scrollHeight;
+});
+$("thread-dialog").addEventListener("close", () => {
+  const thread = $("thread");
+  thread.classList.remove("thread-expanded");
+  thread.classList.add("thread-preview");
+  $("thread-home").append(thread);
+});
+$("secret-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget,
+    requestId = form.elements.request_id.value,
+    body = new Blob([form.elements.value.value], { type: "application/octet-stream" });
+  form.elements.value.value = "";
+  try {
+    await submitSecretValue(requestId, body);
+    form.reset();
+    $("secret-dialog").close();
+    notify("Managed secret set");
+    await hydrate();
+  } catch (error) {
+    notify(error.message, true);
+  }
+});
+
 $("answer-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget,
@@ -734,6 +876,12 @@ $("answer-form").addEventListener("submit", async (event) => {
     notify(error.message, true);
   }
 });
+$("message-body").addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
+  event.preventDefault();
+  $("compose").requestSubmit();
+});
+
 $("compose").addEventListener("submit", async (event) => {
   event.preventDefault();
   if (!state.conversation) return;
@@ -741,7 +889,11 @@ $("compose").addEventListener("submit", async (event) => {
   try {
     await api("/api/v1/messages", {
       method: "POST",
-      body: { to: state.conversation.address, body },
+      body: {
+        to: state.conversation.address,
+        body,
+        urgency: $("message-urgency").value,
+      },
       intent: true,
     });
     $("message-body").value = "";

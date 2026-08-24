@@ -283,6 +283,19 @@ def _reserve_terminal_unchecked(
     return dict(connection.execute("SELECT * FROM terminal_runs WHERE id=?", (run_id,)).fetchone())
 
 
+def _raise_incident(connection: sqlite3.Connection, kind: str, entity_kind: str, entity_id: str, summary: str) -> None:
+    if connection.execute(
+        "SELECT 1 FROM incidents WHERE kind=? AND entity_kind=? AND entity_id=? AND state='open'",
+        (kind, entity_kind, entity_id),
+    ).fetchone():
+        return
+    now = utc_now()
+    connection.execute(
+        "INSERT INTO incidents(kind,entity_kind,entity_id,severity,state,summary,details_json,created_at,updated_at)VALUES(?,?,?,'high','open',?,'{}',?,?)",
+        (kind, entity_kind, entity_id, summary, now, now),
+    )
+
+
 def bootstrap_persistent_agents(connection: sqlite3.Connection, config: AgentsConfig) -> list[int]:
     reserved: list[int] = []
     actors = connection.execute("SELECT slug FROM actors WHERE kind='agent' AND persistent=1 ORDER BY slug")
@@ -294,15 +307,29 @@ def bootstrap_persistent_agents(connection: sqlite3.Connection, config: AgentsCo
             (actor,),
         ).fetchone():
             continue
+        # Only count recent failures (rolling window, mirrors the launch budget below):
+        # a lifetime-cumulative counter would eventually and permanently lock every
+        # persistent actor out of relaunch after enough ordinary failures over weeks
+        # of operation, with no visible signal and no way to recover automatically.
+        since = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
         attempts = connection.execute(
             "SELECT COUNT(*) total,"
-            "COUNT(*) FILTER (WHERE error IS NULL OR ("
-            "error NOT LIKE 'CAO terminal working directory mismatch:%' "
-            "AND error NOT LIKE 'transient Herdr cutover:%')) relevant "
-            "FROM terminal_runs WHERE actor_slug=? AND purpose_kind='persistent'",
-            (actor,),
+            "COUNT(*) FILTER (WHERE error IS NOT NULL "
+            "AND error NOT LIKE 'CAO terminal working directory mismatch:%' "
+            "AND error NOT LIKE 'transient Herdr cutover:%') relevant "
+            "FROM terminal_runs WHERE actor_slug=? AND purpose_kind='persistent' "
+            "AND state IN ('ended','failed') AND updated_at>=?",
+            (actor, since),
         ).fetchone()
         if attempts["relevant"] >= 3 or attempts["total"] >= 12:
+            _raise_incident(
+                connection,
+                "persistent_agent_relaunch_suspended",
+                "persistent",
+                actor,
+                f"{actor} had {attempts['relevant']} relevant / {attempts['total']} total terminal failures "
+                "in the last hour; pausing relaunch until the failure rate drops",
+            )
             continue
         run = reserve_terminal(
             connection,
@@ -441,6 +468,21 @@ class Reconciler:
                 incident_kind="provider_or_backend_changed",
             )
 
+    def _recover_orphaned_executions(self) -> None:
+        for row in self.connection.execute(
+            "SELECT tr.* FROM terminal_runs tr "
+            "JOIN assignments a ON a.terminal_run_id=tr.id AND a.state='open' "
+            "JOIN work_items w ON w.id=a.work_id AND w.active_execution_id=a.execution_id "
+            "AND w.status NOT IN ('blocked','cancelled','delivered','accepted') "
+            "WHERE tr.state IN ('ended','failed','ending')"
+        ):
+            self._recover_terminal(
+                row,
+                "terminal ended without fencing its still-open assignment",
+                blocker_kind="orphaned_execution",
+                incident_kind="orphaned_execution",
+            )
+
     async def run_once(self) -> None:
         from .delivery import Delivery
         from .schedules import Scheduler
@@ -465,6 +507,7 @@ class Reconciler:
             run_id = int(row["id"])
             self._spawn(f"cleanup:{run_id}", self._cleanup_terminal(run_id))
         self._spawn("unmapped", self._remove_unmapped_sessions())
+        self._recover_orphaned_executions()
         if not healthy:
             return
         for row in self.connection.execute(
@@ -1559,6 +1602,55 @@ class Reconciler:
             (delivery_id,),
         ).fetchone()
         if row is None or not row["backend_run_id"] or not row["backend_terminal_id"]:
+            if row is not None:
+                return
+            delivery = self.connection.execute(
+                "SELECT attempts,actor_slug,terminal_run_id FROM deliveries WHERE id=?", (delivery_id,)
+            ).fetchone()
+            if delivery is None:
+                return
+            dead_terminal_id: int | None = None
+            if delivery["terminal_run_id"] is not None:
+                target = self.connection.execute(
+                    "SELECT id,state FROM terminal_runs WHERE id=?", (delivery["terminal_run_id"],)
+                ).fetchone()
+                if target is not None and str(target["state"]) in {"reserved", "creating"}:
+                    return
+                if target is not None:
+                    dead_terminal_id = int(target["id"])
+            else:
+                starting = self.connection.execute(
+                    "SELECT id FROM terminal_runs WHERE actor_slug=? AND purpose_kind='persistent' "
+                    "AND purpose_id=? AND state IN ('reserved','creating')",
+                    (delivery["actor_slug"], delivery["actor_slug"]),
+                ).fetchone()
+                if starting is not None:
+                    return
+                dead = self.connection.execute(
+                    "SELECT id FROM terminal_runs WHERE actor_slug=? AND purpose_kind='persistent' "
+                    "AND purpose_id=? ORDER BY id DESC LIMIT 1",
+                    (delivery["actor_slug"], delivery["actor_slug"]),
+                ).fetchone()
+                if dead is not None:
+                    dead_terminal_id = int(dead["id"])
+            attempts = int(delivery["attempts"])
+            error = "no live terminal available for delivery target"
+            now = datetime.now(UTC)
+            delay = _RETRY[min(attempts, len(_RETRY) - 1)]
+            if dead_terminal_id is not None:
+                self.connection.execute(
+                    "INSERT INTO wake_attempts(delivery_id,terminal_run_id,nonce,backend_message_id,result,error,created_at)"
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (delivery_id, dead_terminal_id, secrets.token_urlsafe(12), None, "failed", error, utc_now()),
+                )
+            self.connection.execute(
+                "UPDATE deliveries SET attempts=attempts+1,next_attempt_at=?,last_error=? WHERE id=?",
+                ((now + timedelta(seconds=delay)).isoformat().replace("+00:00", "Z"), error, delivery_id),
+            )
+            if attempts + 1 == 5:
+                self._incident(
+                    "wake_delivery_failed", "delivery", str(delivery_id), "Wake delivery has failed five times"
+                )
             return
         nonce = secrets.token_urlsafe(12)
         body = f"AGENTS_WAKE {delivery_id} {nonce}; call inbox, process messages in ID order, then ack_inbox"
@@ -1706,35 +1798,37 @@ class Reconciler:
         self.connection.execute("BEGIN IMMEDIATE")
         try:
             current = self.connection.execute("SELECT state FROM terminal_runs WHERE id=?", (run["id"],)).fetchone()
-            if current is None or str(current["state"]) in {"ending", "ended", "failed"}:
+            if current is None:
                 self.connection.execute("ROLLBACK")
                 return
-            self.connection.execute(
-                "UPDATE terminal_runs SET state=?,profile_state=COALESCE(?,profile_state),"
-                "token_revoked_at=COALESCE(token_revoked_at,?),error=?,updated_at=? WHERE id=?",
-                (terminal_state, terminal_profile_state, now, reason, now, run["id"]),
-            )
-            if launch_attempt_counted is None:
+            already_terminal = str(current["state"]) in {"ending", "ended", "failed"}
+            if not already_terminal:
                 self.connection.execute(
-                    "UPDATE launch_attempts SET state=?,error=?,updated_at=? "
-                    "WHERE terminal_run_id=? AND state IN ('reserved','posting','uncertain')",
-                    (launch_attempt_state, reason, now, run["id"]),
+                    "UPDATE terminal_runs SET state=?,profile_state=COALESCE(?,profile_state),"
+                    "token_revoked_at=COALESCE(token_revoked_at,?),error=?,updated_at=? WHERE id=?",
+                    (terminal_state, terminal_profile_state, now, reason, now, run["id"]),
                 )
-            else:
+                if launch_attempt_counted is None:
+                    self.connection.execute(
+                        "UPDATE launch_attempts SET state=?,error=?,updated_at=? "
+                        "WHERE terminal_run_id=? AND state IN ('reserved','posting','uncertain')",
+                        (launch_attempt_state, reason, now, run["id"]),
+                    )
+                else:
+                    self.connection.execute(
+                        "UPDATE launch_attempts SET state=?,counted=?,error=?,updated_at=? "
+                        "WHERE terminal_run_id=? AND state IN ('reserved','posting','uncertain')",
+                        (launch_attempt_state, launch_attempt_counted, reason, now, run["id"]),
+                    )
                 self.connection.execute(
-                    "UPDATE launch_attempts SET state=?,counted=?,error=?,updated_at=? "
-                    "WHERE terminal_run_id=? AND state IN ('reserved','posting','uncertain')",
-                    (launch_attempt_state, launch_attempt_counted, reason, now, run["id"]),
+                    "UPDATE actor_leases SET released_at=? WHERE terminal_run_id=? AND released_at IS NULL",
+                    (now, run["id"]),
                 )
-            self.connection.execute(
-                "UPDATE actor_leases SET released_at=? WHERE terminal_run_id=? AND released_at IS NULL",
-                (now, run["id"]),
-            )
-            self.connection.execute(
-                "UPDATE consultations SET state='failed',version=version+1,updated_at=? "
-                "WHERE terminal_run_id=? AND state='assigned'",
-                (now, run["id"]),
-            )
+                self.connection.execute(
+                    "UPDATE consultations SET state='failed',version=version+1,updated_at=? "
+                    "WHERE terminal_run_id=? AND state='assigned'",
+                    (now, run["id"]),
+                )
             if work_id is not None:
                 work = self.connection.execute(
                     "SELECT status,blocked_from FROM work_items WHERE id=?", (work_id,)
@@ -1893,13 +1987,4 @@ class Reconciler:
             self._incident("worktree_cleanup_failed", "worktree", "global", str(exc))
 
     def _incident(self, kind: str, entity_kind: str, entity_id: str, summary: str) -> None:
-        if self.connection.execute(
-            "SELECT 1 FROM incidents WHERE kind=? AND entity_kind=? AND entity_id=? AND state='open'",
-            (kind, entity_kind, entity_id),
-        ).fetchone():
-            return
-        now = utc_now()
-        self.connection.execute(
-            "INSERT INTO incidents(kind,entity_kind,entity_id,severity,state,summary,details_json,created_at,updated_at)VALUES(?,?,?,'high','open',?,'{}',?,?)",
-            (kind, entity_kind, entity_id, summary, now, now),
-        )
+        _raise_incident(self.connection, kind, entity_kind, entity_id, summary)

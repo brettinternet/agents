@@ -19,6 +19,7 @@ from agents.profiles import (
     merge_owned_json,
     profile_name,
     provider_lock_path,
+    purpose_tools,
     remove_profile,
     validate_templates,
 )
@@ -67,6 +68,21 @@ class ProfileTests(unittest.TestCase):
 
     def test_repository_templates_validate(self):
         validate_templates(Path(__file__).resolve().parents[1])
+
+    def test_persistent_profiles_have_no_generic_filesystem_or_command_tools(self):
+        self.assertEqual(purpose_tools("persistent"), ())
+
+    def test_materialized_profiles_explain_repository_interaction_methods(self):
+        root = Path(__file__).parents[1]
+        with tempfile.TemporaryDirectory() as d:
+            profile = self._materialize(root, Path(d))
+            text = profile.path.read_text()
+        self.assertEqual(profile.allowed_tools, ())
+        self.assertIn("`repository_list` and `repository_read`", text)
+        self.assertIn("not native filesystem tools or browser `file://` URLs", text)
+        self.assertIn("Use Agent MCP backlog tools", text)
+        self.assertIn("durable memory changes", text)
+        self.assertIn("request an execute-capable work item for any secret operation", text)
 
     def test_packaged_templates_fallback_when_editable_templates_are_absent(self):
         repository = Path(__file__).resolve().parents[1]
@@ -188,6 +204,7 @@ class ProfileTests(unittest.TestCase):
             self.assertIn('reasoningEffort: "high"', agent_text)
             self.assertIn("permission:", agent_text)
             self.assertIn("  bash: allow", agent_text)
+            self.assertIn("  skill: deny", agent_text)
             self.assertEqual(agent.stat().st_mode & 0o777, 0o600)
             self.assertTrue(all(Path(item["path"]).stat().st_mode & 0o777 == 0o600 for item in launch.artifacts))
             agent_record = next(item for item in launch.artifacts if item["kind"] == "agent")
@@ -195,6 +212,15 @@ class ProfileTests(unittest.TestCase):
             self.assertEqual(
                 provider_lock_path({"XDG_STATE_HOME": str(state / "xdg")}), state / "xdg/agents/provider-config.lock"
             )
+
+    def test_opencode_permission_denies_skill_tool_always(self):
+        restricted = profiles_module._tools_to_opencode_permission(("fs_*", "execute_bash"))
+        self.assertEqual(restricted["skill"], "deny")
+        self.assertEqual(restricted["bash"], "allow")
+        wildcard = profiles_module._tools_to_opencode_permission(("*",))
+        self.assertEqual(wildcard["skill"], "deny")
+        self.assertEqual(wildcard["task"], "allow")
+        self.assertEqual(wildcard["bash"], "allow")
 
     def test_claude_install_uses_manifest_owned_runtime_files_and_filtered_env(self):
         root = Path(__file__).parents[1]
@@ -360,6 +386,11 @@ class ProfileTests(unittest.TestCase):
             self.assertFalse(profile.path.exists())
             self.assertFalse((runtime / f"{profile.name}.prompt").exists())
             self.assertFalse((runtime / f"{profile.name}.mcp.json").exists())
+
+    def test_project_opencode_config_denies_skill_permission(self):
+        root = Path(__file__).parents[1]
+        data = json.loads((root / "opencode.json").read_text())
+        self.assertEqual(data["permission"]["skill"], {"*": "deny"})
 
 
 if __name__ == "__main__":

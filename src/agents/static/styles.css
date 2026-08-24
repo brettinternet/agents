@@ -15,8 +15,9 @@
   box-sizing: border-box;
 }
 body {
+  height: 100dvh;
   margin: 0;
-  min-height: 100vh;
+  overflow: hidden;
 }
 button,
 input,
@@ -55,26 +56,31 @@ select:focus-visible,
   color: white;
   box-shadow: 0 5px 25px #0003;
 }
+#status:empty {
+  display: none;
+}
 .shell {
   display: grid;
   grid-template-columns: 13rem minmax(32rem, 1fr) minmax(30rem, 34rem);
-  min-height: 100vh;
+  height: 100dvh;
+  min-height: 0;
 }
 .shell > nav,
 .shell > aside {
+  min-height: 0;
   background: var(--panel);
   padding: 0.75rem;
-  overflow: auto;
 }
 .shell > nav {
   display: flex;
   flex-direction: column;
-  min-height: 100vh;
+  overflow: auto;
   border-right: 1px solid var(--line);
 }
 .shell > aside {
   display: flex;
   flex-direction: column;
+  overflow: hidden;
   border-left: 1px solid var(--line);
 }
 nav h1 {
@@ -135,8 +141,9 @@ textarea {
   resize: vertical;
 }
 main {
-  padding: 0.75rem;
   min-width: 0;
+  overflow: auto;
+  padding: 0.75rem;
 }
 main > header {
   display: flex;
@@ -160,6 +167,9 @@ main > header {
   display: grid;
   gap: 0.35rem;
 }
+.thread-home {
+  display: contents;
+}
 .thread {
   display: flex;
   flex: 1;
@@ -177,17 +187,74 @@ main > header {
 .thread-header h2 {
   margin-bottom: 0;
 }
+.thread-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
 .compose {
   margin-top: 0.5rem;
 }
-.form-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: end;
-  gap: 0.4rem;
+.compose-box {
+  border: 1px solid var(--line);
+  border-radius: 1rem;
+  background: white;
+  box-shadow: 0 2px 8px #17203312;
+  overflow: hidden;
 }
-.form-row label {
-  margin: 0;
+.compose-box:focus-within {
+  border-color: #68a7ea;
+  box-shadow: 0 0 0 2px #68a7ea42;
+}
+.compose-box #message-body {
+  min-height: 4.5rem;
+  border: 0;
+  border-radius: 0;
+  padding: 0.75rem 0.85rem 0.35rem;
+  resize: none;
+}
+.compose-box #message-body:focus-visible,
+.compose-box #message-urgency:focus-visible,
+.compose-box .compose-send:focus-visible {
+  outline-width: 2px;
+  outline-offset: 0;
+}
+.compose-controls {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.45rem 0.45rem;
+}
+.compose-box #message-urgency {
+  width: auto;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.compose-send {
+  display: grid;
+  width: 2.25rem;
+  height: 2.25rem;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  padding: 0;
+  background: var(--ink);
+  color: white;
+}
+.compose-send:hover {
+  background: var(--accent);
+}
+.compose-send svg {
+  width: 1.2rem;
+  height: 1.2rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
 }
 .board {
   display: grid;
@@ -253,8 +320,14 @@ main > header {
   background: #fbe9e9;
   color: var(--danger);
 }
+.queue-preview {
+  max-width: min(42rem, 100%);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .messages {
-  height: clamp(28rem, 58vh, 44rem);
+  min-height: 0;
   overflow: auto;
   border: 1px solid var(--line);
   border-radius: 0.5rem;
@@ -282,12 +355,65 @@ main > header {
 .message p {
   margin: 0.55rem 0;
 }
-#detail {
-  max-height: 40vh;
-  overflow: auto;
+.detail-preview {
+  flex: 0 0 auto;
+  padding-bottom: 0.9rem;
+  border-bottom: 1px solid var(--line);
 }
-#detail ul {
-  padding-left: 1.2rem;
+.detail-preview h2,
+.detail-preview .preview-copy {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+}
+.detail-preview h2 {
+  -webkit-line-clamp: 2;
+}
+.detail-preview h3 {
+  margin: 0.75rem 0 0.25rem;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+.detail-preview .preview-copy {
+  margin: 0;
+  -webkit-line-clamp: 3;
+  line-height: 1.35;
+}
+.preview-summary {
+  margin: 0.75rem 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+.preview-evidence {
+  max-height: 6rem;
+}
+.thread-preview .compose,
+.thread-preview #older {
+  display: none;
+}
+.thread-preview .messages {
+  flex: 1;
+  overflow: hidden;
+}
+.thread-preview .message {
+  display: none;
+}
+.thread-preview .message:nth-last-child(-n + 3) {
+  display: block;
+}
+.thread-preview .message p {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+.thread-expanded {
+  margin-top: 0;
+}
+.thread-expanded .messages {
+  height: min(62vh, 44rem);
 }
 .evidence {
   white-space: pre-wrap;
@@ -305,11 +431,53 @@ dialog {
   box-shadow: 0 15px 50px #0005;
   width: min(32rem, calc(100% - 2rem));
 }
+.detail-dialog,
+.thread-dialog {
+  width: min(56rem, calc(100% - 2rem));
+  max-height: calc(100dvh - 2rem);
+  overflow: auto;
+}
+.dialog-close {
+  position: sticky;
+  z-index: 1;
+  top: 0;
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 0.5rem;
+}
+.thread-dialog .thread {
+  min-height: min(40rem, calc(100dvh - 8rem));
+}
+.thread-dialog #open-thread {
+  display: none;
+}
 #decision-dialog {
   width: min(46rem, calc(100% - 2rem));
 }
 #incident-dialog {
   width: min(52rem, calc(100% - 2rem));
+}
+#answer-dialog {
+  width: min(42rem, calc(100% - 2rem));
+}
+.answer-question {
+  margin: 1rem 0;
+}
+.answer-question h3 {
+  margin-bottom: 0.4rem;
+}
+.answer-question pre {
+  max-height: min(35vh, 18rem);
+  margin: 0;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 0.4rem;
+  padding: 0.65rem;
+  background: var(--surface);
+  font: inherit;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 .incident-list {
   display: grid;
@@ -377,6 +545,14 @@ dialog {
 .decision-option input {
   width: auto;
   margin: 0.15rem 0 0;
+}
+.decision-input-label,
+.decision-option textarea {
+  grid-column: 2;
+}
+.decision-input-label {
+  color: var(--muted);
+  font-size: 0.8rem;
 }
 dialog::backdrop {
   background: #17203388;
@@ -447,8 +623,17 @@ dialog::backdrop {
   }
 }
 @media (max-width: 1000px) {
+  body {
+    height: auto;
+    overflow: auto;
+  }
   .shell {
     grid-template-columns: 12rem 1fr;
+    height: auto;
+    min-height: 100vh;
+  }
+  main {
+    overflow: visible;
   }
   .shell > aside {
     grid-column: 1/-1;
@@ -457,6 +642,7 @@ dialog::backdrop {
     display: grid;
     grid-template-columns: minmax(0, 1fr);
     gap: 1rem;
+    overflow: visible;
   }
   .board {
     grid-template-columns: repeat(5, 15rem);
@@ -484,7 +670,7 @@ dialog::backdrop {
   main {
     padding: 0.75rem;
   }
-  .messages {
+  .thread-expanded .messages {
     height: clamp(24rem, 58vh, 36rem);
   }
   #status {

@@ -2,6 +2,14 @@
 
 Agents is a local control plane for running a durable, observable team of AI agents who don't really do anything other than browse the web and poke around the internet. They're not very productive, but they're curious.
 
+## Demo
+
+![Agents board showing the live control plane, agent roster, work queues, and task preview](docs/assets/agents-board.webp)
+
+| Durable task details                                                                                                                  | Human decision workflow                                                                                           |
+| ------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| ![Task detail view with acceptance criteria, consultations, submissions, checks, reviews, and blockers](docs/assets/task-detail.webp) | ![Human decision dialog with a recommendation and structured resolution options](docs/assets/human-decision.webp) |
+
 ## Run
 
 Requires [mise](https://mise.jdx.dev/) and Git.
@@ -81,6 +89,13 @@ exact or noninteractive input, start the command with a private non-TTY stdin
 channel and write the value through the transient control plane. Non-TTY input
 is exact, including any trailing newline. Never place the value in shell command
 text, arguments, environment assignments, or files. Other operations:
+
+CAO work agents request the same operation with Agent MCP
+`request_managed_secret_set`, passing only the declared name. The dashboard then
+shows a private one-shot form for the operator-provided value. That raw body is
+held only long enough to pipe it to `task secrets:set`; it does not enter agent
+tool arguments, terminal input, SQLite, messages, events, logs, or retry state.
+The agent can poll non-secret completion with `managed_secret_set_status`.
 
 ```sh
 task secrets:list

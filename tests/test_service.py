@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import errno
 import json
+import os
+import signal
 import sqlite3
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from agents.config import (
     AgentsConfig,
@@ -21,12 +26,15 @@ from agents.config import (
 )
 from agents.service import (
     ServiceError,
+    _acquire_daemon_lock_after_stop,
     _agents_environment,
     _close_mapped_workspaces,
     _foreground_agents_environment,
     _herdr_environment,
     _owned,
     _record,
+    _stop_named,
+    _wait_for_exit,
     acquire_daemon_lock,
     foreground,
     shutdown,
@@ -184,17 +192,77 @@ class ServiceTests(unittest.TestCase):
             ):
                 start(config)
 
-    def test_start_rejects_stale_ownership_record(self) -> None:
+    def test_start_removes_stale_record_and_starts_agentsd(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            agentsd = root / ".venv" / "bin" / "agentsd"
+            agentsd.parent.mkdir(parents=True)
+            agentsd.write_text("#!/bin/sh\n")
+            agentsd.chmod(0o755)
             config = _config(root)
             config.state_dir.mkdir(mode=0o700)
-            (config.state_dir / "agentsd.pid").write_text("{}")
+            record = config.state_dir / "agentsd.pid"
+            record.write_text('{"pid": 123, "executable": "/missing", "started": "old"}')
             with (
-                patch("agents.service._owned", return_value=None),
-                self.assertRaisesRegex(ServiceError, "stale service ownership record for agentsd"),
+                patch("agents.service._owned", side_effect=(None, (123, {}))),
+                patch("agents.service._herdr_health", return_value=True),
+                patch("agents.service._web_health_ready", return_value=True),
+                patch("agents.service._port_free", return_value=True),
+                patch("agents.service._launch_process", return_value=FakeProcess()) as launch,
             ):
                 start(config)
+            self.assertFalse(record.exists())
+            launch.assert_called_once()
+            self.assertEqual(launch.call_args.args[1], "agentsd")
+
+    def test_start_reports_invalid_record_without_removing_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = _config(Path(temporary))
+            config.state_dir.mkdir(mode=0o700)
+            record = config.state_dir / "agentsd.pid"
+            record.write_text("{}")
+            with self.assertRaisesRegex(
+                ServiceError, "cannot validate service ownership: invalid service ownership record"
+            ):
+                start(config)
+            self.assertTrue(record.exists())
+
+    def test_stop_removes_stale_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = _config(Path(temporary))
+            config.state_dir.mkdir(mode=0o700)
+            record = config.state_dir / "agentsd.pid"
+            record.write_text('{"pid": 123, "executable": "/missing", "started": "old"}')
+            with patch("agents.service._owned", return_value=None):
+                stop(config)
+            self.assertFalse(record.exists())
+
+    def test_stop_reports_invalid_record_without_removing_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = _config(Path(temporary))
+            config.state_dir.mkdir(mode=0o700)
+            record = config.state_dir / "agentsd.pid"
+            record.write_text("{}")
+            with self.assertRaisesRegex(
+                ServiceError, "cannot validate agentsd ownership before stopping: invalid service ownership record"
+            ):
+                stop(config)
+            self.assertTrue(record.exists())
+
+    def test_stop_signals_verified_owned_process_before_removing_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = _config(Path(temporary))
+            config.state_dir.mkdir(mode=0o700)
+            record = config.state_dir / "agentsd.pid"
+            record.write_text('{"pid": 123, "executable": "/owned", "started": "now"}')
+            with (
+                patch("agents.service._owned", return_value=(123, {})),
+                patch("agents.service.os.killpg") as kill_group,
+                patch("agents.service.os.kill", side_effect=ProcessLookupError),
+            ):
+                stop(config)
+            kill_group.assert_called_once_with(123, signal.SIGTERM)
+            self.assertFalse(record.exists())
 
     def test_foreground_removes_provider_credential_when_setup_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -236,6 +304,121 @@ class ServiceTests(unittest.TestCase):
                 self.assertEqual((state / "agentsd.lock").stat().st_mode & 0o777, 0o600)
             finally:
                 first.close()
+
+    def test_acquire_daemon_lock_error_names_path_and_errno(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            first = acquire_daemon_lock(state)
+            try:
+                with self.assertRaisesRegex(
+                    ServiceError, r"agentsd\.lock is already locked by another process \(errno \d+"
+                ):
+                    acquire_daemon_lock(state)
+            finally:
+                first.close()
+
+    def test_acquire_daemon_lock_after_stop_retries_transient_contention(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            blocker = acquire_daemon_lock(state)
+
+            def release_soon() -> None:
+                time.sleep(0.2)
+                blocker.close()
+
+            releaser = threading.Thread(target=release_soon)
+            releaser.start()
+            try:
+                handle = _acquire_daemon_lock_after_stop(state, timeout=2.0, interval=0.05)
+                handle.close()
+            finally:
+                releaser.join()
+
+    def test_acquire_daemon_lock_after_stop_gives_up_after_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            holder = acquire_daemon_lock(state)
+            try:
+                with self.assertRaises(ServiceError):
+                    _acquire_daemon_lock_after_stop(state, timeout=0.2, interval=0.05)
+            finally:
+                holder.close()
+
+    def test_acquire_daemon_lock_after_stop_does_not_retry_non_lock_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            with (
+                patch("agents.service.fcntl.flock", side_effect=OSError(errno.EACCES, "Permission denied")),
+                patch("agents.service.time.sleep") as sleep,
+                self.assertRaisesRegex(ServiceError, "Permission denied"),
+            ):
+                _acquire_daemon_lock_after_stop(state, timeout=2.0, interval=0.05)
+            sleep.assert_not_called()
+
+    def test_wait_for_exit_reaps_a_child_process(self) -> None:
+        process = subprocess.Popen(["/usr/bin/true"])
+        self.assertTrue(_wait_for_exit(process.pid, 2))
+        process.returncode = 0
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(process.pid, os.WNOHANG)
+
+    def test_stop_raises_when_process_survives_sigterm_and_sigkill(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = _config(Path(temporary))
+            config.state_dir.mkdir(mode=0o700)
+            record = config.state_dir / "agentsd.pid"
+            record.write_text('{"pid": 123, "executable": "/owned", "started": "now"}')
+            with (
+                patch("agents.service._owned", return_value=(123, {})),
+                patch("agents.service.os.killpg") as kill_group,
+                patch("agents.service._wait_for_exit", return_value=False),
+                self.assertRaisesRegex(ServiceError, "did not exit after SIGTERM and SIGKILL"),
+            ):
+                _stop_named(config, "agentsd")
+            self.assertEqual(kill_group.call_args_list, [call(123, signal.SIGTERM), call(123, signal.SIGKILL)])
+            self.assertTrue(record.exists())
+
+    def test_owned_rejects_malformed_field_types_before_inspecting_process(self) -> None:
+        invalid_records = (
+            {"pid": "123", "executable": "/missing", "started": "old"},
+            {"pid": 123, "executable": "", "started": "old"},
+            {"pid": 123, "executable": "/missing", "started": ""},
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            pidfile = Path(temporary) / "service.pid"
+            for record in invalid_records:
+                with self.subTest(record=record):
+                    pidfile.write_text(json.dumps(record))
+                    with (
+                        patch("agents.service.os.kill") as inspect,
+                        self.assertRaisesRegex(ServiceError, "invalid service ownership record"),
+                    ):
+                        _owned(pidfile)
+                    inspect.assert_not_called()
+
+    def test_owned_reports_out_of_range_pid_as_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            pidfile = Path(temporary) / "service.pid"
+            pidfile.write_text('{"pid": 10000000000, "executable": "/missing", "started": "old"}')
+            with (
+                patch("agents.service.os.kill", side_effect=OverflowError),
+                self.assertRaisesRegex(ServiceError, "invalid service ownership record.*supported range"),
+            ):
+                _owned(pidfile)
+
+    def test_owned_reports_non_utf8_record_as_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            pidfile = Path(temporary) / "service.pid"
+            pidfile.write_bytes(b"\xff\xfe")
+            with self.assertRaisesRegex(ServiceError, "invalid service ownership record.*not UTF-8"):
+                _owned(pidfile)
+
+    def test_owned_returns_none_when_recorded_process_is_gone(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            pidfile = Path(temporary) / "service.pid"
+            pidfile.write_text('{"pid": 123, "executable": "/missing", "started": "old"}')
+            with patch("agents.service.os.kill", side_effect=ProcessLookupError):
+                self.assertIsNone(_owned(pidfile))
 
     def test_owned_process_accepts_resolved_symlink_executable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

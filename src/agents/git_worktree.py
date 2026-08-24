@@ -428,6 +428,15 @@ def import_isolated_submission(
         raise cleanup_error
 
 
+def rollback_isolated_submission(project: Path, branch: str, base_sha: str, commit_sha: str) -> None:
+    """Restore an imported branch only when it still names the submitted commit."""
+    _validate_branch(branch)
+    branch_ref = f"refs/heads/{branch}"
+    if _ref_sha(project, branch_ref) != commit_sha:
+        raise GitError("authoritative branch changed after submission import")
+    git(project, "update-ref", branch_ref, base_sha, commit_sha)
+
+
 def remove_recorded_workspace(
     config: Any,
     project: Path,

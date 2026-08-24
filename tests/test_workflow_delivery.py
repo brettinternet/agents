@@ -13,7 +13,7 @@ from agents.config import AgentsConfig, ExecutionConfig, ModelChoice, ProjectCon
 from agents.db import connect, migrate, utc_now
 from agents.delivery import Delivery
 from agents.execution import RunHandle
-from agents.git_worktree import branch_sha, head_sha
+from agents.git_worktree import GitError, branch_sha, head_sha
 from agents.policy import DomainError
 from agents.reconciler import Reconciler, reserve_terminal
 from agents.store import Store
@@ -313,6 +313,35 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(
             self.connection.execute("SELECT 1 FROM submissions WHERE id=?", (submission_id,)).fetchone()
         )
+
+    def test_container_submission_rolls_back_import_when_snapshot_fails(self):
+        item, version = self.ready_item()
+        dispatch = cast(dict[str, Any], self.delivery.dispatch_next())
+        run_id = int(dispatch["terminal_run_id"])
+        self.connection.execute(
+            "UPDATE terminal_runs SET execution_backend='herdr-container' WHERE id=?",
+            (run_id,),
+        )
+        worktree = Path(dispatch["worktree"])
+        (worktree / "file").write_text("changed")
+        subprocess.run(["git", "-C", str(worktree), "commit", "-am", "implement"], check=True, capture_output=True)
+        commit_sha = head_sha(worktree)
+        with (
+            patch("agents.delivery.import_isolated_submission") as imported,
+            patch("agents.delivery.add_agent_snapshot", side_effect=GitError("snapshot failed")),
+            patch("agents.delivery.rollback_isolated_submission") as rolled_back,
+            self.assertRaisesRegex(GitError, "snapshot failed"),
+        ):
+            self.delivery.submit_work("writer", item, version + 1, commit_sha, "done", run_id)
+        imported.assert_called_once()
+        rolled_back.assert_called_once_with(
+            self.config.project.path,
+            str(dispatch["branch"]),
+            str(dispatch["base_sha"]),
+            commit_sha,
+        )
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM submissions").fetchone()[0], 0)
+        self.assertEqual(Store(self.connection).get_work(item)["status"], "in_progress")
 
     async def test_delivery_path(self):
         item, version = self.ready_item()

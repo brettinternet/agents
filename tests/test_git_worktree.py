@@ -22,6 +22,7 @@ from agents.git_worktree import (
     remove_recorded_worktree,
     reserve_execution,
     reserve_execution_workspace,
+    rollback_isolated_submission,
 )
 
 
@@ -156,6 +157,10 @@ class GitWorktreeTests(unittest.TestCase):
 
         self.assertEqual(branch_sha(self.repo, branch), submitted)
         self.assertEqual(git(self.repo, "for-each-ref", "--format=%(refname)", "refs/agents/import"), "")
+        rollback_isolated_submission(self.repo, branch, base, submitted)
+        self.assertEqual(branch_sha(self.repo, branch), base)
+        with self.assertRaisesRegex(GitError, "changed after submission import"):
+            rollback_isolated_submission(self.repo, branch, base, submitted)
 
     def test_import_rejects_dirty_wrong_branch_and_wrong_sha(self):
         config = self._config()

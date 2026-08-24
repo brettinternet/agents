@@ -1058,14 +1058,22 @@ def reset(config: AgentsConfig) -> None:
     if topology_record.exists() or topology_record.is_symlink() or any(service.status(config).values()):
         raise ContainerCommandError("all Agents topologies must be stopped before container:reset")
     runtime = _runtime(config)
-    environment = _compose_environment(
-        config,
-        "reset",
-        config.state_dir / "runtime" / "system-auth" / "reset",
-    )
-    _verify_compose_project_scope(config, "reset")
-    _completed(
-        ("docker", "compose", "-f", str(config.root / "compose.yaml"), "down", "--volumes", "--remove-orphans"),
-        env=environment,
-    )
-    _completed(("colima", "--profile", runtime.config.colima_profile, "delete", "--force"))
+    auth_file = _system_auth_directory(config, create=True) / "reset"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(auth_file, flags, 0o600)
+    os.close(descriptor)
+    try:
+        environment = _compose_environment(config, "reset", auth_file)
+        _verify_compose_project_scope(config, "reset")
+        _completed(
+            ("docker", "compose", "-f", str(config.root / "compose.yaml"), "down", "--volumes", "--remove-orphans"),
+            env=environment,
+        )
+        _completed(("colima", "--profile", runtime.config.colima_profile, "delete", "--force"))
+    finally:
+        try:
+            _cleanup_secret_source_artifacts(auth_file)
+        finally:
+            auth_file.unlink(missing_ok=True)

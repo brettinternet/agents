@@ -33,6 +33,7 @@ from .git_worktree import (
     is_clean,
     remove_recorded_workspace,
     reserve_execution_workspace,
+    rollback_isolated_submission,
 )
 from .policy import CONSULTATION_SPECIALTIES, DomainError, validate_text, validate_title
 from .reconciler import _config_for_backend, reserve_terminal
@@ -608,41 +609,90 @@ class Delivery:
                 (assignment["execution_id"],),
             ).fetchone()[0]
         )
-        if str(execution_config.execution.isolation) == "container":
-            try:
-                import_isolated_submission(
-                    self.config.project.path,
-                    path,
-                    str(assignment["branch"]),
-                    str(assignment["base_sha"]),
-                    commit_sha,
-                    int(assignment["execution_id"]),
-                    revision,
-                )
-            except GitError as exc:
-                raise DomainError("invalid_submission", str(exc)) from exc
         if (
             not is_clean(path)
             or head_sha(path) != commit_sha
-            or not is_ancestor(self.config.project.path, str(assignment["base_sha"]), commit_sha)
+            or not is_ancestor(path, str(assignment["base_sha"]), commit_sha)
             or commit_sha == assignment["base_sha"]
         ):
             raise DomainError("invalid_submission", "submission must be a clean committed descendant")
-        now = utc_now()
-        submission = self.connection.execute(
-            "INSERT INTO submissions(execution_id,revision,commit_sha,summary,state,created_at,updated_at)VALUES(?,?,?,?, 'checking',?,?)",
-            (assignment["execution_id"], revision, commit_sha, summary, now, now),
-        ).lastrowid
-        checktree = self.config.root / ".worktrees/check" / str(submission)
-        add_agent_snapshot(execution_config, execution_config.project.path, commit_sha, checktree)
-        for position, argv in enumerate(self.config.project.verify, 1):
+        imported = False
+        checktree: Path | None = None
+        submission: int | None = None
+        self.connection.execute("SAVEPOINT submit_work")
+        try:
+            if str(execution_config.execution.isolation) == "container":
+                try:
+                    import_isolated_submission(
+                        self.config.project.path,
+                        path,
+                        str(assignment["branch"]),
+                        str(assignment["base_sha"]),
+                        commit_sha,
+                        int(assignment["execution_id"]),
+                        revision,
+                    )
+                    imported = True
+                except GitError as exc:
+                    raise DomainError("invalid_submission", str(exc)) from exc
+            now = utc_now()
+            submission = self.connection.execute(
+                "INSERT INTO submissions(execution_id,revision,commit_sha,summary,state,created_at,updated_at)"
+                "VALUES(?,?,?,?, 'checking',?,?)",
+                (assignment["execution_id"], revision, commit_sha, summary, now, now),
+            ).lastrowid
+            if submission is None:
+                raise RuntimeError("SQLite did not allocate submission")
+            checktree = self.config.root / ".worktrees/check" / str(submission)
+            add_agent_snapshot(execution_config, execution_config.project.path, commit_sha, checktree)
+            for position, argv in enumerate(self.config.project.verify, 1):
+                self.connection.execute(
+                    "INSERT INTO checks(submission_id,scope,target_sha,position,command,worktree_path,state,"
+                    "created_at,updated_at)VALUES(?,'submission',?,?,?,?, 'queued',?,?)",
+                    (submission, commit_sha, position, json.dumps(argv), str(checktree), now, now),
+                )
             self.connection.execute(
-                "INSERT INTO checks(submission_id,scope,target_sha,position,command,worktree_path,state,created_at,updated_at)VALUES(?,'submission',?,?,?,?, 'queued',?,?)",
-                (submission, commit_sha, position, json.dumps(argv), str(checktree), now, now),
+                "UPDATE work_items SET status='verifying',version=version+1,updated_at=? WHERE id=?",
+                (now, item_id),
             )
-        self.connection.execute(
-            "UPDATE work_items SET status='verifying',version=version+1,updated_at=? WHERE id=?", (now, item_id)
-        )
+            self.connection.execute("RELEASE SAVEPOINT submit_work")
+        except BaseException as exc:
+            cleanup_errors: list[str] = []
+            try:
+                self.connection.execute("ROLLBACK TO SAVEPOINT submit_work")
+            except sqlite3.Error as cleanup_exc:
+                cleanup_errors.append(str(cleanup_exc))
+            try:
+                self.connection.execute("RELEASE SAVEPOINT submit_work")
+            except sqlite3.Error as cleanup_exc:
+                cleanup_errors.append(str(cleanup_exc))
+            if checktree is not None and (checktree.exists() or checktree.is_symlink()):
+                try:
+                    remove_recorded_workspace(
+                        execution_config,
+                        execution_config.project.path,
+                        checktree,
+                        commit_sha,
+                        allow_dirty=True,
+                    )
+                except (GitError, OSError) as cleanup_exc:
+                    cleanup_errors.append(str(cleanup_exc))
+            if imported:
+                try:
+                    rollback_isolated_submission(
+                        self.config.project.path,
+                        str(assignment["branch"]),
+                        str(assignment["base_sha"]),
+                        commit_sha,
+                    )
+                except GitError as cleanup_exc:
+                    cleanup_errors.append(str(cleanup_exc))
+            if cleanup_errors:
+                raise DomainError(
+                    "submission_cleanup_failed",
+                    f"submission failed: {exc}; cleanup failed: {'; '.join(cleanup_errors)}",
+                ) from exc
+            raise
         return {"submission_id": submission, "commit_sha": commit_sha, "version": expected_version + 1}
 
     def recover_running_checks(self) -> int:

@@ -449,6 +449,92 @@ class WebAuthTests(unittest.TestCase):
             )
         self.assertEqual(status.json()["data"]["state"], "set")
 
+    def test_agent_sets_managed_secret_directly(self):
+        item_id, terminal_id = self._active_work_terminal()
+        context = AgentContext(terminal_id, "researcher", "work", item_id, False)
+        agent_headers = {"Authorization": "Bearer test-token", "X-Agents-Execution-ID": "work-execution"}
+        private_value = "agent-chosen-value"
+        completed = subprocess.CompletedProcess([], 0)
+        with (
+            patch("agents.web.authenticate_agent", return_value=context),
+            patch("agents.web.subprocess.run", return_value=completed) as run,
+        ):
+            response = self.client.post(
+                "/agent/v1/secrets",
+                headers=agent_headers,
+                json={"name": "SERVICE_TOKEN", "value": private_value},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["data"], {"name": "SERVICE_TOKEN", "state": "set"})
+        argv = run.call_args.args[0]
+        self.assertEqual((Path(argv[0]).name, argv[1]), ("task", "--taskfile"))
+        self.assertIn("secrets:set", argv)
+        self.assertEqual(argv[-2:], ["--", "SERVICE_TOKEN"])
+        self.assertNotIn(private_value, argv)
+        self.assertEqual(run.call_args.kwargs["input"], private_value.encode())
+        self.assertIs(run.call_args.kwargs["stdout"], subprocess.DEVNULL)
+        self.assertIs(run.call_args.kwargs["stderr"], subprocess.DEVNULL)
+        self.assertNotIn(private_value, response.text)
+        self.assertNotIn(private_value, "\n".join(self.connection.iterdump()))
+
+    def test_agent_set_secret_requires_active_assignment(self):
+        item_id, _ = self._active_work_terminal()
+        unauthorized = AgentContext(999999, "researcher", "work", item_id, False)
+        agent_headers = {"Authorization": "Bearer test-token", "X-Agents-Execution-ID": "work-execution"}
+        with (
+            patch("agents.web.authenticate_agent", return_value=unauthorized),
+            patch("agents.web.subprocess.run") as run,
+        ):
+            response = self.client.post(
+                "/agent/v1/secrets",
+                headers=agent_headers,
+                json={"name": "SERVICE_TOKEN", "value": "x"},
+            )
+        self.assertEqual(response.status_code, 403)
+        run.assert_not_called()
+
+    def test_agent_set_secret_validates_input_and_setter_failure(self):
+        item_id, terminal_id = self._active_work_terminal()
+        context = AgentContext(terminal_id, "researcher", "work", item_id, False)
+        agent_headers = {"Authorization": "Bearer test-token", "X-Agents-Execution-ID": "work-execution"}
+        with (
+            patch("agents.web.authenticate_agent", return_value=context),
+            patch("agents.web.subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as run,
+        ):
+            bad_name = self.client.post(
+                "/agent/v1/secrets", headers=agent_headers, json={"name": "bad-name", "value": "x"}
+            )
+            reserved = self.client.post(
+                "/agent/v1/secrets", headers=agent_headers, json={"name": secret_store.FORMAT_KEY, "value": "x"}
+            )
+            non_string = self.client.post(
+                "/agent/v1/secrets", headers=agent_headers, json={"name": "SERVICE_TOKEN", "value": 5}
+            )
+            too_large = self.client.post(
+                "/agent/v1/secrets",
+                headers=agent_headers,
+                json={"name": "SERVICE_TOKEN", "value": "x" * (64 * 1024 + 1)},
+            )
+        self.assertEqual(bad_name.status_code, 400)
+        self.assertEqual(reserved.status_code, 400)
+        self.assertEqual(non_string.status_code, 400)
+        self.assertEqual(too_large.status_code, 413)
+        run.assert_not_called()
+
+        with (
+            patch("agents.web.authenticate_agent", return_value=context),
+            patch("agents.web.subprocess.run", return_value=subprocess.CompletedProcess([], 1)) as run,
+        ):
+            rejected = self.client.post(
+                "/agent/v1/secrets", headers=agent_headers, json={"name": "SERVICE_TOKEN", "value": "rejected-value"}
+            )
+        self.assertEqual(rejected.status_code, 422)
+        run.assert_called_once()
+        self.assertEqual(run.call_args.kwargs["input"], b"rejected-value")
+        self.assertNotIn("rejected-value", run.call_args.args[0])
+        self.assertNotIn("rejected-value", rejected.text)
+        self.assertNotIn("rejected-value", "\n".join(self.connection.iterdump()))
+
     def test_managed_secret_request_runs_real_setter_end_to_end(self):
         repo = self.config.project.path
         (repo / ".env.schema").write_text(
@@ -484,6 +570,31 @@ class WebAuthTests(unittest.TestCase):
         self.assertEqual(secret_store._decrypt(paths)["SERVICE_TOKEN"], "route-e2e-test-value")
         self.assertNotIn("route-e2e-test-value", response.text)
         self.assertNotIn("route-e2e-test-value", "\n".join(self.connection.iterdump()))
+
+    def test_agent_sets_managed_secret_end_to_end_with_real_crypto(self):
+        repo = self.config.project.path
+        (repo / ".env.schema").write_text(
+            "# @defaultSensitive=false @defaultRequired=false\n# ---\n# @sensitive\nSERVICE_TOKEN=\n"
+        )
+        (repo / ".env.local").touch()
+        source_taskfile = Path(__file__).parents[1] / "Taskfile.dist.yaml"
+        (repo / "Taskfile.dist.yaml").write_text(source_taskfile.read_text())
+        paths = secret_store.resolve_paths(repo)
+        secret_store.init_store(paths)
+        item_id, terminal_id = self._active_work_terminal()
+        context = AgentContext(terminal_id, "researcher", "work", item_id, False)
+        agent_headers = {"Authorization": "Bearer test-token", "X-Agents-Execution-ID": "work-execution"}
+        with patch("agents.web.authenticate_agent", return_value=context):
+            response = self.client.post(
+                "/agent/v1/secrets",
+                headers=agent_headers,
+                json={"name": "SERVICE_TOKEN", "value": "agent-e2e-secret-value"},
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["data"], {"name": "SERVICE_TOKEN", "state": "set"})
+        self.assertEqual(secret_store._decrypt(paths)["SERVICE_TOKEN"], "agent-e2e-secret-value")
+        self.assertNotIn("agent-e2e-secret-value", response.text)
+        self.assertNotIn("agent-e2e-secret-value", "\n".join(self.connection.iterdump()))
 
     def test_managed_secret_request_requires_active_work_and_is_one_shot(self):
         persistent = AgentContext(1, "researcher", "persistent", "researcher", True)

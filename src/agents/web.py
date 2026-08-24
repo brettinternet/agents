@@ -95,6 +95,39 @@ def _trusted_secret_tools() -> tuple[str, dict[str, str]]:
     return executables["task"], environment
 
 
+async def _apply_managed_secret(project_path: Path, working_directory: str, name: str, value: bytes) -> None:
+    try:
+        task_executable, trusted_environment = _trusted_secret_tools()
+    except RuntimeError:
+        raise HTTPException(503, detail=error("secret_set_unavailable", "secret setter unavailable")) from None
+    trusted_setter = shlex.join((sys.executable, str(Path(__file__).with_name("secret_store.py").resolve())))
+    try:
+        result = await asyncio.to_thread(
+            subprocess.run,
+            [
+                task_executable,
+                "--taskfile",
+                str(project_path / "Taskfile.dist.yaml"),
+                "--dir",
+                str(working_directory),
+                "secrets:set",
+                f"SECRETS_CLI={trusted_setter}",
+                "--",
+                name,
+            ],
+            input=value,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=60,
+            env=trusted_environment,
+        )
+    except OSError, subprocess.TimeoutExpired:
+        raise HTTPException(503, detail=error("secret_set_unavailable", "secret setter unavailable")) from None
+    if result.returncode:
+        raise HTTPException(422, detail=error("secret_set_rejected", "secret setter rejected the value"))
+
+
 def ok(data: Any, version: int | None = None) -> dict[str, Any]:
     value = {"ok": True, "data": data}
     if version is not None:
@@ -766,6 +799,28 @@ def create_app(config: AgentsConfig | None = None, connection: sqlite3.Connectio
         ):
             raise HTTPException(404, detail=error("not_found", "managed secret request does not exist"))
         return ok(_public_secret_request(item))
+
+    @app.post("/agent/v1/secrets")
+    async def agent_set_secret(request: Request, context: AgentAuth):
+        body = await _json_body(request)
+        name = body.get("name")
+        value = body.get("value")
+        assignment = _active_secret_assignment(request.app.state.connection, context.terminal_run_id)
+        if context.purpose_kind != "work" or assignment is None:
+            raise HTTPException(
+                403, detail=error("unauthorized", "managed secrets require an active execute-capable assignment")
+            )
+        if not isinstance(name, str) or not NAME_RE.fullmatch(name) or name == FORMAT_KEY:
+            raise HTTPException(400, detail=error("validation_failed", "invalid managed secret name"))
+        if not isinstance(value, str):
+            raise HTTPException(400, detail=error("validation_failed", "secret value must be a string"))
+        encoded = value.encode("utf-8")
+        if len(encoded) > 64 * 1024:
+            raise HTTPException(413, detail=error("secret_too_large", "secret input exceeds 64 KiB"))
+        await _apply_managed_secret(
+            request.app.state.config.project.path, assignment["working_directory"], name, encoded
+        )
+        return ok({"name": name, "state": "set"})
 
     @app.post("/agent/v1/backlog/{item_id}/progress")
     async def agent_report_progress(request: Request, item_id: str, context: AgentAuth):
@@ -1448,48 +1503,25 @@ def create_app(config: AgentsConfig | None = None, connection: sqlite3.Connectio
         if assignment is None:
             del request.app.state.managed_secret_requests[secret_request_id]
             raise HTTPException(404, detail=error("not_found", "managed secret request is not active"))
-        try:
-            task_executable, trusted_environment = _trusted_secret_tools()
-        except RuntimeError:
-            raise HTTPException(503, detail=error("secret_set_unavailable", "secret setter unavailable")) from None
         item["state"] = "setting"
         item["expires_at"] = time.monotonic() + SECRET_REQUEST_TTL_SECONDS
         value = bytearray()
         try:
             async for chunk in request.stream():
                 if len(value) + len(chunk) > 64 * 1024:
-                    item["state"] = "failed"
                     raise HTTPException(413, detail=error("secret_too_large", "secret input exceeds 64 KiB"))
                 value.extend(chunk)
-            trusted_setter = shlex.join((sys.executable, str(Path(__file__).with_name("secret_store.py").resolve())))
-            result = await asyncio.to_thread(
-                subprocess.run,
-                [
-                    task_executable,
-                    "--taskfile",
-                    str(request.app.state.config.project.path / "Taskfile.dist.yaml"),
-                    "--dir",
-                    str(assignment["working_directory"]),
-                    "secrets:set",
-                    f"SECRETS_CLI={trusted_setter}",
-                    "--",
-                    item["name"],
-                ],
-                input=bytes(value),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-                timeout=60,
-                env=trusted_environment,
+            await _apply_managed_secret(
+                request.app.state.config.project.path,
+                assignment["working_directory"],
+                item["name"],
+                bytes(value),
             )
-        except OSError, subprocess.TimeoutExpired:
+        except HTTPException:
             item["state"] = "failed"
-            raise HTTPException(503, detail=error("secret_set_unavailable", "secret setter unavailable")) from None
+            raise
         finally:
             value.clear()
-        if result.returncode:
-            item["state"] = "failed"
-            raise HTTPException(422, detail=error("secret_set_rejected", "secret setter rejected the value"))
         item["state"] = "set"
         item["expires_at"] = time.monotonic() + SECRET_REQUEST_TTL_SECONDS
         return ok(_public_secret_request(item))

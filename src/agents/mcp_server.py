@@ -455,6 +455,12 @@ def managed_secret_set_status(request_id: str) -> Any:
 
 
 @mcp.tool
+def set_managed_secret(name: str, value: str) -> Any:
+    """Set a managed secret for this execution's active assignment. The value is written to the encrypted store by the trusted setter (piped to stdin, never argv); the response returns only non-secret status."""
+    return _request("POST", "/secrets", {"name": name, "value": value})
+
+
+@mcp.tool
 def get_assignment() -> Any:
     return _request("GET", "/assignment")
 

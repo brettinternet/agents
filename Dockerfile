@@ -16,7 +16,7 @@ ARG AGENTS_UID=1000
 ARG AGENTS_GID=1000
 ARG TARGETARCH
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl git tini util-linux \
+    && apt-get install -y --no-install-recommends ca-certificates curl git procps tini util-linux \
     && rm -rf /var/lib/apt/lists/* \
     && case "${TARGETARCH:-$(uname -m)}" in \
          arm64|aarch64) herdr_arch=aarch64; herdr_sha=f55610658e1c2e0d2aaef730b4b2ab885f7f8ba00285ab372bfb14f2e3d5b40d ;; \
@@ -86,5 +86,25 @@ CMD ["agents","service","foreground"]
 
 FROM agent-base AS secrets
 USER root
+ARG TARGETARCH
+RUN set -eux; \
+    case "${TARGETARCH:-$(uname -m)}" in \
+      arm64|aarch64) age_arch=arm64; age_sha=c6878a324421b69e3e20b00ba17c04bc5c6dab0030cfe55bf8f68fa8d9e9093a; sops_arch=arm64; sops_sha=53b0abacd38ef1b12a66d6c100956691b9cefce018d91f81e73ddf7438b94d77; varlock_arch=arm64; varlock_sha=08ea40fdca2ffeb7bb0afe6f47813bab43298c1ce897f07e013aae2649bfc01a ;; \
+      amd64|x86_64) age_arch=amd64; age_sha=bdc69c09cbdd6cf8b1f333d372a1f58247b3a33146406333e30c0f26e8f51377; sops_arch=amd64; sops_sha=e5bec3346a873ae91d871550f3e698c1aad962aff462a080e40f25fde17fef6b; varlock_arch=x64; varlock_sha=9b0ee1a7d42469c27dbfa284fa4337eb02c39c259198f36c5b127d5c3fb7a89d ;; \
+      *) echo "unsupported target architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSLo /tmp/age.tar.gz "https://github.com/FiloSottile/age/releases/download/v1.3.1/age-v1.3.1-linux-${age_arch}.tar.gz"; \
+    echo "${age_sha}  /tmp/age.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/age.tar.gz -C /tmp; \
+    install -m 0555 /tmp/age/age /tmp/age/age-keygen /usr/local/bin/; \
+    curl -fsSLo /usr/local/bin/sops "https://github.com/getsops/sops/releases/download/v3.13.3/sops-v3.13.3.linux.${sops_arch}"; \
+    echo "${sops_sha}  /usr/local/bin/sops" | sha256sum -c -; \
+    chmod 0555 /usr/local/bin/sops; \
+    curl -fsSLo /tmp/varlock.tar.gz "https://github.com/dmno-dev/varlock/releases/download/varlock%401.17.0/varlock-linux-${varlock_arch}.tar.gz"; \
+    echo "${varlock_sha}  /tmp/varlock.tar.gz" | sha256sum -c -; \
+    mkdir /tmp/varlock-dist; \
+    tar -xzf /tmp/varlock.tar.gz -C /tmp/varlock-dist; \
+    install -m 0555 /tmp/varlock-dist/varlock /tmp/varlock-dist/varlock-local-encrypt /usr/local/bin/; \
+    rm -rf /tmp/age /tmp/age.tar.gz /tmp/varlock-dist /tmp/varlock.tar.gz
 ENTRYPOINT ["/usr/bin/tini","--"]
 CMD ["agents-secrets-broker"]

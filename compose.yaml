@@ -118,9 +118,10 @@ services:
       AGENTS_BROKER_CHILD_UID: ${AGENTS_UID}
       AGENTS_BROKER_CHILD_GID: ${AGENTS_GID}
       AGENTS_BROKER_SECRETS_ROOT: /run/agents-secrets
-      AGENTS_BROKER_ENV_SCHEMA: /run/agents-secrets/env-schema
-      AGENTS_BROKER_DB_PATH: /run/agents-secrets/agents.db
-      AGENTS_BROKER_AUTH_KEY_PATH: /run/agents-secrets/agent-auth-key
+      AGENTS_BROKER_ENV_SCHEMA: /run/agents-secrets/.env.schema
+      AGENTS_BROKER_WORKTREE: /run/agents-secrets
+      AGENTS_BROKER_DB_PATH: /run/agents-state/agents.db
+      AGENTS_BROKER_AUTH_KEY_PATH: /run/agents-state/agent-auth-key
     cap_drop:
       - ALL
     cap_add:
@@ -155,7 +156,11 @@ services:
         read_only: true
       - type: bind
         source: ${AGENTS_ENV_SCHEMA_PATH}
-        target: /run/agents-secrets/env-schema
+        target: /run/agents-secrets/.env.schema
+        read_only: true
+      - type: bind
+        source: ${AGENTS_ENV_LOCAL_PATH}
+        target: /run/agents-secrets/.env.local
         read_only: true
       - type: bind
         source: ${AGENTS_SOPS_CONFIG_PATH}
@@ -173,12 +178,8 @@ services:
         source: ${AGENTS_SECRET_STORE_PATH}
         target: /run/agents-secrets/store
       - type: bind
-        source: ${AGENTS_REPO_PATH}/.agents/agents.db
-        target: /run/agents-secrets/agents.db
-        read_only: true
-      - type: bind
-        source: ${AGENTS_REPO_PATH}/.agents/agent-auth-key
-        target: /run/agents-secrets/agent-auth-key
+        source: ${AGENTS_REPO_PATH}/.agents
+        target: /run/agents-state
         read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev

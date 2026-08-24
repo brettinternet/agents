@@ -314,7 +314,7 @@ def start(config: AgentsConfig) -> None:
         if not agentsd_owned:
             agentsd = config.root / ".venv" / "bin" / "agentsd"
             if not agentsd.is_file() or not os.access(agentsd, os.X_OK):
-                raise ServiceError("required managed executable is not installed: agentsd")
+                raise ServiceError(f"required managed executable is not installed: {agentsd}")
             agentsd_process = _launch_process(config, "agentsd", agentsd, [], _herdr_environment(config))
 
         deadline = time.monotonic() + 30
@@ -670,7 +670,9 @@ def shutdown(config: AgentsConfig, client: Any | None = None) -> None:
         try:
             rows = list(
                 connection.execute(
-                    "SELECT * FROM terminal_runs WHERE execution_name LIKE ? ORDER BY id", (f"{prefix}%",)
+                    "SELECT * FROM terminal_runs WHERE execution_name LIKE ? "
+                    "AND state IN ('reserved','creating','live','retained','ending') ORDER BY id",
+                    (f"{prefix}%",),
                 )
             )
             connection.execute(

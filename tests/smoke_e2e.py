@@ -20,6 +20,7 @@ import uuid
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 import httpx
 
@@ -36,7 +37,11 @@ from agents.db import connect, migrate
 from agents.reconciler import bootstrap_persistent_agents
 from agents.store import Store
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = (
+    Path(os.environ["AGENTS_CONFIG"]).resolve().parent
+    if os.environ.get("AGENTS_SYSTEM_CONTAINER") == "1"
+    else Path(__file__).resolve().parents[1]
+)
 FIXTURE_BIN = ROOT / "tests" / "fixtures" / "bin"
 TOOL_HOME = Path.home()
 ORIGIN_URL = "git@github.com:brettinternet/agents.git"
@@ -68,8 +73,8 @@ def _config_file(source: Path, destination: Path, web_port: int, isolation: str 
     text = text.replace("poll_seconds = 5", "poll_seconds = 1")
     text = text.replace('provider = "opencode"', 'provider = "mock"')
     text = re.sub(r"(?m)^port = \d+$", f"port = {web_port}", text, count=1)
+    text = re.sub(r'(?m)^isolation = "(?:host|container)"$', f'isolation = "{isolation}"', text, count=1)
     if isolation == "container":
-        text = text.replace('isolation = "host"', 'isolation = "container"')
         text = text.replace('image = "agents-agent-opencode:local"', 'image = "agents-agent-mock:local"')
     destination.write_text(text, encoding="utf-8")
     destination.chmod(0o600)
@@ -161,6 +166,7 @@ def _assert_container_boundary(config: AgentsConfig) -> None:
         }
         cwd = str(Path(str(row["working_directory"])).resolve())
         runtime_dir = str((config.state_dir / "runtime" / str(row["agent_auth_id"])).resolve())
+        has_git_dir = (Path(cwd) / ".git").is_dir()
         if binds != {cwd: cwd, runtime_dir: runtime_dir}:
             raise SmokeFailure("container boundary", f"{name} has an unexpected bind mount")
         sentinel = f"agents-{instance[:12]}-network-smoke"
@@ -192,7 +198,7 @@ def _assert_container_boundary(config: AgentsConfig) -> None:
                     "import os,socket,urllib.request\n"
                     f"urllib.request.urlopen('http://host.docker.internal:{config.web.port}/health',timeout=2).read()\n"
                     "urllib.request.urlopen('https://example.com/',timeout=5).read(1)\n"
-                    f"assert os.path.isdir({cwd!r}+'/.git')\n"
+                    f"assert os.path.isdir({cwd!r}+'/.git') is {has_git_dir!r}\n"
                     f"assert not os.path.exists({str(config.root / '.env.sops-age')!r})\n"
                     f"assert not os.path.exists({str(config.root / '.sops-isolated-home')!r})\n"
                     "assert 'SSH_AUTH_SOCK' not in os.environ\n"
@@ -365,7 +371,7 @@ def _isolated_environment(config_path: Path, home: Path, xdg: Path) -> Iterator[
         os.environ.update(old)
 
 
-def _prepare_runtime(runtime: Path, config_path: Path) -> AgentsConfig:
+def _prepare_runtime(runtime: Path, config_path: Path, smoke_instance: str | None = None) -> AgentsConfig:
     (runtime / "agents").mkdir(parents=True)
     for profile in (ROOT / "agents").glob("*.md"):
         shutil.copy2(profile, runtime / "agents" / profile.name)
@@ -431,6 +437,9 @@ def _prepare_runtime(runtime: Path, config_path: Path) -> AgentsConfig:
     try:
         migrate(connection)
         Store(connection).initialize(config)
+        if smoke_instance:
+            connection.execute("UPDATE project SET instance_id=? WHERE id=1", (smoke_instance,))
+            connection.commit()
         bootstrap_persistent_agents(connection, config)
     finally:
         connection.close()
@@ -538,14 +547,25 @@ def _cleanup(config: AgentsConfig | None) -> list[str]:
     return errors
 
 
-def run(isolation: str = "host") -> None:
+def run(isolation: str = "host", smoke_instance: str = "") -> None:
     config: AgentsConfig | None = None
-    parent = ROOT if isolation == "container" else Path("/tmp")
+    parent = ROOT if isolation == "container" or os.environ.get("AGENTS_SYSTEM_CONTAINER") == "1" else Path("/tmp")
+    original_initialize = ContainerRuntime.initialize
+
+    def initialize_fixture(runtime: ContainerRuntime, _repository: Path, instance: str, api_port: int) -> None:
+        original_initialize(runtime, ROOT, instance, api_port)
+
+    runtime_context = (
+        mock.patch.object(ContainerRuntime, "initialize", initialize_fixture)
+        if isolation == "container"
+        else contextlib.nullcontext()
+    )
     with (
         tempfile.TemporaryDirectory(
             prefix=".agents-smoke-" if isolation == "container" else "agents-smoke-", dir=parent
         ) as temporary,
         tempfile.TemporaryDirectory(prefix="agents-smoke-home-", dir="/tmp") as private_temporary,
+        runtime_context,
     ):
         runtime = Path(temporary)
         project = runtime / "project"
@@ -562,7 +582,7 @@ def run(isolation: str = "host") -> None:
             config_path.read_text(encoding="utf-8").replace('path = "."', 'path = "project"'), encoding="utf-8"
         )
         with _isolated_environment(config_path, home, xdg):
-            config = _prepare_runtime(runtime, config_path)
+            config = _prepare_runtime(runtime, config_path, smoke_instance or None)
             persistent_agent_count = sum(
                 1 for actor in config.actors if actor["kind"] == "agent" and actor.get("persistent")
             )
@@ -849,9 +869,10 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", choices=("herdr",), default="herdr")
     parser.add_argument("--isolation", choices=("host", "container"), default="host")
+    parser.add_argument("--instance", default="")
     args = parser.parse_args()
     try:
-        run(args.isolation)
+        run(args.isolation, args.instance)
     except SmokeFailure as exc:
         print(f"[smoke] FAIL {exc}", file=sys.stderr, flush=True)
         return 1

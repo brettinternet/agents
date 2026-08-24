@@ -104,9 +104,16 @@ def _secret_source_environment(config: AgentsConfig, provider: str, auth_file: P
     if not broker_config.exists():
         broker_config.write_text(config.source.read_text(encoding="utf-8"), encoding="utf-8")
         broker_config.chmod(0o600)
+    broker_local = auth_file.parent / f"{auth_file.name}-broker.env"
+    if broker_local.is_symlink():
+        raise ContainerCommandError("broker environment path is unsafe")
+    if not broker_local.exists():
+        broker_local.write_text("", encoding="utf-8")
+        broker_local.chmod(0o600)
     common = {
         "AGENTS_BROKER_CONFIG_PATH": str(broker_config),
         "AGENTS_ENV_SCHEMA_PATH": str(config.root / ".env.schema"),
+        "AGENTS_ENV_LOCAL_PATH": str(broker_local),
         "AGENTS_SOPS_CONFIG_PATH": str(config.root / ".sops.yaml"),
     }
     if provider != "mock":
@@ -127,6 +134,9 @@ def _secret_source_environment(config: AgentsConfig, provider: str, auth_file: P
         "# @defaultSensitive=false @defaultRequired=false\n# ---\n# @sensitive\nTEST_SECRET=\n",
         encoding="utf-8",
     )
+    local = worktree / ".env.local"
+    local.write_text("", encoding="utf-8")
+    local.chmod(0o600)
     from .secret_store import Paths, init_store, set_secret_value
 
     paths = Paths(
@@ -309,7 +319,14 @@ def _recover_dead_topology(config: AgentsConfig) -> None:
     directory = config.state_dir / "runtime" / "system-auth"
     if not directory.is_dir() or directory.is_symlink():
         return
-    candidates = [candidate for candidate in directory.iterdir() if candidate.is_file() and not candidate.is_symlink()]
+    candidates = [
+        candidate
+        for candidate in directory.iterdir()
+        if candidate.is_file()
+        and not candidate.is_symlink()
+        and len(candidate.name) == 32
+        and all(character in "0123456789abcdef" for character in candidate.name)
+    ]
     if candidates:
         raise ContainerCommandError("whole-system credential files exist without provably dead ownership records")
 
@@ -560,28 +577,22 @@ def smoke(config: AgentsConfig, topology: str = "system") -> None:
             "/bin/true",
             image_id,
         )
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            smoke_port = int(probe.getsockname()[1])
-        instance = _instance(config)
-        runtime.initialize(_mount_root(config), instance, smoke_port)
         environment = dict(os.environ)
-        environment["AGENTS_SMOKE_API_PORT"] = str(smoke_port)
-        try:
-            _completed(
-                (
-                    sys.executable,
-                    "-m",
-                    "tests.smoke_e2e",
-                    "--backend",
-                    "herdr",
-                    "--isolation",
-                    "container",
-                ),
-                env=environment,
-            )
-        finally:
-            runtime.initialize(_mount_root(config), instance, config.web.port)
+        environment["AGENTS_SMOKE_API_PORT"] = str(config.web.port)
+        _completed(
+            (
+                sys.executable,
+                "-m",
+                "tests.smoke_e2e",
+                "--backend",
+                "herdr",
+                "--isolation",
+                "container",
+                "--instance",
+                _instance(config),
+            ),
+            env=environment,
+        )
         return
 
     runtime_init(config)
@@ -608,6 +619,8 @@ def smoke(config: AgentsConfig, topology: str = "system") -> None:
         "exec",
         "--env",
         "AGENTS_SECRETS_TRANSPORT=",
+        "--env",
+        f"PYTHONPATH={config.root / 'src'}",
         agents_name,
         "/opt/agents/.venv/bin/python",
         "-m",
@@ -807,6 +820,7 @@ def _verify_system_topology(config: AgentsConfig, *, exercise_janitor: bool = Tr
         for mount in agents.get("Mounts", [])
         if isinstance(mount, dict)
     }
+    agent_tmpfs = agents.get("HostConfig", {}).get("Tmpfs", {})
     for masked in (config.root / ".env.sops-age", config.root / "agent-secrets.sops.json"):
         if agent_mounts.get(str(masked)) != ("bind", "/dev/null"):
             raise ContainerCommandError(f"whole-system Agents service exposes secret identity path {masked}")
@@ -816,7 +830,7 @@ def _verify_system_topology(config: AgentsConfig, *, exercise_janitor: bool = Tr
         Path("/home/agents/.local/share/opencode"),
         Path("/home/agents/bin"),
     ):
-        if agent_mounts.get(str(private_tmpfs), ("", ""))[0] != "tmpfs":
+        if str(private_tmpfs) not in agent_tmpfs and agent_mounts.get(str(private_tmpfs), ("", ""))[0] != "tmpfs":
             raise ContainerCommandError(f"whole-system private path is not tmpfs-backed: {private_tmpfs}")
     secrets = services["secrets"]
     secrets_network = secrets.get("NetworkSettings", {}).get("Networks", {}).get("agents-system", {})
@@ -827,7 +841,9 @@ def _verify_system_topology(config: AgentsConfig, *, exercise_janitor: bool = Tr
         for mount in secrets.get("Mounts", [])
         if isinstance(mount, dict)
     }
-    if secret_mounts.get(str(config.root / ".agents")) != "tmpfs":
+    secret_tmpfs = secrets.get("HostConfig", {}).get("Tmpfs", {})
+    control_plane = str(config.root / ".agents")
+    if control_plane not in secret_tmpfs and secret_mounts.get(control_plane) != "tmpfs":
         raise ContainerCommandError("whole-system secret broker exposes the repository control plane")
     runtime.docker(
         "exec",
@@ -849,7 +865,11 @@ def _verify_system_topology(config: AgentsConfig, *, exercise_janitor: bool = Tr
     if len(volumes) != 1:
         raise ContainerCommandError("whole-system persistent Herdr volume identity is ambiguous")
     if exercise_janitor:
-        before = set(names.splitlines())
+        before = {
+            service_names[service_name]
+            for service_name, inspect in services.items()
+            if inspect.get("State", {}).get("Running")
+        }
         _remove_stopped_topology_containers(config)
         after = set(
             runtime.docker(

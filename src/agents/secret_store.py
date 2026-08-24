@@ -83,8 +83,10 @@ def resolve_paths(cwd: Path | None = None) -> Paths:
     broker_root = os.environ.get("AGENTS_BROKER_SECRETS_ROOT")
     if broker_root:
         private = Path(broker_root).resolve(strict=True)
+        broker_worktree = os.environ.get("AGENTS_BROKER_WORKTREE")
+        worktree = Path(broker_worktree).resolve(strict=True) if broker_worktree else current
         return Paths(
-            worktree=current,
+            worktree=worktree,
             common_root=private,
             config=private / "sops-config",
             store=private / "store",

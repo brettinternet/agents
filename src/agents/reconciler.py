@@ -176,6 +176,19 @@ def _reserve_terminal_unchecked(
     return dict(connection.execute("SELECT * FROM terminal_runs WHERE id=?", (run_id,)).fetchone())
 
 
+def _raise_incident(connection: sqlite3.Connection, kind: str, entity_kind: str, entity_id: str, summary: str) -> None:
+    if connection.execute(
+        "SELECT 1 FROM incidents WHERE kind=? AND entity_kind=? AND entity_id=? AND state='open'",
+        (kind, entity_kind, entity_id),
+    ).fetchone():
+        return
+    now = utc_now()
+    connection.execute(
+        "INSERT INTO incidents(kind,entity_kind,entity_id,severity,state,summary,details_json,created_at,updated_at)VALUES(?,?,?,'high','open',?,'{}',?,?)",
+        (kind, entity_kind, entity_id, summary, now, now),
+    )
+
+
 def bootstrap_persistent_agents(connection: sqlite3.Connection, config: AgentsConfig) -> list[int]:
     reserved: list[int] = []
     actors = connection.execute("SELECT slug FROM actors WHERE kind='agent' AND persistent=1 ORDER BY slug")
@@ -187,15 +200,29 @@ def bootstrap_persistent_agents(connection: sqlite3.Connection, config: AgentsCo
             (actor,),
         ).fetchone():
             continue
+        # Only count recent failures (rolling window, mirrors the launch budget below):
+        # a lifetime-cumulative counter would eventually and permanently lock every
+        # persistent actor out of relaunch after enough ordinary failures over weeks
+        # of operation, with no visible signal and no way to recover automatically.
+        since = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
         attempts = connection.execute(
             "SELECT COUNT(*) total,"
-            "COUNT(*) FILTER (WHERE error IS NULL OR ("
-            "error NOT LIKE 'CAO terminal working directory mismatch:%' "
-            "AND error NOT LIKE 'transient Herdr cutover:%')) relevant "
-            "FROM terminal_runs WHERE actor_slug=? AND purpose_kind='persistent'",
-            (actor,),
+            "COUNT(*) FILTER (WHERE error IS NOT NULL "
+            "AND error NOT LIKE 'CAO terminal working directory mismatch:%' "
+            "AND error NOT LIKE 'transient Herdr cutover:%') relevant "
+            "FROM terminal_runs WHERE actor_slug=? AND purpose_kind='persistent' "
+            "AND state IN ('ended','failed') AND updated_at>=?",
+            (actor, since),
         ).fetchone()
         if attempts["relevant"] >= 3 or attempts["total"] >= 12:
+            _raise_incident(
+                connection,
+                "persistent_agent_relaunch_suspended",
+                "persistent",
+                actor,
+                f"{actor} had {attempts['relevant']} relevant / {attempts['total']} total terminal failures "
+                "in the last hour; pausing relaunch until the failure rate drops",
+            )
             continue
         run = reserve_terminal(
             connection,
@@ -1680,13 +1707,4 @@ class Reconciler:
             self._incident("worktree_cleanup_failed", "worktree", "global", str(exc))
 
     def _incident(self, kind: str, entity_kind: str, entity_id: str, summary: str) -> None:
-        if self.connection.execute(
-            "SELECT 1 FROM incidents WHERE kind=? AND entity_kind=? AND entity_id=? AND state='open'",
-            (kind, entity_kind, entity_id),
-        ).fetchone():
-            return
-        now = utc_now()
-        self.connection.execute(
-            "INSERT INTO incidents(kind,entity_kind,entity_id,severity,state,summary,details_json,created_at,updated_at)VALUES(?,?,?,'high','open',?,'{}',?,?)",
-            (kind, entity_kind, entity_id, summary, now, now),
-        )
+        _raise_incident(self.connection, kind, entity_kind, entity_id, summary)

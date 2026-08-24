@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -447,6 +448,67 @@ class ReconcilerTests(unittest.IsolatedAsyncioTestCase):
                     ",".join("?" for _ in reserved)
                 ),
                 tuple(reserved),
+            ).fetchone()
+        )
+
+    def test_bootstrap_suspends_and_raises_incident_on_recent_relevant_failures(self):
+        for _ in range(3):
+            run = self.reserve()
+            now = utc_now()
+            self.connection.execute(
+                "UPDATE terminal_runs SET state='failed',error=?,token_revoked_at=?,updated_at=? WHERE id=?",
+                ("boom: crashed immediately", now, now, run["id"]),
+            )
+            self.connection.execute(
+                "UPDATE launch_attempts SET state='failed',updated_at=? WHERE terminal_run_id=?",
+                (now, run["id"]),
+            )
+            self.connection.execute(
+                "UPDATE actor_leases SET released_at=? WHERE terminal_run_id=?",
+                (now, run["id"]),
+            )
+        reserved = bootstrap_persistent_agents(self.connection, self.config)
+        self.assertFalse(
+            self.connection.execute(
+                "SELECT 1 FROM terminal_runs WHERE id IN ({}) AND actor_slug='manager'".format(
+                    ",".join("?" for _ in reserved)
+                ),
+                tuple(reserved),
+            ).fetchone()
+        )
+        incident = self.connection.execute(
+            "SELECT state,entity_id FROM incidents WHERE kind='persistent_agent_relaunch_suspended'"
+        ).fetchone()
+        self.assertIsNotNone(incident)
+        self.assertEqual((incident["state"], incident["entity_id"]), ("open", "manager"))
+
+    def test_bootstrap_recovers_once_relevant_failures_age_out_of_window(self):
+        stale = (datetime.now(UTC) - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+        for _ in range(3):
+            run = self.reserve()
+            self.connection.execute(
+                "UPDATE terminal_runs SET state='failed',error=?,token_revoked_at=?,updated_at=? WHERE id=?",
+                ("boom: crashed immediately", stale, stale, run["id"]),
+            )
+            self.connection.execute(
+                "UPDATE launch_attempts SET state='failed',updated_at=? WHERE terminal_run_id=?",
+                (stale, run["id"]),
+            )
+            self.connection.execute(
+                "UPDATE actor_leases SET released_at=? WHERE terminal_run_id=?",
+                (stale, run["id"]),
+            )
+        reserved = bootstrap_persistent_agents(self.connection, self.config)
+        replacement = self.connection.execute(
+            "SELECT generation,state FROM terminal_runs WHERE id IN ({}) AND actor_slug='manager'".format(
+                ",".join("?" for _ in reserved)
+            ),
+            tuple(reserved),
+        ).fetchone()
+        self.assertEqual(tuple(replacement), (4, "reserved"))
+        self.assertIsNone(
+            self.connection.execute(
+                "SELECT 1 FROM incidents WHERE kind='persistent_agent_relaunch_suspended'"
             ).fetchone()
         )
 

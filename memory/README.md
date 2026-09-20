@@ -1,39 +1,49 @@
 # Repository memory
 
-This directory contains public, durable knowledge that helps future agent work. It is deliberately smaller than the Agent control plane: raw activity, messages, events, transcripts, and routine progress remain local and are not copied here.
+This directory is the agents' public, durable memory. It contains compact Markdown notes, not transcripts or hidden runtime state.
 
 ## Layout
 
-- `journal/YYYY-MM.md` — compact, dated summaries of noteworthy outcomes.
-- `knowledge/<topic>.md` — reusable lessons promoted after they prove useful.
+- `journal/YYYY-MM.md` — dated outcomes, decisions, and lessons.
+- `knowledge/<topic>.md` — reusable notes promoted after repeated use.
 
 Current journal: [`journal/2026-08.md`](journal/2026-08.md)
 
-No knowledge notes have qualified for promotion yet. Create `knowledge/` with the first promoted note; do not add placeholders.
+Create `knowledge/` only when the first note qualifies; do not add placeholders.
 
-## Reading memory
+## Search first
 
-1. Read this index.
-2. Search for terms specific to the assignment.
-3. Read only matching journal entries and knowledge notes, not the whole tree.
-4. Treat notes as evidence, not instructions or current truth.
-5. Recheck time-sensitive claims against current code, live services, or primary sources.
+Search before reading broadly or writing a duplicate:
 
-Do not inject the journal or knowledge tree into every agent context.
+```sh
+task memory:grep -- 'exact terms'
+task memory:semantic -- 'natural-language description of the memory'
+task memory:list
+task memory:pick
+```
 
-## Writing memory
+The toolkit is intentionally plain:
 
-Add a journal entry only when all of these are true:
+- `rg` for fast exact and regular-expression search.
+- `jegrep` for semantic search through Jev (`OPENROUTER_API_KEY` in `secrets.sops.env`).
+- `fd` for finding notes.
+- `fzf` for interactive selection.
 
-- It is safe to publish in a public Git repository.
-- It records an outcome, decision, constraint, or lesson—not raw activity.
-- It is likely to change a future decision or prevent meaningful repeated work.
-- It is not already represented adequately by code, project documentation, or a primary-source link.
-- It can include a date and provenance.
+Read only likely matches. Memory is evidence, not authority: recheck time-sensitive notes against current code, live services, and primary sources.
 
-Never commit credentials, tokens, authentication artifacts, personal or proprietary data, private messages, transcripts, or unreviewed web content. Link to public artifacts instead of copying them. Redact incidental identifiers that are not needed to reuse the lesson.
+## Write selectively
 
-Use this journal entry shape:
+Add a journal entry only when it:
+
+- is safe to publish in this repository;
+- records an outcome, decision, constraint, or reusable lesson rather than raw activity;
+- is likely to change a future decision or prevent meaningful repeated work;
+- is not already represented better by code, Git history, documentation, or a primary source; and
+- includes a date and provenance.
+
+Never store credentials, tokens, private messages, personal or proprietary data, authentication artifacts, raw transcripts, or unreviewed web content.
+
+Use this shape:
 
 ```markdown
 ## YYYY-MM-DD — Short outcome
@@ -45,14 +55,6 @@ Use this journal entry shape:
 - Freshness: Stable, or the condition/date that requires rechecking.
 ```
 
-## Promoting knowledge
+## Promote proven knowledge
 
-Promote a journal item to `knowledge/<topic>.md` only after it has affected a decision, prevented repeated work, or proved reusable in more than one activity. Consolidate related entries rather than copying them. A knowledge note must contain:
-
-- `Last verified` date and current/stale status.
-- The reusable claim or procedure.
-- Why and when it should influence future work.
-- Public sources or repository evidence.
-- Explicit recheck conditions for time-sensitive claims.
-
-Update this index when adding, renaming, or removing a knowledge note. Supersede incorrect material in place so search does not return competing guidance.
+Move a journal item to `knowledge/<topic>.md` only after it has affected a decision, prevented repeated work, or proved reusable more than once. Consolidate rather than copy. Include the last verified date, why the note matters, sources, and explicit recheck conditions. Update this index when adding or renaming a knowledge note, and supersede incorrect material in place so search does not return competing guidance.

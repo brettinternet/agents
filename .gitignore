@@ -1,28 +1,14 @@
-node_modules/
-.robot-witness.json
 .DS_Store
-.worktrees
-AGENTS.local.md
-Taskfile.yaml
-
-# local state and secrets
-.env
+.agents/
 .env.local
 .env.sops-age
-.sops-isolated-home/
-.agents/
+.pi-data/
 .tools/
-.worktrees/*
 .venv/
-.pytest_cache/
-.mypy_cache/
-.pyright/
-.ruff_cache/
 __pycache__/
-*.py[cod]
 *.log
-.DS_Store
-
-# Generated/materialized profiles
-profiles/
-agent-profiles/
+.pi/git/
+.pi/npm/
+.pi/package-lock.json
+.worktrees/
+Taskfile.yaml

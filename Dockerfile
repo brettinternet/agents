@@ -1,110 +1,62 @@
-# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
-ARG PYTHON_IMAGE=ghcr.io/astral-sh/uv:python3.14-bookworm-slim@sha256:7cf77f594be8042dab6daa9fe326f90962252268b4f120a7f5dccce4d947e6c1
-ARG BUN_IMAGE=oven/bun:1.3.14@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4
+# syntax=docker/dockerfile:1.7
+FROM node:24-trixie-slim
 
-FROM alpine:3.23@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40 AS task
-ARG TASK_VERSION=3.52.0
-ARG TASK_SHA256=7e0044108830cec0534577b289564e3b7c83e6df276feb631a1edc63d04e4ebe
-RUN wget -q "https://github.com/go-task/task/releases/download/v${TASK_VERSION}/task_linux_arm64.tar.gz" -O /tmp/task.tgz \
-    && echo "${TASK_SHA256}  /tmp/task.tgz" | sha256sum -c - \
-    && tar -xzf /tmp/task.tgz -C /usr/local/bin task \
-    && chmod 0555 /usr/local/bin/task
-FROM ${BUN_IMAGE} AS bun
-
-FROM ${PYTHON_IMAGE} AS agent-base
-ARG AGENTS_UID=1000
-ARG AGENTS_GID=1000
+ARG AGENT_UID=1000
+ARG AGENT_GID=1000
 ARG TARGETARCH
+ARG PI_VERSION=0.86.1
+ARG SOPS_VERSION=3.13.3
+ARG AGE_VERSION=1.3.1
+ARG JEGREP_VERSION=0.1.0
+
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl git procps tini util-linux \
-    && rm -rf /var/lib/apt/lists/* \
-    && case "${TARGETARCH:-$(uname -m)}" in \
-         arm64|aarch64) herdr_arch=aarch64; herdr_sha=f55610658e1c2e0d2aaef730b4b2ab885f7f8ba00285ab372bfb14f2e3d5b40d ;; \
-         amd64|x86_64) herdr_arch=x86_64; herdr_sha=976150a14d490c94b243ea2e1a7eb2dfb67f12e36b182db90936f6728e6aecf4 ;; \
-         *) echo "unsupported target architecture: ${TARGETARCH:-$(uname -m)}" >&2; exit 1 ;; \
-       esac \
-    && curl -fsSL "https://github.com/herdrdev/herdr/releases/download/v0.8.2/herdr-linux-${herdr_arch}" \
-         -o /usr/local/bin/herdr \
-    && echo "${herdr_sha}  /usr/local/bin/herdr" | sha256sum -c - \
-    && chmod 0555 /usr/local/bin/herdr \
-    && if ! getent group "${AGENTS_GID}" >/dev/null; then groupadd --gid "${AGENTS_GID}" agents; fi \
-    && existing_user="$(getent passwd "${AGENTS_UID}" | cut -d: -f1 || true)" \
-    && if [ -z "${existing_user}" ]; then \
-         useradd --uid "${AGENTS_UID}" --gid "${AGENTS_GID}" --home-dir /home/agents --create-home agents; \
-       elif [ "${existing_user}" != agents ]; then \
-         usermod --login agents --home /home/agents --move-home --gid "${AGENTS_GID}" "${existing_user}"; \
-       fi \
-    && install -d -o "${AGENTS_UID}" -g "${AGENTS_GID}" /home/agents
-COPY --from=task /usr/local/bin/task /usr/local/bin/task
-WORKDIR /opt/agents
-COPY pyproject.toml uv.lock ./
-COPY src ./src
-COPY agents ./agents
-COPY agents.toml .env.schema Taskfile.dist.yaml ./
-COPY tests ./tests
-RUN uv sync --frozen --no-dev
-ENV PATH=/opt/agents/.venv/bin:/opt/agents/bin:/usr/local/bin:/usr/bin:/bin \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-COPY container/ /opt/agents/bin/
-RUN chmod 0555 /opt/agents/bin/*
-USER ${AGENTS_UID}:${AGENTS_GID}
-ENTRYPOINT ["/usr/bin/tini","--"]
+    && apt-get install -y --no-install-recommends \
+      bash ca-certificates curl fd-find fzf git gh jq less nano procps ripgrep tini wget \
+    && ln -s /usr/bin/fdfind /usr/local/bin/fd \
+    && rm -rf /var/lib/apt/lists/*
 
-FROM agent-base AS agent-opencode
-USER root
-COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
-RUN BUN_INSTALL=/usr/local bun install --global opencode-ai@1.18.21
-USER agents
-CMD ["opencode"]
-
-FROM agent-base AS agent-claude
-USER root
-COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
-RUN BUN_INSTALL=/usr/local bun install --global @anthropic-ai/claude-code@2.1.229
-USER agents
-CMD ["claude"]
-
-FROM agent-base AS agent-mock
-USER root
-COPY tests/fixtures/bin/mock_cli /usr/local/bin/mock_cli
-RUN chmod 0555 /usr/local/bin/mock_cli
-USER agents
-CMD ["mock_cli"]
-
-FROM agent-opencode AS system-opencode
-WORKDIR /workspace
-CMD ["agents","service","foreground"]
-
-FROM agent-claude AS system-claude
-WORKDIR /workspace
-CMD ["agents","service","foreground"]
-
-FROM agent-mock AS system-mock
-WORKDIR /workspace
-CMD ["agents","service","foreground"]
-
-FROM agent-base AS secrets
-USER root
-ARG TARGETARCH
 RUN set -eux; \
-    case "${TARGETARCH:-$(uname -m)}" in \
-      arm64|aarch64) age_arch=arm64; age_sha=c6878a324421b69e3e20b00ba17c04bc5c6dab0030cfe55bf8f68fa8d9e9093a; sops_arch=arm64; sops_sha=53b0abacd38ef1b12a66d6c100956691b9cefce018d91f81e73ddf7438b94d77; varlock_arch=arm64; varlock_sha=08ea40fdca2ffeb7bb0afe6f47813bab43298c1ce897f07e013aae2649bfc01a ;; \
-      amd64|x86_64) age_arch=amd64; age_sha=bdc69c09cbdd6cf8b1f333d372a1f58247b3a33146406333e30c0f26e8f51377; sops_arch=amd64; sops_sha=e5bec3346a873ae91d871550f3e698c1aad962aff462a080e40f25fde17fef6b; varlock_arch=x64; varlock_sha=9b0ee1a7d42469c27dbfa284fa4337eb02c39c259198f36c5b127d5c3fb7a89d ;; \
-      *) echo "unsupported target architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    case "${TARGETARCH:-$(dpkg --print-architecture)}" in \
+      arm64) \
+        age_arch=arm64; \
+        age_sha=c6878a324421b69e3e20b00ba17c04bc5c6dab0030cfe55bf8f68fa8d9e9093a; \
+        sops_arch=arm64; \
+        sops_sha=53b0abacd38ef1b12a66d6c100956691b9cefce018d91f81e73ddf7438b94d77; \
+        jegrep_target=aarch64-unknown-linux-gnu; \
+        jegrep_sha=3712bd5ffd079f46d7d1aff6d62bf3f6acda88f9a0234c8ab77b04d21a358bc4 ;; \
+      amd64) \
+        age_arch=amd64; \
+        age_sha=bdc69c09cbdd6cf8b1f333d372a1f58247b3a33146406333e30c0f26e8f51377; \
+        sops_arch=amd64; \
+        sops_sha=e5bec3346a873ae91d871550f3e698c1aad962aff462a080e40f25fde17fef6b; \
+        jegrep_target=x86_64-unknown-linux-gnu; \
+        jegrep_sha=c860c1d5d7f657e5222136b2211b398d4183dae7feccda29d19f7439818ca64d ;; \
+      *) echo "unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
-    curl -fsSLo /tmp/age.tar.gz "https://github.com/FiloSottile/age/releases/download/v1.3.1/age-v1.3.1-linux-${age_arch}.tar.gz"; \
+    curl -fsSLo /tmp/age.tar.gz "https://github.com/FiloSottile/age/releases/download/v${AGE_VERSION}/age-v${AGE_VERSION}-linux-${age_arch}.tar.gz"; \
     echo "${age_sha}  /tmp/age.tar.gz" | sha256sum -c -; \
     tar -xzf /tmp/age.tar.gz -C /tmp; \
     install -m 0555 /tmp/age/age /tmp/age/age-keygen /usr/local/bin/; \
-    curl -fsSLo /usr/local/bin/sops "https://github.com/getsops/sops/releases/download/v3.13.3/sops-v3.13.3.linux.${sops_arch}"; \
+    curl -fsSLo /usr/local/bin/sops "https://github.com/getsops/sops/releases/download/v${SOPS_VERSION}/sops-v${SOPS_VERSION}.linux.${sops_arch}"; \
     echo "${sops_sha}  /usr/local/bin/sops" | sha256sum -c -; \
     chmod 0555 /usr/local/bin/sops; \
-    curl -fsSLo /tmp/varlock.tar.gz "https://github.com/dmno-dev/varlock/releases/download/varlock%401.17.0/varlock-linux-${varlock_arch}.tar.gz"; \
-    echo "${varlock_sha}  /tmp/varlock.tar.gz" | sha256sum -c -; \
-    mkdir /tmp/varlock-dist; \
-    tar -xzf /tmp/varlock.tar.gz -C /tmp/varlock-dist; \
-    install -m 0555 /tmp/varlock-dist/varlock /tmp/varlock-dist/varlock-local-encrypt /usr/local/bin/; \
-    rm -rf /tmp/age /tmp/age.tar.gz /tmp/varlock-dist /tmp/varlock.tar.gz
-ENTRYPOINT ["/usr/bin/tini","--"]
-CMD ["agents-secrets-broker"]
+    curl -fsSLo /tmp/jegrep.tar.gz "https://github.com/can1357/jegrep/releases/download/v${JEGREP_VERSION}/jegrep-v${JEGREP_VERSION}-${jegrep_target}.tar.gz"; \
+    echo "${jegrep_sha}  /tmp/jegrep.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/jegrep.tar.gz -C /tmp; \
+    install -m 0555 "/tmp/jegrep-v${JEGREP_VERSION}-${jegrep_target}/jegrep" /usr/local/bin/jegrep; \
+    rm -rf /tmp/age /tmp/age.tar.gz "/tmp/jegrep-v${JEGREP_VERSION}-${jegrep_target}" /tmp/jegrep.tar.gz
+
+RUN npm install -g --ignore-scripts "@earendil-works/pi-coding-agent@${PI_VERSION}"
+
+RUN if ! getent group "${AGENT_GID}" >/dev/null; then groupadd --gid "${AGENT_GID}" agent; fi \
+    && useradd --uid "${AGENT_UID}" --gid "${AGENT_GID}" --create-home --home-dir /home/agent agent \
+    && install -d -o "${AGENT_UID}" -g "${AGENT_GID}" /home/agent/.pi/agent
+
+ENV HOME=/home/agent \
+    PI_CODING_AGENT_DIR=/home/agent/.pi/agent \
+    SOPS_AGE_KEY_FILE=/workspace/.env.sops-age \
+    SOPS_DECRYPTION_ORDER=age
+
+WORKDIR /workspace
+USER agent
+ENTRYPOINT ["/usr/bin/tini", "--", "sops", "exec-env", "--same-process", "/workspace/secrets.sops.env", "pi --approve"]

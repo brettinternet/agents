@@ -1,166 +1,67 @@
 # Agents
 
-Agents is a local control plane for running a durable, observable team of AI agents who don't really do anything other than browse the web and poke around the internet. They're not very productive, but they're curious.
+A small, containerized [Pi](https://pi.dev) environment for agents that browse the internet, use explicitly provided accounts, and maintain searchable Markdown memory.
 
-## Demo
+There is no dashboard, scheduler, database, message bus, or agent control plane. Pi runs directly in one Docker container with the repository mounted at `/workspace`.
 
-![Agents board showing the live control plane, agent roster, work queues, and task preview](docs/assets/agents-board.webp)
+## Included
 
-| Durable task details                                                                                                                  | Human decision workflow                                                                                           |
-| ------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| ![Task detail view with acceptance criteria, consultations, submissions, checks, reviews, and blockers](docs/assets/task-detail.webp) | ![Human decision dialog with a recommendation and structured resolution options](docs/assets/human-decision.webp) |
+- Pi with [`brettinternet/pi-extensions`](https://github.com/brettinternet/pi-extensions)
+- Internet tools: `curl`, `wget`, Git, GitHub CLI, and `jq`
+- Memory search: [`jegrep`](https://github.com/can1357/jegrep), `rg`, `fd`, and `fzf`
+- SOPS + age for a committed encrypted environment file
+- The durable Markdown memory in [`memory/`](memory/README.md)
 
-## Run
+## Start
 
-Requires [mise](https://mise.jdx.dev/) and Git.
+Requires [mise](https://mise.jdx.dev), Docker, and Git.
 
 ```sh
 task init
+task agent
 ```
 
-`task init` installs dependencies, initializes state, runs the selected Herdr
-provider integration, and starts the Agents web server plus the owned Herdr
-socket service. Open `http://127.0.0.1:9890`. Run `task dashboard` to print the
-login token's path.
+`task init` installs the small host toolchain, creates private local directories, verifies the encrypted secret store, and builds the image. The first Pi session asks you to authenticate a model provider unless its credentials are already in the encrypted environment.
+
+The repository is mounted read/write. Pi settings, installed extensions, sessions, and provider logins are kept in the ignored `.pi-data/` directory.
+
+## Secrets and accounts
+
+`secrets.sops.env` is committed ciphertext. `.env.sops-age` is its ignored local age identity and must be backed up separately. The container can read that identity and decrypt the whole environment: SOPS protects secrets in Git and at rest, **not from the agent**. Only put accounts in this store when the agent is allowed to use them.
+
+Add or change values:
 
 ```sh
-task server:status  # Show agentsd and Herdr ownership
-task server:start   # Start (or reuse) the owned Herdr and Agents services
-task server:stop    # Stop agentsd; retain Herdr panes and processes
-task doctor         # Check prerequisites, socket schema, and ownership
-task check          # Run formatting, lint, and type checks
-task check:staged   # Run the pre-commit checks against staged files
-task fix            # Format and autofix project files
-task test           # Run tests
-task smoke          # Run the isolated direct-Herdr delivery smoke test
-task shutdown       # Fence runs, remove artifacts, close workspaces, and delete the session
-```
-
-## Documentation
-
-- [Operator documentation](docs/README.md)
-
-The tracked `Taskfile.dist.yaml` is Task's default project taskfile; a local
-`Taskfile.yaml` may override it without being committed.
-Configure the project, runtime, local Herdr execution backend, web server, and
-agent roster in `agents.toml`. Varlock uses two environment files:
-
-| File          | Git       | Purpose                                       |
-| ------------- | --------- | --------------------------------------------- |
-| `.env.schema` | committed | Optional override contract and secret marking |
-| `.env.local`  | ignored   | Local overrides and encrypted secret values   |
-
-`task init` installs every pinned mise tool—including SOPS and age—creates and
-validates `.env.local`, initializes and validates the agent secret store,
-installs Lefthook, and initializes Agents. Set non-secret overrides directly in
-`.env.local`. For a fixed web login token, use
-`AGENTS_WEB_TOKEN=varlock(prompt)`, then run `task env:check` to store the
-device-encrypted value. Use `task env:run -- <command>` for direct commands that
-need these overrides and `task env:lock` to lock the local encryption session.
-
-### Agent-managed secrets
-
-The shared agent secret store is separate from the operator/runtime values in
-`.env.local`:
-
-| File                      | Git       | Purpose                                                                 |
-| ------------------------- | --------- | ----------------------------------------------------------------------- |
-| `.sops.yaml`              | committed | Restricts SOPS creation to the agent store and its repository recipient |
-| `agent-secrets.sops.json` | committed | SOPS ciphertext for agent-managed environment values                    |
-| `.env.sops-age`           | ignored   | Host-local age identity; raw identity data, never dotenv syntax         |
-| `.sops-isolated-home/`    | ignored   | Private SOPS home isolated from user and system identities              |
-
-`task init` creates `.env.sops-age` when initializing a repository that does not
-yet contain a secret store. If committed config or ciphertext already exists
-but the local identity is missing, initialization fails closed. Restore the
-matching `.env.sops-age`, then rerun `task init`; initialization never rotates
-the recipient or rewrites ciphertext with a replacement.
-
-To add a value, first declare the same name with `# @sensitive` in
-`.env.schema`. Then run the setter in a private TTY and enter the value at its
-hidden prompt:
-
-```sh
-task secrets:set -- SERVICE_TOKEN
-```
-
-The Enter key terminates hidden-prompt input and is not part of the value. For
-exact or noninteractive input, start the command with a private non-TTY stdin
-channel and write the value through the transient control plane. Non-TTY input
-is exact, including any trailing newline. Never place the value in shell command
-text, arguments, environment assignments, or files. Other operations:
-
-CAO work agents request the same operation with Agent MCP
-`request_managed_secret_set`, passing only the declared name. The dashboard then
-shows a private one-shot form for the operator-provided value. That raw body is
-held only long enough to pipe it to `task secrets:set`; it does not enter agent
-tool arguments, terminal input, SQLite, messages, events, logs, or retry state.
-The agent can poll non-secret completion with `managed_secret_set_status`.
-
-```sh
-task secrets:list
+task secrets:edit
 task secrets:check
-task secrets:run -- SERVICE_TOKEN OTHER_TOKEN -- command arg
-task secrets:reveal -- SERVICE_TOKEN
-task secrets:unset -- SERVICE_TOKEN
 ```
 
-Prefer `secrets:run`, which injects only the explicitly selected managed values
-and uses Varlock to redact command output. Reserve `secrets:reveal` for login
-surfaces that cannot consume environment variables. Necessary discovery or
-reveal output is transient private control-plane data: do not echo it
-deliberately or retain it in tracked files, command arguments, messages,
-durable logs, or durable memory. Persistent
-MCP-only sessions request a work item rather than bypassing the command
-boundary. Commit only `.sops.yaml` and ciphertext—never the identity, isolated
-home, or plaintext.
+Run a host command with the decrypted environment:
 
-See the [SOPS documentation](https://getsops.io/docs/) for age identity
-behavior and [Varlock load and run](https://varlock.dev/reference/cli/load-and-run)
-for schema validation and output redaction.
-
-## Model selection
-
-Set one model for every new execution:
-
-```toml
-[execution]
-model = "openai/gpt-5"
-effort = "high"
+```sh
+task secrets:run -- gh auth status
+task secrets:run -- curl https://api.example.com/me
 ```
 
-Or choose a model/effort pair uniformly when each execution is reserved:
+`OPENROUTER_API_KEY` enables `jegrep`. Provider variables such as `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` are also available to Pi when present. Never commit `.env.sops-age` or plaintext secret files.
 
-```toml
-[execution]
-models = [
-  { id = "openai/gpt-5", effort = "high" },
-  { id = "openai/gpt-5", effort = "medium" },
-  { id = "anthropic/claude-sonnet-4-6" },
-]
+## Memory
+
+Memory is ordinary Markdown so agents can read and edit it directly.
+
+```sh
+task memory:list
+task memory:grep -- 'search terms'
+task memory:semantic -- 'where did we decide how credentials work?'
+task memory:pick
 ```
 
-An agent actor can override the global choice or pool:
+Read [`memory/README.md`](memory/README.md) before adding durable memory. Commit useful, public-safe memories with the repository; do not store credentials, private messages, or raw transcripts.
 
-```toml
-[[actors]]
-slug = "manager"
-kind = "agent"
-models = [
-  { id = "openai/gpt-5", effort = "high" },
-]
+## Other tasks
 
-[[actors]]
-slug = "researcher"
-kind = "agent"
-models = [
-  { id = "openai/gpt-5-mini", effort = "medium" },
-  { id = "anthropic/claude-sonnet-4-6" },
-]
+```sh
+task container:build
+task shell
+task check
 ```
-
-Actor choices take precedence over `[execution]`; actors without choices use the
-global configuration. The selected pair is persisted for the execution, so
-retries never re-roll it. `effort` is available only with the OpenCode
-provider. `AGENTS_MODEL` and optional `AGENTS_EFFORT` override every actor and
-either TOML form with one fixed choice.

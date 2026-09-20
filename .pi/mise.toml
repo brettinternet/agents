@@ -1,0 +1,4 @@
+# Optional sandbox tools live here. Agents may add pinned tools when a task
+# requires them. Boot-critical tools remain pinned in Dockerfile.
+[tools]
+bun = "1.3.14"

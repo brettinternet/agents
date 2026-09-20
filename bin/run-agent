@@ -1,0 +1,38 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -eq 1 ]; then
+  prompt_file=$1
+elif [ "$#" -eq 0 ] && [ -n "${AGENT_PROMPT_FILE:-}" ]; then
+  prompt_file=$AGENT_PROMPT_FILE
+else
+  echo "usage: run-agent PROMPT_FILE" >&2
+  exit 2
+fi
+if [ ! -f "$prompt_file" ]; then
+  echo "prompt file not found: $prompt_file" >&2
+  exit 2
+fi
+
+prompt_name=$(basename "$prompt_file" .md)
+run_prefix=$(date -u +%Y%m%dT%H%M%SZ)-${prompt_name}
+run_dir=$(mktemp -d "/workspace/.pi-data/runs/${run_prefix}.XXXXXX")
+run_id=$(basename "$run_dir")
+run_timeout=${AGENT_RUN_TIMEOUT:-6h}
+
+set +e
+PI_CODING_AGENT_SESSION_DIR=/workspace/.pi-data/sessions/scheduled \
+  timeout --signal=TERM --kill-after=30s "$run_timeout" \
+  pi --approve --print "$(cat "$prompt_file")" >"$run_dir/output.md" 2>"$run_dir/error.log"
+exit_code=$?
+set -e
+
+{
+  printf 'run_id=%s\n' "$run_id"
+  printf 'prompt=%s\n' "$prompt_file"
+  printf 'finished_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf 'timeout=%s\n' "$run_timeout"
+  printf 'exit_code=%s\n' "$exit_code"
+} >"$run_dir/status"
+
+exit "$exit_code"

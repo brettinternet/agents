@@ -1,0 +1,25 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -eq 0 ] && [ -z "${WEB_SEARCH_QUERY:-}" ]; then
+  echo "usage: web-search QUERY" >&2
+  exit 2
+fi
+if [ -z "${BRAVE_SEARCH_API_KEY:-}" ]; then
+  echo "BRAVE_SEARCH_API_KEY is required" >&2
+  exit 2
+fi
+
+if [ "$#" -gt 0 ]; then
+  query=$*
+else
+  query=$WEB_SEARCH_QUERY
+fi
+encoded_query=$(printf '%s' "$query" | jq -sRr @uri)
+count=${WEB_SEARCH_COUNT:-10}
+
+curl -fsS \
+  -H 'Accept: application/json' \
+  -H "X-Subscription-Token: ${BRAVE_SEARCH_API_KEY}" \
+  "https://api.search.brave.com/res/v1/web/search?q=${encoded_query}&count=${count}" \
+  | jq -r '.web.results[]? | [.title, .url, (.description // "")] | @tsv'

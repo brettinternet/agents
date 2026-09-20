@@ -1,20 +1,23 @@
 services:
-  agent:
+  sandbox:
     build:
       context: .
       args:
         AGENT_UID: ${AGENT_UID:-1000}
         AGENT_GID: ${AGENT_GID:-1000}
     image: agents-pi:local
-    init: true
-    stdin_open: true
-    tty: true
+    restart: unless-stopped
     working_dir: /workspace
     environment:
       HOME: /home/agent
       PI_CODING_AGENT_DIR: /home/agent/.pi/agent
+      MISE_CONFIG_FILE: /workspace/.pi/mise.toml
+      MISE_IGNORED_CONFIG_PATHS: /workspace/mise.toml
+      MISE_DATA_DIR: /workspace/.tools/mise
       SOPS_AGE_KEY_FILE: /workspace/.env.sops-age
       SOPS_DECRYPTION_ORDER: age
+      WORKLEASE_HOME: /workspace/.pi-data/worklease
+      TZ: UTC
     volumes:
       - .:/workspace
       - ./.pi-data:/home/agent/.pi/agent

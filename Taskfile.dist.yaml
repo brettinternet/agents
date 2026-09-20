@@ -4,6 +4,7 @@ version: "3"
 
 vars:
   SOPS_ENV: SOPS_AGE_KEY_FILE={{.ROOT_DIR}}/.env.sops-age SOPS_DECRYPTION_ORDER=age
+  COMPOSE_ENV: AGENT_UID=$(id -u) AGENT_GID=$(id -g)
 
 tasks:
   default:
@@ -12,25 +13,69 @@ tasks:
     cmd: task --list
 
   init:
-    desc: Install tools, prepare local state, verify secrets, and build the agent
+    desc: Install host tools, prepare state, verify secrets, and build the sandbox
     cmds:
       - mise install
-      - mkdir -p .pi-data
-      - chmod 700 .pi-data
+      - mkdir -p .pi-data/browser .pi-data/runs .pi-data/sessions .pi-data/worklease .tools/mise
+      - chmod 700 .pi-data .pi-data/worklease .tools
       - task: secrets:check
       - task: container:build
+      - task: sandbox:start
 
   agent:
-    desc: Start Pi with the decrypted agent environment
-    cmd: AGENT_UID=$(id -u) AGENT_GID=$(id -g) docker compose run --rm agent
+    desc: Start the sandbox and attach to its persistent Pi tmux session
+    deps: [sandbox:start]
+    cmd: docker compose exec sandbox /workspace/bin/attach-agent
+
+  agent:status:
+    desc: Show the sandbox and Pi tmux session status
+    cmds:
+      - docker compose ps sandbox
+      - docker compose exec -T sandbox sh -c 'tmux list-sessions 2>/dev/null || echo "no Pi tmux session"'
+
+  agent:stop:
+    desc: Stop the active Pi tmux session without stopping the sandbox
+    cmd: docker compose exec -T sandbox tmux kill-session -t pi
 
   shell:
-    desc: Open a shell in the agent image without decrypting secrets
-    cmd: AGENT_UID=$(id -u) AGENT_GID=$(id -g) docker compose run --rm --entrypoint bash agent
+    desc: Open an interactive shell in the running sandbox
+    deps: [sandbox:start]
+    cmd: docker compose exec sandbox bash
+
+  sandbox:start:
+    desc: Start the named long-running sandbox service
+    cmds:
+      - mkdir -p .pi-data/browser .pi-data/runs .pi-data/sessions .pi-data/worklease .tools/mise
+      - chmod 700 .pi-data .pi-data/worklease .tools
+      - "{{.COMPOSE_ENV}} docker compose up -d sandbox"
+
+  sandbox:stop:
+    desc: Stop the sandbox while preserving sessions and state
+    cmd: docker compose stop sandbox
+
+  sandbox:logs:
+    desc: Follow scheduler and scheduled-job logs
+    cmd: docker compose logs --follow sandbox
 
   container:build:
-    desc: Build the Pi agent image
-    cmd: AGENT_UID=$(id -u) AGENT_GID=$(id -g) docker compose build
+    desc: Build the Pi sandbox image
+    cmd: "{{.COMPOSE_ENV}} docker compose build sandbox"
+
+  scheduler:reload:
+    desc: Ask Supercronic to reload jobs/crontab
+    cmd: docker compose kill --signal USR2 sandbox
+
+  job:run:
+    desc: Run one reviewed prompt file immediately in a fresh Pi session
+    deps: [sandbox:start]
+    env:
+      AGENT_PROMPT_FILE: '{{join " " .CLI_ARGS_LIST}}'
+    cmd: docker compose exec -T -e AGENT_PROMPT_FILE sandbox /workspace/bin/run-agent
+
+  tools:install:
+    desc: Install agent-owned optional tools from .pi/mise.toml
+    deps: [sandbox:start]
+    cmd: docker compose exec -T sandbox mise install --yes
 
   secrets:check:
     desc: Verify that the local age identity decrypts the committed environment
@@ -44,17 +89,27 @@ tasks:
     desc: Run a host command with all managed secrets in its environment
     cmd: "{{.SOPS_ENV}} sops exec-env --same-process secrets.sops.env '{{.CLI_ARGS}}'"
 
+  web:search:
+    desc: Search the public web through the Brave Search API
+    env:
+      WEB_SEARCH_QUERY: '{{join " " .CLI_ARGS_LIST}}'
+    cmd: "{{.SOPS_ENV}} sops exec-env secrets.sops.env 'bin/web-search'"
+
   memory:list:
     desc: List Markdown memory files
     cmd: fd --type f --extension md . memory
 
   memory:grep:
     desc: Search memory text with ripgrep
-    cmd: rg --smart-case {{.CLI_ARGS}} memory
+    env:
+      MEMORY_QUERY: '{{join " " .CLI_ARGS_LIST}}'
+    cmd: rg --smart-case -- "$MEMORY_QUERY" memory
 
   memory:semantic:
     desc: Search memory semantically with jegrep and Jev
-    cmd: "{{.SOPS_ENV}} sops exec-env secrets.sops.env 'jegrep {{.CLI_ARGS}} memory'"
+    env:
+      MEMORY_QUERY: '{{join " " .CLI_ARGS_LIST}}'
+    cmd: "{{.SOPS_ENV}} sops exec-env secrets.sops.env 'jegrep \"$MEMORY_QUERY\" memory'"
 
   memory:pick:
     desc: Interactively choose a memory file
@@ -65,8 +120,14 @@ tasks:
     cmds:
       - task: secrets:check
       - docker compose config --quiet
+      - test -x bin/attach-agent
+      - test -x bin/run-agent
+      - test -x bin/web-search
       - test -f .pi/settings.json
+      - test -f .pi/mise.toml
+      - test -f jobs/crontab
       - test -f memory/README.md
+      - test -f results/README.md
       - test ! -d src
       - test ! -d tests
       - test ! -d docs

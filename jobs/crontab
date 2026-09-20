@@ -1,0 +1,7 @@
+# Schedules use UTC. Keep this file empty until the operator explicitly
+# authorizes a prompt, account, venue, cadence, and stopping condition.
+#
+# Example research-only schedule:
+# 0 9 * * * /workspace/bin/run-agent /workspace/jobs/prompts/example-research.md
+#
+# Reload after edits with: task scheduler:reload

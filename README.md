@@ -1,18 +1,21 @@
 # Agents
 
-A small, containerized [Pi](https://pi.dev) environment for agents that browse the internet, use explicitly provided accounts, and maintain searchable Markdown memory.
+A small, persistent [Pi](https://pi.dev) sandbox for long-running internet research, explicitly authorized account actions, public-safe results, and durable Markdown memory.
 
-There is no dashboard, scheduler, database, message bus, or agent control plane. Pi runs directly in one Docker container with the repository mounted at `/workspace`.
+There is no dashboard, database-backed control plane, message bus, or agent hierarchy. One named Docker Compose service runs standard container tools: Supercronic for reviewed schedules and tmux for an attachable Pi session.
 
 ## Included
 
-- Pi with [`brettinternet/pi-extensions`](https://github.com/brettinternet/pi-extensions)
-- Internet tools: `curl`, `wget`, Git, GitHub CLI, and `jq`
+- Pi with [`brettinternet/pi-extensions`](https://github.com/brettinternet/pi-extensions), including `/loop`
+- An attachable, persistent tmux session
+- [Supercronic](https://github.com/aptible/supercronic) for optional reviewed schedules
+- [Worklease](https://github.com/brettinternet/worklease) for cooperative account, browser-profile, and workspace leases
+- Internet tools: Brave Search helper, `curl`, `wget`, Git, GitHub CLI, and `jq`
 - Memory search: [`jegrep`](https://github.com/can1357/jegrep), `rg`, `fd`, and `fzf`
-- SOPS + age for a committed encrypted environment file
-- The durable Markdown memory in [`memory/`](memory/README.md)
+- SOPS + age for a committed encrypted environment
+- Agent-owned optional tools in [`.pi/mise.toml`](.pi/mise.toml)
 
-## Start
+## Start and attach
 
 Requires [mise](https://mise.jdx.dev), Docker, and Git.
 
@@ -21,13 +24,43 @@ task init
 task agent
 ```
 
-`task init` installs the small host toolchain, creates private local directories, verifies the encrypted secret store, and builds the image. The first Pi session asks you to authenticate a model provider unless its credentials are already in the encrypted environment.
+`task init` installs the host tools, prepares ignored state, builds the image, and starts the named `sandbox` service. `task agent` creates or attaches to the `pi` tmux session inside that service.
 
-The repository is mounted read/write. Pi settings, installed extensions, sessions, and provider logins are kept in the ignored `.pi-data/` directory.
+Detach without stopping Pi using `Ctrl-b d`. Reattach later with `task agent`. Pi sessions, provider logins, raw runs, Worklease state, and optional installed tools survive under ignored `.pi-data/` and `.tools/`.
+
+```sh
+task agent:status
+task agent:stop       # explicitly ends the Pi tmux session
+task shell            # shell in the running sandbox
+task sandbox:logs
+task sandbox:stop
+```
+
+The repository is mounted read/write at `/workspace`. The container has internet access but no published ports, Docker socket, or host home mount.
+
+## Results and memory
+
+Public-safe task deliverables go in [`results/`](results/README.md). Raw output and private evidence go in ignored `.pi-data/runs/`. Durable reusable knowledge goes in [`memory/`](memory/README.md) only when it meets the memory policy.
+
+With `BRAVE_SEARCH_API_KEY` in `secrets.sops.env`, search the public web from the host or sandbox:
+
+```sh
+task web:search -- 'public research query'
+sops exec-env secrets.sops.env 'bin/web-search "public research query"'
+```
+
+Memory search remains local:
+
+```sh
+task memory:list
+task memory:grep -- 'search terms'
+task memory:semantic -- 'where did we decide how credentials work?'
+task memory:pick
+```
 
 ## Secrets and accounts
 
-`secrets.sops.env` is committed ciphertext. `.env.sops-age` is its ignored local age identity and must be backed up separately. The container can read that identity and decrypt the whole environment: SOPS protects secrets in Git and at rest, **not from the agent**. Only put accounts in this store when the agent is allowed to use them.
+`secrets.sops.env` is committed ciphertext. `.env.sops-age` is its ignored local age identity and must be backed up separately. The sandbox can read that identity, so SOPS protects secrets in Git and at rest, **not from the agent**.
 
 Add or change values:
 
@@ -43,25 +76,58 @@ task secrets:run -- gh auth status
 task secrets:run -- curl https://api.example.com/me
 ```
 
-`OPENROUTER_API_KEY` enables `jegrep`. Provider variables such as `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` are also available to Pi when present. Never commit `.env.sops-age` or plaintext secret files.
-
-## Memory
-
-Memory is ordinary Markdown so agents can read and edit it directly.
+The sandbox and tmux server start without decrypted values. An agent decrypts only around a command that needs them:
 
 ```sh
-task memory:list
-task memory:grep -- 'search terms'
-task memory:semantic -- 'where did we decide how credentials work?'
-task memory:pick
+sops exec-env secrets.sops.env 'command args'
 ```
 
-Read [`memory/README.md`](memory/README.md) before adding durable memory. Commit useful, public-safe memories with the repository; do not store credentials, private messages, or raw transcripts.
+`OPENROUTER_API_KEY` enables `jegrep`, and `BRAVE_SEARCH_API_KEY` enables `bin/web-search`. Pi provider login can be stored in persistent `.pi-data`; API-key providers can instead be supplied explicitly through SOPS. All values in the encrypted file are exposed to a process launched with `sops exec-env`.
 
-## Other tasks
+## Long-running loops
+
+Use `/loop` inside the attached Pi session for bounded repeated work. tmux protects it from terminal disconnects, but not from host or container failure. Reconcile external state before resuming any loop that may already have posted, messaged, or otherwise changed a service.
+
+When concurrent work could use the same account or browser profile, coordinate it with Worklease:
+
+```sh
+worklease instructions safety
+worklease instructions loop
+worklease acquire --resource account:forum-main --session "$PI_LOOP_RUN_ID" --ttl 30m
+worklease exec --session "$PI_LOOP_RUN_ID" -- command args
+worklease release --session "$PI_LOOP_RUN_ID" --reason done
+```
+
+Worklease is cooperative coordination, not a secret-access boundary or an exactly-once guarantee.
+
+## Scheduled jobs
+
+Supercronic watches [`jobs/crontab`](jobs/crontab) in UTC. No job is enabled by default. See [`jobs/README.md`](jobs/README.md) before adding one.
+
+Run a reviewed prompt manually before scheduling it:
+
+```sh
+task job:run -- jobs/prompts/example-research.md
+task scheduler:reload
+task sandbox:logs
+```
+
+The host and sandbox must be running when a schedule becomes due. There is no missed-run catch-up. Use host `launchd` or another host scheduler to start a stopped sandbox when that behavior is required.
+
+## Agent-owned tools
+
+Boot-critical tools are pinned in `Dockerfile`. Agents may add pinned optional tools to `.pi/mise.toml`, then install them into ignored `.tools/mise/`:
+
+```sh
+mise install --yes   # inside the sandbox
+task tools:install   # from the host
+```
+
+Mutable mise installs are never run automatically at sandbox startup.
+
+## Validation
 
 ```sh
 task container:build
-task shell
 task check
 ```

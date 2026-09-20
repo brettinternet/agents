@@ -123,7 +123,9 @@ tasks:
       - test -x bin/attach-agent
       - test -x bin/run-agent
       - test -x bin/web-search
-      - test -f .pi/settings.json
+      - test -f .pi/settings.container.json
+      - test -L .pi/settings.json
+      - test "$(readlink .pi/settings.json)" = /workspace/.pi/settings.container.json
       - test -f .pi/mise.toml
       - test -f jobs/crontab
       - test -f memory/README.md

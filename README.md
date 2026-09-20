@@ -24,7 +24,7 @@ task init
 task agent
 ```
 
-`task init` installs the host tools, prepares ignored state, builds the image, and starts the named `sandbox` service. `task agent` creates or attaches to the `pi` tmux session inside that service.
+`task init` installs the host tools, prepares ignored state, builds the image, and starts the named `sandbox` service. `task agent` creates or attaches to the `pi` tmux session inside that service. `.pi/settings.json` points to the container-only `/workspace/.pi/settings.container.json`, keeping its Linux-installed Pi extensions isolated from host Pi.
 
 Detach without stopping Pi using `Ctrl-b d`. Reattach later with `task agent`. Pi sessions, provider logins, raw runs, Worklease state, and optional installed tools survive under ignored `.pi-data/` and `.tools/`.
 

@@ -48,7 +48,7 @@ tasks:
   sandbox:start:
     desc: Start the named long-running sandbox service
     cmds:
-      - mkdir -p .pi-data/browser .pi-data/herdr .pi-data/runs .pi-data/sessions .pi-data/worklease .tools/mise
+      - mkdir -p .pi-data/browser .pi-data/runs .pi-data/sessions .pi-data/worklease .tools/mise
       - chmod 700 .pi-data .pi-data/worklease .tools
       - "{{.COMPOSE_ENV}} docker compose up -d sandbox"
 

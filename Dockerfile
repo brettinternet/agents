@@ -100,7 +100,7 @@ RUN if ! getent group "${AGENT_GID}" >/dev/null; then groupadd --gid "${AGENT_GI
        elif [ "${existing_user}" != agent ]; then \
          usermod --login agent --home /home/agent --move-home --gid "${AGENT_GID}" "${existing_user}"; \
        fi \
-    && install -d -o "${AGENT_UID}" -g "${AGENT_GID}" /home/agent/.pi/agent
+    && install -d -o "${AGENT_UID}" -g "${AGENT_GID}" /home/agent/.pi/agent /home/agent/.config/herdr
 
 ENV HOME=/home/agent \
     PI_CODING_AGENT_DIR=/home/agent/.pi/agent \

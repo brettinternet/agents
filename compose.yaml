@@ -21,10 +21,13 @@ services:
     volumes:
       - .:/workspace
       - ./.pi-data:/home/agent/.pi/agent
-      - ./.pi-data/herdr:/home/agent/.config/herdr
+      - herdr-state:/home/agent/.config/herdr
       - ./.herdr/config.toml:/home/agent/.config/herdr/config.toml:ro
       - ./.pi/keybindings.container.json:/home/agent/.pi/agent/keybindings.json:ro
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
+
+volumes:
+  herdr-state:

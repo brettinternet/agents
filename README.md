@@ -27,7 +27,7 @@ task agent
 
 `task init` installs the host tools and Git hooks, prepares ignored state, builds the image, and starts the named `sandbox` service. `task agent` creates or attaches to the `agents` Herdr session inside that service. Every new Herdr pane starts a configured Pi runtime; use workspaces, tabs, and splits to run several concurrently. `.pi/settings.json` points to the container-only `/workspace/.pi/settings.container.json`, keeping its Linux-installed Pi extensions isolated from host Pi.
 
-Detach without stopping Pi using `Ctrl-b q`. Reattach later with `task agent`. Herdr layout state, Pi sessions, provider logins, raw runs, Worklease state, and optional installed tools survive under ignored `.pi-data/` and `.tools/`. The live Codex view uses `Ctrl+L`; the container remaps Pi's model selector to `Alt+P`.
+Detach without stopping Pi using `Ctrl-b q`. Reattach later with `task agent`. Herdr layout state survives in the `herdr-state` Docker volume; Pi sessions, provider logins, raw runs, and Worklease state survive under ignored `.pi-data/`, with optional installed tools under `.tools/`. The live Codex view uses `Ctrl+L`; the container remaps Pi's model selector to `Alt+P`.
 
 The committed [`.herdr/config.toml`](.herdr/config.toml) controls the sandbox UI and pane defaults. Edit it and run `task agent:reload` to apply reloadable options. Print the complete option reference with `herdr --default-config` inside `task shell`.
 

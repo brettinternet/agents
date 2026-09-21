@@ -2,4 +2,4 @@
 set -eu
 
 session_name=${PI_TMUX_SESSION:-pi}
-exec tmux new-session -A -s "$session_name" "pi --approve"
+exec tmux -u new-session -A -s "$session_name" "pi --approve"

@@ -1,3 +1,4 @@
 {
-  "app.model.select": "alt+p"
+  "app.model.select": "alt+p",
+  "app.tree.filter.labeledOnly": "ctrl+shift+l"
 }

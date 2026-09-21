@@ -1,0 +1,21 @@
+# Committed Herdr configuration for the sandbox.
+# Edit this file and run `task agent:reload` to apply reloadable changes.
+# Print all available options with `herdr --default-config`.
+
+[terminal]
+# The sandbox is dedicated to Pi; every new Herdr pane starts another runtime.
+default_shell = "/workspace/bin/start-pi"
+shell_mode = "non_login"
+new_cwd = "follow"
+
+[ui]
+# Workspace names distinguish concurrent Pi tasks in the sidebar.
+prompt_new_workspace_name = true
+
+[session]
+# Resume integration-reported Pi conversations after a Herdr server restart.
+resume_agents_on_restore = true
+
+[experimental]
+# Terminal history may contain prompts, command output, or credentials.
+pane_history = false

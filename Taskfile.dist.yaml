@@ -22,19 +22,23 @@ tasks:
       - task: sandbox:start
 
   agent:
-    desc: Start the sandbox and attach to its persistent Pi tmux session
+    desc: Start the sandbox and attach to its persistent Herdr session
     deps: [sandbox:start]
     cmd: docker compose exec sandbox /workspace/bin/attach-agent
 
   agent:status:
-    desc: Show the sandbox and Pi tmux session status
+    desc: Show the sandbox, Herdr server, and active Pi runtimes
     cmds:
       - docker compose ps sandbox
-      - docker compose exec -T sandbox sh -c 'tmux list-sessions 2>/dev/null || echo "no Pi tmux session"'
+      - docker compose exec -T sandbox sh -c 'herdr --session agents status server && herdr --session agents agent list || echo "no agents Herdr session"'
+
+  agent:reload:
+    desc: Reload the committed Herdr configuration
+    cmd: docker compose exec -T sandbox herdr --session agents server reload-config
 
   agent:stop:
-    desc: Stop the active Pi tmux session without stopping the sandbox
-    cmd: docker compose exec -T sandbox tmux kill-session -t pi
+    desc: Stop all interactive Pi runtimes without stopping the sandbox
+    cmd: docker compose exec -T sandbox herdr session stop agents
 
   shell:
     desc: Open an interactive shell in the running sandbox
@@ -44,7 +48,7 @@ tasks:
   sandbox:start:
     desc: Start the named long-running sandbox service
     cmds:
-      - mkdir -p .pi-data/browser .pi-data/runs .pi-data/sessions .pi-data/worklease .tools/mise
+      - mkdir -p .pi-data/browser .pi-data/herdr .pi-data/runs .pi-data/sessions .pi-data/worklease .tools/mise
       - chmod 700 .pi-data .pi-data/worklease .tools
       - "{{.COMPOSE_ENV}} docker compose up -d sandbox"
 
@@ -122,10 +126,11 @@ tasks:
       - docker compose config --quiet
       - test -x bin/attach-agent
       - test -x bin/run-agent
+      - test -x bin/start-pi
       - test -x bin/web-search
       - test -f .pi/settings.container.json
       - test -f .pi/keybindings.container.json
-      - test -f .tmux.conf
+      - test -f .herdr/config.toml
       - test -L .pi/settings.json
       - test "$(readlink .pi/settings.json)" = /workspace/.pi/settings.container.json
       - test -f .pi/mise.toml

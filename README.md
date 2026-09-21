@@ -2,12 +2,12 @@
 
 A small, persistent [Pi](https://pi.dev) sandbox for long-running internet research, explicitly authorized account actions, public-safe results, and durable Markdown memory.
 
-There is no dashboard, database-backed control plane, message bus, or agent hierarchy. One named Docker Compose service runs standard container tools: Supercronic for reviewed schedules and tmux for an attachable Pi session.
+There is no dashboard, database-backed control plane, message bus, or agent hierarchy. One named Docker Compose service runs standard container tools: Supercronic for reviewed schedules and Herdr for attachable concurrent Pi sessions.
 
 ## Included
 
 - Pi with [`brettinternet/pi-extensions`](https://github.com/brettinternet/pi-extensions), including `/loop`
-- An attachable, persistent tmux session
+- An attachable, persistent [Herdr](https://herdr.dev) session for concurrent Pi runtimes
 - [Supercronic](https://github.com/aptible/supercronic) for optional reviewed schedules
 - [Worklease](https://github.com/brettinternet/worklease) for cooperative account, browser-profile, and workspace leases
 - Internet tools: Brave Search helper, `curl`, `wget`, Git, GitHub CLI, and `jq`
@@ -25,14 +25,17 @@ task init
 task agent
 ```
 
-`task init` installs the host tools and Git hooks, prepares ignored state, builds the image, and starts the named `sandbox` service. `task agent` creates or attaches to the `pi` tmux session inside that service. `.pi/settings.json` points to the container-only `/workspace/.pi/settings.container.json`, keeping its Linux-installed Pi extensions isolated from host Pi.
+`task init` installs the host tools and Git hooks, prepares ignored state, builds the image, and starts the named `sandbox` service. `task agent` creates or attaches to the `agents` Herdr session inside that service. Every new Herdr pane starts a configured Pi runtime; use workspaces, tabs, and splits to run several concurrently. `.pi/settings.json` points to the container-only `/workspace/.pi/settings.container.json`, keeping its Linux-installed Pi extensions isolated from host Pi.
 
-Detach without stopping Pi using `Ctrl-b d`. Reattach later with `task agent`. Pi sessions, provider logins, raw runs, Worklease state, and optional installed tools survive under ignored `.pi-data/` and `.tools/`. The live Codex view uses `Ctrl+L`; the container remaps Pi's model selector to `Alt+P`.
+Detach without stopping Pi using `Ctrl-b q`. Reattach later with `task agent`. Herdr layout state, Pi sessions, provider logins, raw runs, Worklease state, and optional installed tools survive under ignored `.pi-data/` and `.tools/`. The live Codex view uses `Ctrl+L`; the container remaps Pi's model selector to `Alt+P`.
+
+The committed [`.herdr/config.toml`](.herdr/config.toml) controls the sandbox UI and pane defaults. Edit it and run `task agent:reload` to apply reloadable options. Print the complete option reference with `herdr --default-config` inside `task shell`.
 
 ```sh
-task agent:status
-task agent:stop       # explicitly ends the Pi tmux session
-task shell            # shell in the running sandbox
+task agent:status     # server state and all detected Pi runtimes
+task agent:reload     # reload committed Herdr options
+task agent:stop       # explicitly ends every interactive Pi runtime
+task shell            # raw shell in the running sandbox
 task sandbox:logs
 task sandbox:stop
 ```
@@ -77,7 +80,7 @@ task secrets:run -- gh auth status
 task secrets:run -- curl https://api.example.com/me
 ```
 
-The sandbox and tmux server start without decrypted values. An agent decrypts only around a command that needs them:
+The sandbox and Herdr server start without decrypted values. An agent decrypts only around a command that needs them:
 
 ```sh
 sops exec-env secrets.sops.env 'command args'
@@ -87,7 +90,7 @@ sops exec-env secrets.sops.env 'command args'
 
 ## Long-running loops
 
-Use `/loop` inside the attached Pi session for bounded repeated work. tmux protects it from terminal disconnects, but not from host or container failure. Reconcile external state before resuming any loop that may already have posted, messaged, or otherwise changed a service.
+Use `/loop` inside an attached Pi session for bounded repeated work. Herdr protects it from terminal disconnects, but not from host or container failure. After a Herdr server restart, supported Pi conversations resume through their saved session references; reconcile external state before resuming any loop that may already have posted, messaged, or otherwise changed a service.
 
 When concurrent work could use the same account or browser profile, coordinate it with Worklease:
 

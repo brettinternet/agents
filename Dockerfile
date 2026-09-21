@@ -5,6 +5,7 @@ ARG AGENT_UID=1000
 ARG AGENT_GID=1000
 ARG TARGETARCH
 ARG PI_VERSION=0.87.0
+ARG HERDR_VERSION=0.9.1
 ARG SOPS_VERSION=3.13.3
 ARG AGE_VERSION=1.3.1
 ARG JEGREP_VERSION=0.1.0
@@ -15,9 +16,19 @@ ARG WORKLEASE_VERSION=1.7.3
 
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      bash ca-certificates curl fd-find fzf git gh jq less nano procps ripgrep tini tmux tzdata util-linux wget \
+      bash ca-certificates curl fd-find fzf git gh jq less nano procps ripgrep tini tzdata util-linux wget \
     && ln -s /usr/bin/fdfind /usr/local/bin/fd \
     && rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    case "${TARGETARCH:-$(dpkg --print-architecture)}" in \
+      arm64) herdr_arch=aarch64; herdr_sha=f4ccf4de745f2cb9a39a983e9ba3703dad50ec2a58dea83026ceab721bbd8d9e ;; \
+      amd64) herdr_arch=x86_64; herdr_sha=2a02fed16beb651ef006e1d43f048f652ca4dc58ad053cd2d44450563d5c54b7 ;; \
+      *) echo "unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSLo /usr/local/bin/herdr "https://github.com/herdrdev/herdr/releases/download/v${HERDR_VERSION}/herdr-linux-${herdr_arch}"; \
+    echo "${herdr_sha}  /usr/local/bin/herdr" | sha256sum -c -; \
+    chmod 0555 /usr/local/bin/herdr
 
 RUN set -eux; \
     case "${TARGETARCH:-$(dpkg --print-architecture)}" in \

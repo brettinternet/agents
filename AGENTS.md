@@ -41,7 +41,7 @@ task memory:list
 
 ## Long-running and scheduled work
 
-Use `/loop` only for bounded work with an explicit iteration count and stopping condition. Keep Pi inside the named tmux session so terminal disconnects do not end it. Container or host failure can still interrupt a loop; never automatically resume side-effecting work without reconciling the external state.
+Use `/loop` only for bounded work with an explicit iteration count and stopping condition. Keep Pi inside the named Herdr session so terminal disconnects do not end it. Container or host failure can still interrupt a loop; never automatically resume side-effecting work without reconciling the external state.
 
 Scheduled prompts live in `jobs/prompts/`, with schedules in `jobs/crontab`. Scheduled work must follow `jobs/README.md`. No external-write schedule may be enabled without explicit account, venue, cadence, and stopping-condition authorization. Supercronic does not provide catch-up or exactly-once execution.
 
@@ -50,6 +50,7 @@ Scheduled prompts live in `jobs/prompts/`, with schedules in `jobs/crontab`. Sch
 Use Worklease when interactive sessions, loops, or scheduled jobs could compete for the same account, browser profile, or writable workspace. Worklease coordinates cooperating workers; it does not enforce secret access or prove that an external side effect occurred.
 
 <!-- worklease:begin v1.7.3 -->
+
 Authority selection: local authority at `/workspace/.pi-data/worklease` (`WORKLEASE_HOME`)
 Work source: the explicit user task or reviewed prompt and schedule under `jobs/`
 Resource convention: exact keys `account:<account-name>`, `browser-profile:<profile-name>`, and `workspace:agents`
@@ -67,6 +68,6 @@ Boot-critical tools are pinned in `Dockerfile`. Optional sandbox tools are pinne
 
 Use `bin/web-search` with an authorized `BRAVE_SEARCH_API_KEY` for public discovery, and `curl` for retrieval. Prefer official APIs and venue-specific CLIs over browser automation. Add a pinned browser tool only when a target demonstrably requires JavaScript interaction, and keep its profile and downloads under `.pi-data/`.
 
-Keep this environment small. Do not add a custom scheduler, dashboard, message bus, agent hierarchy, or memory abstraction when Pi, Supercronic, tmux, Worklease, shell tools, Git, and Markdown suffice.
+Keep this environment small. Do not add a custom scheduler, dashboard, message bus, agent hierarchy, or memory abstraction when Pi, Supercronic, Herdr, Worklease, shell tools, Git, and Markdown suffice.
 
 `Taskfile.dist.yaml` is the shared taskfile. `Taskfile.yaml` is ignored and reserved for local overrides. Use `bun` rather than npm for ad hoc JavaScript work. Use `trash`, never `rm`, for manual deletion. `task check` is a host validation because it calls Docker; from inside the sandbox run the relevant direct checks and report that the host check remains pending.

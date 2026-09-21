@@ -122,6 +122,8 @@ tasks:
       - test -x bin/run-agent
       - test -x bin/web-search
       - test -f .pi/settings.container.json
+      - test -f .pi/keybindings.container.json
+      - test -f .tmux.conf
       - test -L .pi/settings.json
       - test "$(readlink .pi/settings.json)" = /workspace/.pi/settings.container.json
       - test -f .pi/mise.toml

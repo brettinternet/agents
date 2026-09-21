@@ -26,7 +26,7 @@ task agent
 
 `task init` installs the host tools, prepares ignored state, builds the image, and starts the named `sandbox` service. `task agent` creates or attaches to the `pi` tmux session inside that service. `.pi/settings.json` points to the container-only `/workspace/.pi/settings.container.json`, keeping its Linux-installed Pi extensions isolated from host Pi.
 
-Detach without stopping Pi using `Ctrl-b d`. Reattach later with `task agent`. Pi sessions, provider logins, raw runs, Worklease state, and optional installed tools survive under ignored `.pi-data/` and `.tools/`.
+Detach without stopping Pi using `Ctrl-b d`. Reattach later with `task agent`. Pi sessions, provider logins, raw runs, Worklease state, and optional installed tools survive under ignored `.pi-data/` and `.tools/`. The live Codex view uses `Ctrl+L`; the container remaps Pi's model selector to `Ctrl+Shift+L`.
 
 ```sh
 task agent:status
@@ -82,7 +82,7 @@ The sandbox and tmux server start without decrypted values. An agent decrypts on
 sops exec-env secrets.sops.env 'command args'
 ```
 
-`OPENROUTER_API_KEY` enables `jegrep`, and `BRAVE_SEARCH_API_KEY` enables `bin/web-search`. Pi provider login can be stored in persistent `.pi-data`; API-key providers can instead be supplied explicitly through SOPS. All values in the encrypted file are exposed to a process launched with `sops exec-env`.
+`OPENROUTER_API_KEY` enables `jegrep`, and `BRAVE_SEARCH_API_KEY` enables `bin/web-search`. Pi provider login is stored only in ignored `.pi-data/auth.json`; run `/login` once in the container to configure a model provider. Provider credentials are never committed. All values in the encrypted file are exposed to a process launched with `sops exec-env`.
 
 ## Long-running loops
 

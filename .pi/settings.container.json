@@ -1,7 +1,7 @@
 {
   "defaultTools": ["read", "bash", "edit", "write", "grep", "find", "ls"],
   "packages": [
-    "git:github.com/brettinternet/pi-extensions@db46fdd10bbec0f0e25170cce2812c241b1eb54c"
+    "git:github.com/brettinternet/pi-extensions@0acd7455197859fda65b9ee44260defcb4758878"
   ],
   "theme": "terminal"
 }

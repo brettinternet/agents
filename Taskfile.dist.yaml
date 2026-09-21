@@ -16,6 +16,7 @@ tasks:
     desc: Install host tools, prepare state, verify secrets, and build the sandbox
     cmds:
       - mise install
+      - mise exec lefthook -- lefthook install
       - task: secrets:check
       - task: container:build
       - task: sandbox:start
@@ -107,7 +108,7 @@ tasks:
     desc: Search memory semantically with jegrep and Jev
     env:
       MEMORY_QUERY: '{{join " " .CLI_ARGS_LIST}}'
-    cmd: "{{.SOPS_ENV}} sops exec-env secrets.sops.env 'jegrep \"$MEMORY_QUERY\" memory'"
+    cmd: '{{.SOPS_ENV}} sops exec-env secrets.sops.env ''jegrep "$MEMORY_QUERY" memory'''
 
   memory:pick:
     desc: Interactively choose a memory file
@@ -117,6 +118,7 @@ tasks:
     desc: Validate the minimal agent environment
     cmds:
       - task: secrets:check
+      - mise exec lefthook -- lefthook validate
       - docker compose config --quiet
       - test -x bin/attach-agent
       - test -x bin/run-agent

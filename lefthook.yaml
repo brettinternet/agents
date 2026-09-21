@@ -1,0 +1,13 @@
+---
+# yaml-language-server: $schema=https://raw.githubusercontent.com/evilmartians/lefthook/master/schema.json
+
+pre-commit:
+  parallel: true
+  jobs:
+    - name: Check staged formatting
+      run: mise exec prettier -- prettier --check --ignore-unknown -- {staged_files}
+    - name: Check staged shell scripts
+      glob: "bin/*"
+      run: mise exec shellcheck -- shellcheck -- {staged_files}
+    - name: Check for secret leaks
+      run: mise exec gitleaks -- gitleaks git --pre-commit --redact --staged --verbose --no-banner

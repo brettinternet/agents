@@ -1,7 +1,15 @@
 {
+  "quietStartup": true,
+  "steeringMode": "all",
+  "followUpMode": "one-at-a-time",
+  "tuiMode": "fullscreen",
   "defaultTools": ["read", "bash", "edit", "write", "grep", "find", "ls"],
   "packages": [
-    "git:github.com/brettinternet/pi-extensions@0acd7455197859fda65b9ee44260defcb4758878"
+    "git:github.com/brettinternet/pi-extensions@0acd7455197859fda65b9ee44260defcb4758878",
+    "npm:pi-web-access@0.27.0",
+    "npm:pi-mcp-adapter@2.32.1",
+    "npm:@sting8k/pi-vcc@0.7.0",
+    "npm:@narumitw/pi-btw@0.57.0"
   ],
   "theme": "terminal"
 }

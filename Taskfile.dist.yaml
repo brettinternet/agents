@@ -16,8 +16,6 @@ tasks:
     desc: Install host tools, prepare state, verify secrets, and build the sandbox
     cmds:
       - mise install
-      - mkdir -p .pi-data/browser .pi-data/runs .pi-data/sessions .pi-data/worklease .tools/mise
-      - chmod 700 .pi-data .pi-data/worklease .tools
       - task: secrets:check
       - task: container:build
       - task: sandbox:start

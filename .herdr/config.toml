@@ -1,16 +1,10 @@
-# Committed Herdr configuration for the sandbox.
-# Edit this file and run `task agent:reload` to apply reloadable changes.
-# Print all available options with `herdr --default-config`.
+onboarding = false
 
 [terminal]
 # The sandbox is dedicated to Pi; every new Herdr pane starts another runtime.
 default_shell = "/workspace/bin/start-pi"
 shell_mode = "non_login"
 new_cwd = "follow"
-
-[ui]
-# Workspace names distinguish concurrent Pi tasks in the sidebar.
-prompt_new_workspace_name = true
 
 [session]
 # Resume integration-reported Pi conversations after a Herdr server restart.
@@ -19,3 +13,77 @@ resume_agents_on_restore = true
 [experimental]
 # Terminal history may contain prompts, command output, or credentials.
 pane_history = false
+
+[theme]
+name = "terminal"
+
+[theme.custom]
+active_row_bg = "#202020"
+selection_bg = "#2a2a2a"
+surface0 = "#181818"
+surface1 = "#202020"
+surface_dim = "#202020"
+
+[keys]
+prefix = "ctrl+b"
+split_horizontal = ["prefix+minus", "prefix+s"]
+split_vertical = "prefix+v"
+rename_tab = "prefix+,"
+rename_pane = "prefix+."
+previous_tab = "prefix+p"
+next_tab = "prefix+n"
+last_pane = "prefix+ctrl+p"
+close_pane = "prefix+shift+x"
+close_tab = "prefix+shift+d"
+previous_agent = ["prefix+alt+p", "prefix+alt+["]
+next_agent = ["prefix+alt+n", "prefix+alt+]"]
+focus_agent = "prefix+alt+1..9"
+new_workspace = "prefix+shift+c"
+new_worktree = []
+switch_workspace = "prefix+shift+1..9"
+previous_workspace = ["prefix+shift+p", "prefix+shift+["]
+next_workspace = ["prefix+shift+n", "prefix+shift+]"]
+detach = ["prefix+d", "prefix+ctrl+d"]
+zoom = ["prefix+z", "ctrl+alt+z"]
+
+[ui]
+agent_panel_sort = "priority"
+prompt_new_tab_name = false
+prompt_new_workspace_name = true
+hide_tab_bar_when_single_tab = true
+show_agent_labels_on_pane_borders = true
+sidebar_collapsed_mode = "hidden"
+
+[ui.sidebar.spaces]
+rows = [
+  [
+    "state_icon",
+    { token = "workspace", bold = true },
+  ],
+  [
+    "branch",
+    "git_status",
+  ],
+]
+
+[ui.sidebar.agents]
+rows = [
+  [
+    "state_icon",
+    "machine",
+    { token = "workspace", bold = true },
+    "tab",
+  ],
+  [
+    { token = "agent", fg = "#7dcfff" },
+    "state_text",
+    "pane",
+  ],
+  [
+    { token = "terminal_title_stripped", fg = "#c0caf5" },
+  ],
+]
+
+
+[ui.toast]
+delivery = "herdr"

@@ -13,7 +13,8 @@ There is no dashboard, database-backed control plane, message bus, or agent hier
 - Internet tools: Brave Search helper, `curl`, `wget`, Git, GitHub CLI, and `jq`
 - Memory search: [`jegrep`](https://github.com/can1357/jegrep), `rg`, `fd`, and `fzf`
 - SOPS + age for a committed encrypted environment
-- Lefthook pre-commit checks for secrets, formatting, and shell scripts
+- Dedicated locations for checked-in artifacts and ignored working data
+- Lefthook pre-commit checks for secrets, oversized files, formatting, and shell scripts
 - Agent-owned optional tools in [`.pi/mise.toml`](.pi/mise.toml)
 
 ## Start and attach
@@ -40,11 +41,13 @@ task sandbox:logs
 task sandbox:stop
 ```
 
-The repository is mounted read/write at `/workspace`. The container has internet access but no published ports, Docker socket, or host home mount.
+The entire repository is mounted read/write at `/workspace`, including `memory/`, `results/`, `artifacts/`, the encrypted `secrets.sops.env`, and the ignored `.env.sops-age` identity. The host UID and GID are passed into the image so container agents can update repository files without creating root-owned files. The container has internet access but no published ports, Docker socket, or host home mount.
 
-## Results and memory
+## Results, artifacts, memory, and working data
 
-Public-safe task deliverables go in [`results/`](results/README.md). Raw output and private evidence go in ignored `.pi-data/runs/`. Durable reusable knowledge goes in [`memory/`](memory/README.md) only when it meets the memory policy.
+Public-safe task summaries go in [`results/`](results/README.md). Other durable, public-safe files intended for Git go in [`artifacts/`](artifacts/README.md). Durable reusable knowledge goes in [`memory/`](memory/README.md) only when it meets the memory policy. All three directories are writable from the sandbox and covered by the repository's secret-leak and 10 MiB staged-file checks.
+
+Clones, downloads, scratch files, private evidence, and other uncommitted working data go in ignored `.pi-data/work/`; raw run output remains in `.pi-data/runs/`. These directories persist across container replacement because `.pi-data/` lives on the host. They are available to every agent in this sandbox, so they are persistence boundaries, not isolation or access-control boundaries.
 
 With `BRAVE_SEARCH_API_KEY` in `secrets.sops.env`, search the public web from the host or sandbox:
 

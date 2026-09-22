@@ -48,7 +48,7 @@ tasks:
   sandbox:start:
     desc: Start the named long-running sandbox service
     cmds:
-      - mkdir -p .pi-data/browser .pi-data/runs .pi-data/sessions .pi-data/worklease .tools/mise
+      - mkdir -p .pi-data/browser .pi-data/runs .pi-data/sessions .pi-data/work .pi-data/worklease .tools/mise
       - chmod 700 .pi-data .pi-data/worklease .tools
       - "{{.COMPOSE_ENV}} docker compose up -d sandbox"
 
@@ -120,11 +120,13 @@ tasks:
 
   check:
     desc: Validate the minimal agent environment
+    deps: [sandbox:start]
     cmds:
       - task: secrets:check
       - mise exec lefthook -- lefthook validate
       - docker compose config --quiet
       - test -x bin/attach-agent
+      - test -x bin/check-staged-files
       - test -x bin/run-agent
       - test -x bin/start-pi
       - test -x bin/web-search
@@ -135,8 +137,10 @@ tasks:
       - test "$(readlink .pi/settings.json)" = /workspace/.pi/settings.container.json
       - test -f .pi/mise.toml
       - test -f jobs/crontab
+      - test -f artifacts/README.md
       - test -f memory/README.md
       - test -f results/README.md
+      - docker compose exec -T sandbox sh -c 'test -w /workspace && test -r /workspace/.env.sops-age && test -r /workspace/secrets.sops.env && test -w /workspace/secrets.sops.env && test -w /workspace/memory && test -w /workspace/results && test -w /workspace/artifacts && test -w /workspace/.pi-data/work'
       - test ! -d src
       - test ! -d tests
       - test ! -d docs

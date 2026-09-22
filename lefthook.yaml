@@ -9,5 +9,7 @@ pre-commit:
     - name: Check staged shell scripts
       glob: "bin/*"
       run: mise exec shellcheck -- shellcheck -- {staged_files}
+    - name: Check staged file sizes
+      run: bin/check-staged-files
     - name: Check for secret leaks
       run: mise exec gitleaks -- gitleaks git --pre-commit --redact --staged --verbose --no-banner

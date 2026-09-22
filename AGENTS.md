@@ -24,9 +24,9 @@ sops exec-env secrets.sops.env 'command args'
 
 Do not print, copy, summarize, or persist decrypted values. Do not add plaintext environment files. Browser profiles are credentials too; keep them under `.pi-data/browser/`, never reuse a personal browser profile, and coordinate concurrent profile access.
 
-## Results and memory
+## Results, artifacts, memory, and working data
 
-Write each public-safe task deliverable under `results/` using the contract in `results/README.md`. Raw run output and private evidence stay under `.pi-data/runs/`.
+Write each public-safe task deliverable under `results/` using the contract in `results/README.md`. Put other public-safe, checked-in files under `artifacts/` using `artifacts/README.md`. Raw run output and private evidence stay under `.pi-data/runs/`; clones, downloads, and other ephemeral working data belong under `.pi-data/work/`.
 
 Durable memory is curated Markdown under `memory/`. Before writing, read `memory/README.md` and search for related notes with `rg` or `jegrep`. Store only public-safe decisions, outcomes, and reusable lessons with dates and sources. Recheck time-sensitive claims. A completed task does not automatically warrant a memory.
 

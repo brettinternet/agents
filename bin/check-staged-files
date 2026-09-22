@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+max_bytes="${MAX_STAGED_FILE_BYTES:-10485760}"
+status=0
+
+while IFS= read -r -d '' staged_path; do
+  staged_size="$(git cat-file -s ":${staged_path}")"
+  if ((staged_size > max_bytes)); then
+    printf 'staged file exceeds %s bytes (%s): %s\n' "$max_bytes" "$staged_size" "$staged_path" >&2
+    status=1
+  fi
+done < <(git diff --cached --name-only --diff-filter=ACMR -z)
+
+exit "$status"

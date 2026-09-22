@@ -4,7 +4,7 @@
       "command": "worklease",
       "args": ["mcp"],
       "env": {
-        "WORKLEASE_SESSION_ID": "${PI_SESSION_ID}"
+        "WORKLEASE_SESSION_ID": "${HERDR_PANE_ID}"
       },
       "protocolVersion": "2026-07-28"
     }

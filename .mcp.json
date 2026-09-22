@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "worklease": {
+      "command": "worklease",
+      "args": ["mcp"],
+      "env": {
+        "WORKLEASE_SESSION_ID": "${PI_SESSION_ID}"
+      },
+      "protocolVersion": "2026-07-28"
+    }
+  }
+}

@@ -58,3 +58,5 @@ Use this shape:
 ## Promote proven knowledge
 
 Move a journal item to `knowledge/<topic>.md` only after it has affected a decision, prevented repeated work, or proved reusable more than once. Consolidate rather than copy. Include the last verified date, why the note matters, sources, and explicit recheck conditions. Update this index when adding or renaming a knowledge note, and supersede incorrect material in place so search does not return competing guidance.
+
+When recall starts to fail, review recent `results/` and journal entries manually. Promote only independently checked, repeatedly useful lessons with sources and freshness conditions; correct or discard stale notes. Do not schedule automatic transcript-to-memory synthesis or treat a generated summary as evidence.

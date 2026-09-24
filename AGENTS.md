@@ -43,6 +43,8 @@ task memory:list
 
 Use `/loop` only for bounded work with an explicit iteration count and stopping condition. Keep Pi inside the named Herdr session so terminal disconnects do not end it. Container or host failure can still interrupt a loop; never automatically resume side-effecting work without reconciling the external state.
 
+For unfinished work likely to cross sessions, leave a minimal checkpoint under ignored `.pi-data/work/` using the handoff fields in `README.md#resume-handoff-and-recovery`. Include verified external action IDs and uncertainties, not secrets, private handles, personal details, or transcripts. On resumption, recheck repository and venue state and acquire a new Worklease claim before competing work; a checkpoint does not transfer authorization or lease ownership. Keep completed public-safe results in `results/` and curate memory separately.
+
 Scheduled prompts live in `jobs/prompts/`, with schedules in `jobs/crontab`. Scheduled work must follow `jobs/README.md`. No external-write schedule may be enabled without explicit account, venue, cadence, and stopping-condition authorization. Supercronic does not provide catch-up or exactly-once execution.
 
 ## Worklease coordination

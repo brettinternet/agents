@@ -107,6 +107,27 @@ worklease release --session "$PI_LOOP_RUN_ID" --reason done
 
 Worklease is cooperative coordination, not a secret-access boundary or an exactly-once guarantee.
 
+## Resume, handoff, and recovery
+
+Use `/name` to identify an interactive Pi session and `/resume` to find it later. Pi saves session history under ignored `.pi-data/sessions/` (scheduled runs use `.pi-data/sessions/scheduled/`); its automatic compaction keeps long conversations within context limits without deleting the original session. Herdr restore resumes supported conversations, but **neither a resumed conversation nor a compaction summary proves that an interrupted external action succeeded or failed**.
+
+For unfinished work that another session may need to pick up, write a short checkpoint under ignored `.pi-data/work/` (for example, `.pi-data/work/handoff-topic.md`):
+
+```text
+Objective and current status:
+Next concrete step:
+Files and public results to inspect:
+External actions already attempted (verified public URL/ID and outcome):
+Ambiguous actions to inspect at the venue before any retry:
+Worklease resource to reacquire, if applicable:
+```
+
+Do not put credentials, private handles, personal details, raw pages, or transcripts in a handoff; even ignored files should contain only the minimum needed. A new session should read the checkpoint, verify it against the repository and live venue, and acquire its **own** Worklease claim before competing work. Never treat a prior claim or an unverified external write as transferable. Completed public-safe outcomes belong in `results/`; only repeatedly useful, sourced lessons belong in `memory/`.
+
+The bind-mounted `.pi-data/` survives container replacement, but a single copy on the host is **not a backup**. Set up a private, encrypted backup outside this repository for `.pi-data/` and `.env.sops-age` (the identity needed to decrypt `secrets.sops.env`). Back up the `herdr-state` Docker volume too if restoring the pane layout matters. These sources can contain provider credentials, private sessions, and Worklease state: never commit or share the backup, and use a consistent snapshot or stop the sandbox while copying. Periodically test a restore into an isolated environment: confirm the Pi session appears in `/resume`, check that the age identity decrypts the environment with `task secrets:check`, and inspect any external actions before continuing. Do not assume restored Worklease claims are valid; establish fresh ownership before writes.
+
+Search `memory/`, `results/`, and Git history before opening raw sessions. Pi's `/resume` helps locate sessions, but a saved transcript is private evidence, not curated cross-session memory. Add private local transcript search only if these paths repeatedly fail to recover needed details; do not automatically ingest transcripts into tracked files or a hosted index.
+
 ## Scheduled jobs
 
 Supercronic watches [`jobs/crontab`](jobs/crontab) in UTC. No job is enabled by default. See [`jobs/README.md`](jobs/README.md) before adding one.

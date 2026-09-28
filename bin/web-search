@@ -18,8 +18,8 @@ fi
 encoded_query=$(printf '%s' "$query" | jq -sRr @uri)
 count=${WEB_SEARCH_COUNT:-10}
 
-curl -fsS \
+response=$(curl -fsS \
   -H 'Accept: application/json' \
   -H "X-Subscription-Token: ${BRAVE_SEARCH_API_KEY}" \
-  "https://api.search.brave.com/res/v1/web/search?q=${encoded_query}&count=${count}" \
-  | jq -r '.web.results[]? | [.title, .url, (.description // "")] | @tsv'
+  "https://api.search.brave.com/res/v1/web/search?q=${encoded_query}&count=${count}")
+printf '%s\n' "$response" | jq -r '.web.results[]? | [.title, .url, (.description // "")] | @tsv'
